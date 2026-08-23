@@ -35,6 +35,11 @@ namespace Shadowbus
                 "GetOnList",
                 "BlackHole",
                 "ChoiceBraveCardList",
+                // The native skill filter uses this persistent list for
+                // conditions such as {me.evolved_card_list.count}. It is not
+                // merely a VFX work list: the count must match on the peer
+                // before an opponent's skill is evaluated.
+                "EvolvedCards",
                 "TurnPlayCardCountInfo",
                 "TurnFusionCountInfo",
                 "TurnEvolveCardCountInfo",

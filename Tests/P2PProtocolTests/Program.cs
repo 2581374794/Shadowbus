@@ -51,6 +51,7 @@ namespace Shadowbus
                 "BattleStartDeckCardList",
                 "DeckSkillCardList",
                 "TurnFusionCountInfo",
+                "EvolvedCards",
                 "GameTurnPlayCards",
                 "TurnDestroyCards"
             })
@@ -75,7 +76,6 @@ namespace Shadowbus
                 "HealingCards",
                 "SkillSummonedCards",
                 "SummonedCards",
-                "EvolvedCards",
                 "DestroyedWhenDestroyCards"
             })
             {
