@@ -514,6 +514,19 @@ namespace Shadowbus
             Assert(Convert.ToInt32(buffKnownCard["isSelf"]) == 0,
                 "Receiver-relative known cards were not flipped with battle targets.");
 
+            Dictionary<string, object> chatStamp =
+                P2PMessageTransform.PrepareOpponentBattleMessage(
+                    new Dictionary<string, object>
+                    {
+                        ["uri"] = "ChatStamp",
+                        ["stamp"] = "3"
+                    });
+            Assert(!chatStamp.ContainsKey("stamp") &&
+                chatStamp.TryGetValue("chatStamp", out object rawChatStamp) &&
+                rawChatStamp is Dictionary<string, object> chatStampPayload &&
+                Convert.ToString(chatStampPayload["stamp"]) == "3",
+                "Battle ChatStamp was not wrapped in the server-compatible payload.");
+
             Dictionary<string, object> opponentLeaderAttack =
                 P2PMessageTransform.PrepareOpponentBattleMessage(
                     new Dictionary<string, object>

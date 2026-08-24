@@ -410,6 +410,7 @@ namespace Shadowbus
             Dictionary<string, object> source)
         {
             Dictionary<string, object> result = FlipPerspective(source);
+            NormalizeChatStamp(result);
             NormalizeOpponentKeyActions(result);
             if (result.TryGetValue("targetList", out object targets))
             {
@@ -419,6 +420,30 @@ namespace Shadowbus
                 result["oppoTargetList"] = targets;
             }
             return result;
+        }
+
+        private static void NormalizeChatStamp(Dictionary<string, object> message)
+        {
+            if (message == null ||
+                !message.TryGetValue("uri", out object rawUri) ||
+                !string.Equals(rawUri?.ToString(),
+                    P2PBattleProtocol.ChatStampUri,
+                    StringComparison.Ordinal) ||
+                message.ContainsKey("chatStamp") ||
+                !message.TryGetValue("stamp", out object stamp))
+            {
+                return;
+            }
+
+            // The client sends stamp at the top level, but the official server
+            // wraps it as chatStamp before delivering it to NetworkBattleReceiver.
+            // That receiver ignores a top-level stamp and only populates
+            // oppoChatStamp from the nested payload.
+            message.Remove("stamp");
+            message["chatStamp"] = new Dictionary<string, object>
+            {
+                ["stamp"] = stamp
+            };
         }
 
         private static void NormalizeOpponentKeyActions(

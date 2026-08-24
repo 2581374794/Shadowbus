@@ -28,6 +28,7 @@ namespace Shadowbus
         internal const string TurnEndUri = "TurnEnd";
         internal const string TurnEndFinalUri = "TurnEndFinal";
         internal const string TurnStartUri = "TurnStart";
+        internal const string ChatStampUri = "ChatStamp";
         internal const string JudgeUri = "Judge";
         internal const string EchoUri = "Echo";
         // P2P-only metadata. The native receiver ignores unknown fields, while
