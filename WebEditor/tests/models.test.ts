@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { addDeckTag, normalizeDeckCsv, parseCsv, serializeCsv, styleHeaders } from "../src/models/csv";
 import { normalizeBossRush, normalizeCardMaster, normalizeTwoPick } from "../src/models/normalize";
-import { validateBossRush, validateCsv, validateTwoPick } from "../src/models/validation";
+import { validateBossRush, validateCardMaster, validateCsv, validateTwoPick } from "../src/models/validation";
 import { newBossRush, newTwoPick } from "../src/models/defaults";
 
 describe("JSON 模型保真", () => {
@@ -40,6 +40,12 @@ describe("JSON 模型保真", () => {
       intArrayFields: { Tribe: [2, "7", "invalid"] },
     }])[0];
     expect(tribeCard.intArrayFields.Tribe).toEqual([2, 7]);
+    const foilCard = normalizeCardMaster([{
+      templateCardId: 1,
+      foilEffectCardId: "100011010",
+    }])[0];
+    expect(foilCard.foilEffectCardId).toBe(100011010);
+    expect(normalizeCardMaster([{ templateCardId: 1, foilEffectCardId: 0 }])[0].foilEffectCardId).toBeUndefined();
   });
 });
 
@@ -80,5 +86,13 @@ describe("阻止无效配置", () => {
     value.offersPerRound = 3;
     value.roundRules = [{ rounds: [1], costs: null, rarities: null, cards: null }, { rounds: [1], costs: null, rarities: null, cards: null }];
     expect(validateTwoPick(value).filter((item) => item.severity === "error").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("拒绝将自制卡作为闪卡效果来源", () => {
+    const value = normalizeCardMaster([{
+      templateCardId: 100011010,
+      foilEffectCardId: 999991001,
+    }]);
+    expect(validateCardMaster(value).some((item) => item.path === "[0].foilEffectCardId" && item.severity === "error")).toBe(true);
   });
 });

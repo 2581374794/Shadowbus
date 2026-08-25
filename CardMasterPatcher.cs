@@ -27,6 +27,9 @@ namespace Shadowbus
         public bool newCard = false;
         public int cardId = 0;
         public int templateCardId;
+        // Optional. A normal or foil CardId from the original game whose foil
+        // material is used as this card's visual-effect template.
+        public int? foilEffectCardId;
         public Dictionary<string, bool> boolFields = [];
         public Dictionary<string, int> intFields = [];
         public Dictionary<string, int[]> intArrayFields = [];
@@ -433,6 +436,34 @@ namespace Shadowbus
     {
         public static Dictionary<int,CardParameter> CardParameterBackup = [];
         public static Dictionary<string, string> CustomLocalization = [];
+        private static readonly Dictionary<int, FoilEffectBinding>
+            FoilEffectsByTargetResourceId = [];
+        private static readonly Dictionary<int, HashSet<int>>
+            SourceBundleResourcesByTargetBundleResourceId = [];
+        private static readonly Dictionary<int, ResourcesManager.AssetLoadPathType>
+            TargetBundleMaterialTypes = [];
+        private static readonly HashSet<int> DisabledFoilEffectResourceIds = [];
+        private static readonly HashSet<string> FoilEffectWarnings = [];
+        private static readonly HashSet<Material> GeneratedCardMaterials = [];
+
+        [ThreadStatic]
+        private static bool IsResolvingFoilEffectTemplate;
+
+        private sealed class FoilEffectBinding
+        {
+            public int TargetFoilCardId;
+            public int TargetResourceCardId;
+            public int SourceFoilCardId;
+            public int SourceFoilResourceCardId;
+            public int SourceNormalResourceCardId;
+        }
+
+        private sealed class FoilEffectRequest
+        {
+            public int TargetCardId;
+            public int SourceCardId;
+        }
+
         private static readonly ConditionalWeakTable<CardParameter, RuntimeCardText>
             RuntimeCardTexts = new ConditionalWeakTable<CardParameter, RuntimeCardText>();
 
@@ -603,10 +634,186 @@ namespace Shadowbus
             IDictionary<int, CardParameter> masterDict = (IDictionary<int, CardParameter>)AccessTools.Field(typeof(CardMaster), "m_cardParameters").GetValue(master);
             masterDict.Clear();
             CustomLocalization.Clear();
+            ClearFoilEffectRegistry();
             foreach (var kvp in CardParameterBackup)
             {
                 masterDict.Add(kvp.Key,kvp.Value.Clone());
             }
+        }
+
+        private static void ClearFoilEffectRegistry()
+        {
+            FoilEffectsByTargetResourceId.Clear();
+            SourceBundleResourcesByTargetBundleResourceId.Clear();
+            TargetBundleMaterialTypes.Clear();
+            DisabledFoilEffectResourceIds.Clear();
+            FoilEffectWarnings.Clear();
+            GeneratedCardMaterials.Clear();
+        }
+
+        private static void WarnFoilEffectOnce(string key, string message)
+        {
+            if (FoilEffectWarnings.Add(key))
+            {
+                Plugin.Logger.LogWarning(message);
+            }
+        }
+
+        private static bool UsesUnitCardMaterial(CardParameter parameter)
+        {
+            return parameter != null &&
+                (parameter.CharType == CardBasePrm.CharaType.NORMAL ||
+                 CardMaster.IsMutationCardCheck(parameter.BaseCardId));
+        }
+
+        private static void BuildFoilEffectRegistry(
+            CardMaster master,
+            IEnumerable<FoilEffectRequest> requests)
+        {
+            foreach (FoilEffectRequest request in requests)
+            {
+                if (request.SourceCardId <= 0)
+                {
+                    WarnFoilEffectOnce(
+                        $"invalid-source:{request.TargetCardId}",
+                        $"foilEffectCardId for {request.TargetCardId} must be a positive CardId");
+                    continue;
+                }
+
+                CardParameter target = master.GetCardParameterFromId(request.TargetCardId);
+                if (target == null)
+                {
+                    WarnFoilEffectOnce(
+                        $"missing-target:{request.TargetCardId}",
+                        $"foilEffectCardId target card {request.TargetCardId} was not found");
+                    continue;
+                }
+
+                if (!target.IsFoil)
+                {
+                    WarnFoilEffectOnce(
+                        $"nonfoil-target:{target.CardId}",
+                        $"foilEffectCardId on non-foil card {target.CardId} is ignored");
+                    continue;
+                }
+
+                if (DisabledFoilEffectResourceIds.Contains(target.ResourceCardId))
+                {
+                    continue;
+                }
+
+                if (!CardParameterBackup.ContainsKey(request.SourceCardId))
+                {
+                    WarnFoilEffectOnce(
+                        $"custom-source:{request.SourceCardId}",
+                        $"foilEffectCardId {request.SourceCardId} for {target.CardId} must reference an original game card");
+                    continue;
+                }
+
+                CardParameter sourceReference = CardParameterBackup[request.SourceCardId];
+                CardParameter sourceFoil = CardParameterBackup.TryGetValue(
+                    sourceReference.FoilCardId,
+                    out CardParameter originalFoil)
+                    ? originalFoil
+                    : null;
+                if (sourceFoil == null || !sourceFoil.IsFoil ||
+                    !CardParameterBackup.ContainsKey(sourceFoil.CardId))
+                {
+                    WarnFoilEffectOnce(
+                        $"invalid-source-foil:{request.SourceCardId}",
+                        $"foilEffectCardId {request.SourceCardId} for {target.CardId} does not resolve to an original foil card");
+                    continue;
+                }
+
+                if (UsesUnitCardMaterial(target) != UsesUnitCardMaterial(sourceFoil))
+                {
+                    WarnFoilEffectOnce(
+                        $"type-mismatch:{target.CardId}:{sourceFoil.CardId}",
+                        $"foilEffectCardId {sourceFoil.CardId} is incompatible with {target.CardId}: follower and spell/amulet materials cannot be mixed");
+                    continue;
+                }
+
+                CardParameter sourceNormal = CardParameterBackup.TryGetValue(
+                    sourceFoil.NormalCardId,
+                    out CardParameter originalNormal)
+                    ? originalNormal
+                    : null;
+                if (sourceNormal == null)
+                {
+                    WarnFoilEffectOnce(
+                        $"missing-source-normal:{sourceFoil.CardId}",
+                        $"foil effect source {sourceFoil.CardId} has no valid normal-card resource record");
+                    continue;
+                }
+
+                CardParameter targetNormal = master.GetCardParameterFromId(target.NormalCardId) ?? target;
+                if (target.NormalCardId != target.CardId &&
+                    targetNormal.ResourceCardId == target.ResourceCardId)
+                {
+                    WarnFoilEffectOnce(
+                        $"shared-target-resource:{target.ResourceCardId}",
+                        $"foil effect for {target.CardId} is disabled because its normal and foil records share ResourceCardId {target.ResourceCardId}; use distinct resource IDs to keep the effect foil-only");
+                    continue;
+                }
+
+                FoilEffectBinding binding = new FoilEffectBinding
+                {
+                    TargetFoilCardId = target.CardId,
+                    TargetResourceCardId = target.ResourceCardId,
+                    SourceFoilCardId = sourceFoil.CardId,
+                    SourceFoilResourceCardId = sourceFoil.ResourceCardId,
+                    SourceNormalResourceCardId = sourceNormal.ResourceCardId
+                };
+
+                if (FoilEffectsByTargetResourceId.TryGetValue(target.ResourceCardId, out FoilEffectBinding existing) &&
+                    existing.SourceFoilCardId != binding.SourceFoilCardId)
+                {
+                    FoilEffectsByTargetResourceId.Remove(target.ResourceCardId);
+                    DisabledFoilEffectResourceIds.Add(target.ResourceCardId);
+                    WarnFoilEffectOnce(
+                        $"resource-conflict:{target.ResourceCardId}",
+                        $"multiple foil effects target ResourceCardId {target.ResourceCardId}; the effect override is disabled for this shared resource");
+                    continue;
+                }
+
+                FoilEffectsByTargetResourceId[target.ResourceCardId] = binding;
+                ResourcesManager.AssetLoadPathType materialType = UsesUnitCardMaterial(target)
+                    ? ResourcesManager.AssetLoadPathType.UnitCardMaterial
+                    : ResourcesManager.AssetLoadPathType.SpellCardMaterial;
+                AddSourceBundleMapping(
+                    targetNormal.ResourceCardId,
+                    materialType,
+                    sourceNormal.ResourceCardId,
+                    sourceFoil.ResourceCardId);
+                if (target.ResourceCardId != targetNormal.ResourceCardId)
+                {
+                    AddSourceBundleMapping(
+                        target.ResourceCardId,
+                        materialType,
+                        sourceNormal.ResourceCardId,
+                        sourceFoil.ResourceCardId);
+                }
+            }
+        }
+
+        private static void AddSourceBundleMapping(
+            int targetResourceCardId,
+            ResourcesManager.AssetLoadPathType materialType,
+            int sourceNormalResourceCardId,
+            int sourceFoilResourceCardId)
+        {
+            if (!SourceBundleResourcesByTargetBundleResourceId.TryGetValue(
+                    targetResourceCardId,
+                    out HashSet<int> sourceBundles))
+            {
+                sourceBundles = [];
+                SourceBundleResourcesByTargetBundleResourceId.Add(
+                    targetResourceCardId,
+                    sourceBundles);
+            }
+            sourceBundles.Add(sourceNormalResourceCardId);
+            sourceBundles.Add(sourceFoilResourceCardId);
+            TargetBundleMaterialTypes[targetResourceCardId] = materialType;
         }
         public static void ApplyCardMasterPatches(CardMaster master = null)
         {
@@ -616,12 +823,23 @@ namespace Shadowbus
             Dictionary<int, CardParameter> masterDict = (Dictionary<int, CardParameter>)AccessTools.Field(typeof(CardMaster), "m_cardParameters").GetValue(master);
             var card_master_folder = Directory.CreateDirectory(Plugin.CardMasterPath);
             var patches = card_master_folder.GetFiles("*.json");
+            List<FoilEffectRequest> foilEffectRequests = [];
             foreach (var pat in patches)
             {
                 string json = File.ReadAllText(pat.FullName);
                 List<CardParameterPatch> card_patches = JsonConvert.DeserializeObject<List<CardParameterPatch>>(json);
+                if (card_patches == null)
+                {
+                    Plugin.Logger.LogWarning($"CardMaster patch file {pat.Name} is not a JSON array");
+                    continue;
+                }
                 foreach (var patch in card_patches)
                 {
+                    if (patch == null)
+                    {
+                        Plugin.Logger.LogWarning($"CardMaster patch file {pat.Name} contains a null patch entry");
+                        continue;
+                    }
                     var template = master.GetCardParameterFromId(patch.templateCardId);
                     if (template == null)
                     {
@@ -647,6 +865,14 @@ namespace Shadowbus
                             }
 
                             patch.PatchTemplate(variant, preserveVariantIdentity: true);
+                            if (patch.foilEffectCardId.HasValue)
+                            {
+                                foilEffectRequests.Add(new FoilEffectRequest
+                                {
+                                    TargetCardId = variant.CardId,
+                                    SourceCardId = patch.foilEffectCardId.Value
+                                });
+                            }
                         }
                     }
                     else
@@ -693,10 +919,20 @@ namespace Shadowbus
                             }
 
                             masterDict.Add(patch.cardId, newCard);
+                            if (patch.foilEffectCardId.HasValue)
+                            {
+                                foilEffectRequests.Add(new FoilEffectRequest
+                                {
+                                    TargetCardId = newCard.CardId,
+                                    SourceCardId = patch.foilEffectCardId.Value
+                                });
+                            }
                         }
                     }
                 }
             }
+
+            BuildFoilEffectRegistry(master, foilEffectRequests);
 
             Data.Load.data.UserCardList.Clear();
             var all = master.GetAllCardIds();
@@ -724,26 +960,88 @@ namespace Shadowbus
             ApplyCardMasterPatches(__result);
         }
 
-
         public static Material commonCardMaterial;
-        public static Material foilcardMaterial;
+
+        [HarmonyPatch(typeof(Cute.ResourcesManager), nameof(Cute.ResourcesManager.LoadAssetGroupAsync))]
+        [HarmonyPrefix]
+        public static void ResourcesManager_LoadAssetGroupAsync(
+            Cute.ResourcesManager __instance,
+            ref List<string> rogueAssetList)
+        {
+            if (rogueAssetList == null || rogueAssetList.Count == 0 ||
+                SourceBundleResourcesByTargetBundleResourceId.Count == 0)
+            {
+                return;
+            }
+
+            List<string> expanded = new List<string>(rogueAssetList);
+            HashSet<string> loaded = new HashSet<string>(expanded, StringComparer.OrdinalIgnoreCase);
+            foreach (var pair in SourceBundleResourcesByTargetBundleResourceId)
+            {
+                ResourcesManager.AssetLoadPathType materialType =
+                    TargetBundleMaterialTypes.TryGetValue(
+                        pair.Key,
+                        out ResourcesManager.AssetLoadPathType mappedType)
+                        ? mappedType
+                        : ResourcesManager.AssetLoadPathType.UnitCardMaterial;
+                string targetBundle = __instance.GetAssetTypePath(
+                    pair.Key.ToString(),
+                    materialType,
+                    false);
+                if (!loaded.Contains(targetBundle))
+                {
+                    continue;
+                }
+
+                foreach (int sourceResourceId in pair.Value)
+                {
+                    string sourceBundle = __instance.GetAssetTypePath(
+                        sourceResourceId.ToString(),
+                        materialType,
+                        false);
+                    if (loaded.Add(sourceBundle))
+                    {
+                        expanded.Add(sourceBundle);
+                    }
+                }
+            }
+
+            rogueAssetList = expanded;
+        }
 
         [HarmonyPatch(typeof(Cute.ResourcesManager), nameof(Cute.ResourcesManager.FindCardMaterial))]
         [HarmonyPostfix]
         public static void ResourcesManager_FindCardMaterial(
             int cardId,
+            ResourcesManager.AssetLoadPathType type,
             bool isEvol,
+            bool isMutation,
+            CardBasePrm.CharaType originalType,
+            bool isChoiceBrave,
             ref Material __result)
         {
-            if (__result != null)
+            if (IsResolvingFoilEffectTemplate)
             {
-                if (commonCardMaterial == null)
-                {
-                    commonCardMaterial = UnityEngine.Object.Instantiate(__result);
-                }
+                return;
             }
 
-            Material customMaterial = CreateExternalCardMaterial(cardId, isEvol, __result);
+            if (__result != null && commonCardMaterial == null)
+            {
+                commonCardMaterial = UnityEngine.Object.Instantiate(__result);
+            }
+
+            Material foilEffectTemplate = GetFoilEffectMaterial(
+                cardId,
+                type,
+                isEvol,
+                isMutation,
+                originalType,
+                isChoiceBrave);
+            Material customMaterial = CreateCardMaterial(
+                cardId,
+                isEvol,
+                __result,
+                foilEffectTemplate);
             if (customMaterial != null)
             {
                 __result = customMaterial;
@@ -776,46 +1074,174 @@ namespace Shadowbus
             bool isEvolution,
             ref Material __result)
         {
-            int resourceCardId = ResolveResourceCardId(cardId);
-            Material customMaterial = CreateExternalCardMaterial(
-                resourceCardId, isEvolution, __result);
+            CardParameter target = ResolveCardParameter(cardId);
+            int resourceCardId = target?.ResourceCardId ?? cardId;
+            ResourcesManager.AssetLoadPathType type = target != null && UsesUnitCardMaterial(target)
+                ? ResourcesManager.AssetLoadPathType.UnitCardMaterial
+                : ResourcesManager.AssetLoadPathType.SpellCardMaterial;
+            bool isMutation = target != null && CardMaster.IsMutationCardCheck(target.BaseCardId);
+            CardBasePrm.CharaType originalType = target?.CharType ?? CardBasePrm.CharaType.NORMAL;
+            Material foilEffectTemplate = GetFoilEffectMaterial(
+                resourceCardId,
+                type,
+                isEvolution,
+                isMutation,
+                originalType,
+                false);
+            Material customMaterial = CreateCardMaterial(
+                resourceCardId,
+                isEvolution,
+                __result,
+                foilEffectTemplate);
             if (customMaterial != null)
             {
                 __result = customMaterial;
+                ApplyCardShader(customMaterial, target);
             }
+        }
+
+        [HarmonyPatch(typeof(UnitCardCreator), nameof(UnitCardCreator.SetupUnitCardMaterialToCardMesh))]
+        [HarmonyPrefix]
+        public static void UnitCardCreator_SetupUnitCardMaterialToCardMesh(
+            CardParameter cardBasePrm,
+            Material normalCardArtMaterial)
+        {
+            ApplyCardShader(normalCardArtMaterial, cardBasePrm);
+        }
+
+        [HarmonyPatch(typeof(FieldCardCreator), nameof(FieldCardCreator.SetupFieldCardMaterialToCardMesh))]
+        [HarmonyPrefix]
+        public static void FieldCardCreator_SetupFieldCardMaterialToCardMesh(
+            CardParameter cardBasePrm,
+            Material normalCardArtMaterial)
+        {
+            ApplyCardShader(normalCardArtMaterial, cardBasePrm);
+        }
+
+        private static CardParameter ResolveCardParameter(int cardId)
+        {
+            return CardMaster.GetInstanceForBattle()?.GetCardParameterFromId(cardId);
         }
 
         private static int ResolveResourceCardId(int cardId)
         {
-            CardParameter parameter = CardMaster.GetInstanceForBattle()?.GetCardParameterFromId(cardId);
+            CardParameter parameter = ResolveCardParameter(cardId);
             return parameter?.ResourceCardId ?? cardId;
         }
 
-        private static Material CreateExternalCardMaterial(
-            int resourceCardId,
+        private static Material GetFoilEffectMaterial(
+            int targetResourceCardId,
+            ResourcesManager.AssetLoadPathType type,
             bool isEvolution,
-            Material originalMaterial)
+            bool isMutation,
+            CardBasePrm.CharaType originalType,
+            bool isChoiceBrave)
         {
-            Texture2D texture = Utils.GetExternalTexture(resourceCardId, isEvolution);
-            if (texture == null)
+            if (!FoilEffectsByTargetResourceId.TryGetValue(
+                    targetResourceCardId,
+                    out FoilEffectBinding binding))
             {
                 return null;
             }
 
-            Material materialTemplate = originalMaterial ?? commonCardMaterial;
+            if (Toolbox.ResourcesManager == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                IsResolvingFoilEffectTemplate = true;
+                Material material = Toolbox.ResourcesManager.FindCardMaterial(
+                    binding.SourceFoilResourceCardId,
+                    type,
+                    isEvolution,
+                    isMutation,
+                    originalType,
+                    isChoiceBrave);
+                if (material == null)
+                {
+                    WarnFoilEffectOnce(
+                        $"material-unavailable:{binding.SourceFoilCardId}:{isEvolution}",
+                        $"foil effect source {binding.SourceFoilCardId} material is unavailable; using the target material instead");
+                }
+                return material;
+            }
+            finally
+            {
+                IsResolvingFoilEffectTemplate = false;
+            }
+        }
+
+        private static Material CreateCardMaterial(
+            int resourceCardId,
+            bool isEvolution,
+            Material originalMaterial,
+            Material foilEffectTemplate)
+        {
+            Texture2D texture = Utils.GetExternalTexture(resourceCardId, isEvolution);
+            if (texture == null && foilEffectTemplate == null)
+            {
+                return null;
+            }
+
+            // Never display the source card's artwork merely because its foil
+            // material was selected. If the target has no external image and
+            // the target bundle is not loaded, leave the original path intact.
+            if (texture == null && foilEffectTemplate != null && originalMaterial == null)
+            {
+                WarnFoilEffectOnce(
+                    $"missing-target-material:{resourceCardId}:{isEvolution}",
+                    $"target material {resourceCardId} is unavailable; foil effect override was skipped");
+                return null;
+            }
+
+            Material materialTemplate = foilEffectTemplate ?? originalMaterial ?? commonCardMaterial;
             if (materialTemplate == null)
             {
                 Plugin.Logger.LogWarning(
-                    $"Cannot apply custom texture {resourceCardId}: no card material template is loaded");
+                    $"Cannot create card material {resourceCardId}: no material template is loaded");
                 return null;
             }
 
             Material material = UnityEngine.Object.Instantiate(materialTemplate);
-            material.mainTexture = texture;
-            material.SetTexture("_MainTex", texture);
+            GeneratedCardMaterials.Add(material);
+            Texture targetTexture = texture ?? originalMaterial?.mainTexture;
+            if (targetTexture != null)
+            {
+                material.mainTexture = targetTexture;
+                if (material.HasProperty("_MainTex"))
+                {
+                    material.SetTexture("_MainTex", targetTexture);
+                }
+            }
+
             Plugin.Logger.LogInfo(
-                $"Custom {(isEvolution ? "evolved" : "normal")} texture for {resourceCardId} loaded");
+                $"Custom {(isEvolution ? "evolved" : "normal")} material for {resourceCardId} loaded");
             return material;
+        }
+
+        private static void ApplyCardShader(Material material, CardParameter parameter)
+        {
+            if (material == null || parameter == null)
+            {
+                return;
+            }
+
+            bool showFoilAnimation = parameter.IsFoil &&
+                PlayerPrefsWrapper.GetBool(PlayerPrefsWrapper.SHOW_FOIL_CARD_ANIMATION);
+            string shaderName = showFoilAnimation
+                ? CardShaderDefine.CARD_SHADER_FOIL
+                : CardShaderDefine.CARD_SHADER_DEFAULT;
+            Shader shader = Shader.Find(shaderName);
+            if (shader == null)
+            {
+                WarnFoilEffectOnce(
+                    $"missing-shader:{shaderName}",
+                    $"card shader {shaderName} was not found");
+                return;
+            }
+            material.shader = shader;
         }
     }
 

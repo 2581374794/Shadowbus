@@ -10,7 +10,7 @@ import { Card, CheckboxField, Field, NumberField, RowActions, Section, TextField
 import { useCardCatalog } from "../components/CardCatalog";
 import { StringMapEditor, UnknownFieldsEditor } from "../components/Collections";
 
-const known = ["newCard", "cardId", "templateCardId", "boolFields", "intFields", "intArrayFields", "stringChangeFields", "stringAppendFields", "stringArrayFields", "localizationFields", "attackEffectFields"];
+const known = ["newCard", "cardId", "templateCardId", "foilEffectCardId", "boolFields", "intFields", "intArrayFields", "stringChangeFields", "stringAppendFields", "stringArrayFields", "localizationFields", "attackEffectFields"];
 
 /** The patch map each write mode stores the six parallel skill fields in. */
 const skillSourceMap = { append: "stringAppendFields", change: "stringChangeFields" } as const;
@@ -268,6 +268,7 @@ function PatchForm({ value, onChange }: { value: CardMasterPatch; onChange: (val
         <CheckboxField label="创建新卡" field="newCard" value={value.newCard} onChange={(item) => set("newCard", item)} />
         <NumberField label="新卡 ID" field="cardId" value={value.cardId} disabled={!value.newCard} cardId onChange={(item) => set("cardId", item)} />
         <NumberField label="模板卡 ID" field="templateCardId" value={value.templateCardId} cardId onChange={(item) => set("templateCardId", item)} />
+        <NumberField label="闪卡效果来源卡 ID（0 = 不覆盖）" field="foilEffectCardId" value={value.foilEffectCardId ?? 0} min={0} cardId onChange={(item) => set("foilEffectCardId", item > 0 ? item : undefined)} />
       </div>
     </Section>
     <GenericFieldMap title="布尔属性" field="boolFields" value={value.boolFields} type="boolean" suggestions={cardParameterFields.boolean} onChange={(item) => set("boolFields", item)} />

@@ -80,6 +80,8 @@ export interface CardMasterPatch extends JsonRecord {
   newCard: boolean;
   cardId: number;
   templateCardId: number;
+  /** Optional original-game card whose foil material supplies this card's visual effect. */
+  foilEffectCardId?: number;
   boolFields: Record<string, boolean>;
   intFields: Record<string, number>;
   intArrayFields: Record<string, number[]>;

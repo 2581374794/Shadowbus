@@ -98,6 +98,22 @@ export function validateCardMaster(value: CardMasterPatch[], cards?: CardCatalog
     if (patch.newCard && patch.cardId <= 0) issues.push(error(`[${index}].cardId`, "新卡 ID 必须大于 0。"));
     if (patch.newCard && newIds.has(patch.cardId)) issues.push(error(`[${index}].cardId`, "同一文件中存在重复的新卡 ID。"));
     if (patch.newCard) newIds.add(patch.cardId);
+    if (patch.foilEffectCardId != null) {
+      const sourceId = normalizeCardId(patch.foilEffectCardId);
+      const sourcePath = `[${index}].foilEffectCardId`;
+      if (sourceId == null) {
+        issues.push(error(sourcePath, "闪卡效果来源卡 ID 必须为正整数。"));
+      } else if (isCustomCardId(sourceId)) {
+        issues.push(error(sourcePath, "闪卡效果来源必须是游戏原版已有卡，不能引用自制卡。"));
+      } else {
+        const target = cards?.get(patch.templateCardId);
+        const source = cards?.get(sourceId);
+        const targetType = Number.isFinite(patch.intFields?.CharType) ? patch.intFields.CharType : target?.charType;
+        if (targetType != null && source && (targetType === 0) !== (source.charType === 0)) {
+          issues.push(error(sourcePath, "随从只能引用随从闪卡效果；法术或护符只能引用法术或护符效果。"));
+        }
+      }
+    }
     issues.push(...skillFieldIssues(`[${index}].stringAppendFields`, "stringAppendFields", patch.stringAppendFields, "append"));
     issues.push(...skillFieldIssues(`[${index}].stringChangeFields`, "stringChangeFields", patch.stringChangeFields, "change"));
     // Legal but ambiguous: replacement is applied first, then the append runs on top of it.
@@ -106,6 +122,7 @@ export function validateCardMaster(value: CardMasterPatch[], cards?: CardCatalog
     }
   });
   issues.push(...unknownCardIssues(cards, "templateCardId", "模板卡", value.map((patch) => patch.templateCardId)));
+  issues.push(...unknownCardIssues(cards, "foilEffectCardId", "闪卡效果来源卡", value.flatMap((patch) => patch.foilEffectCardId == null ? [] : [patch.foilEffectCardId])));
   return issues;
 }
 
