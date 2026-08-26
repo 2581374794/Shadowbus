@@ -745,6 +745,34 @@ namespace Shadowbus
                         },
                         ["preprocess"] = new List<object> { 1, 0 }
                     }
+                },
+                [P2PBattleProtocol.ActionManifestKey] = new Dictionary<string, object>
+                {
+                    ["version"] = P2PBattleProtocol.ActionManifestVersion,
+                    ["seq"] = 7,
+                    ["uri"] = "PlayActions",
+                    ["p2pAuthoritativeSkillEvaluations"] = new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["owner"] = 1,
+                            ["ownerIdx"] = 42,
+                            ["conditions"] = new List<object>
+                            {
+                                new Dictionary<string, object>
+                                {
+                                    ["ordinal"] = 0,
+                                    ["prePlay"] = 0,
+                                    ["skipTarget"] = 0,
+                                    ["result"] = 1
+                                }
+                            }
+                        }
+                    },
+                    ["state"] = new Dictionary<string, object>
+                    {
+                        ["p2pHiddenOwner"] = 1
+                    }
                 }
             };
 
@@ -857,6 +885,21 @@ namespace Shadowbus
                 Convert.ToInt32(preprocessResults[0]) == 1 &&
                 Convert.ToInt32(preprocessResults[1]) == 0,
                 "Authoritative private skill evaluation was perspective-flipped.");
+            Dictionary<string, object> manifest =
+                (Dictionary<string, object>)flipped[P2PBattleProtocol.ActionManifestKey];
+            Dictionary<string, object> manifestEvaluation =
+                (Dictionary<string, object>)((List<object>)manifest[
+                    "p2pAuthoritativeSkillEvaluations"])[0];
+            Dictionary<string, object> manifestCondition =
+                (Dictionary<string, object>)((List<object>)manifestEvaluation[
+                    "conditions"])[0];
+            Assert(Convert.ToInt32(manifest["version"]) ==
+                    P2PBattleProtocol.ActionManifestVersion &&
+                Convert.ToInt32(manifest["seq"]) == 7 &&
+                Convert.ToInt32(manifestCondition["result"]) == 1 &&
+                Convert.ToInt32(((Dictionary<string, object>)manifest["state"])[
+                    "p2pHiddenOwner"]) == 1,
+                "Action manifest metadata was perspective-flipped or lost.");
         }
 
         private static void TestDealState()

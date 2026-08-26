@@ -351,6 +351,16 @@ namespace Shadowbus
             return ConvertToken(JObject.Parse(json)) as Dictionary<string, object>;
         }
 
+        internal static object CloneValue(object source)
+        {
+            if (source == null)
+            {
+                return null;
+            }
+            string json = JsonConvert.SerializeObject(source, Settings);
+            return ConvertToken(JToken.Parse(json));
+        }
+
         private static object ConvertToken(JToken token)
         {
             if (token == null || token.Type == JTokenType.Null || token.Type == JTokenType.Undefined)
@@ -527,6 +537,8 @@ namespace Shadowbus
                     string.Equals(key, "p2pAuthoritativeSkillTargets",
                         StringComparison.Ordinal) ||
                     string.Equals(key, "p2pAuthoritativeSkillEvaluations",
+                        StringComparison.Ordinal) ||
+                    string.Equals(key, P2PBattleProtocol.ActionManifestKey,
                         StringComparison.Ordinal) ||
                     string.Equals(key, "p2pPlayerHistoryBefore",
                         StringComparison.Ordinal))

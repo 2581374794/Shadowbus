@@ -31,6 +31,11 @@ namespace Shadowbus
         internal const string ChatStampUri = "ChatStamp";
         internal const string JudgeUri = "Judge";
         internal const string EchoUri = "Echo";
+        // A single action-level container for all values resolved by the acting
+        // peer. Legacy side-channel keys remain available during the migration,
+        // but new receivers can consume this manifest as the canonical source.
+        internal const string ActionManifestKey = "p2pActionManifest";
+        internal const int ActionManifestVersion = 1;
         // P2P-only metadata. The native receiver ignores unknown fields, while
         // the host uses this marker to avoid preparing the same action twice.
         internal const string PreparedActionKey = "p2pPreparedAction";
@@ -2002,6 +2007,7 @@ namespace Shadowbus
             int known = Count(data, "knownList");
             int unapproved = Count(data, "uList");
             int orders = Count(data, "orderList");
+            string manifest = DescribeActionManifest(data);
             List<string> moves = new List<string>();
             if (data.TryGetValue("orderList", out object rawOrders))
             {
@@ -2020,7 +2026,35 @@ namespace Shadowbus
             }
             return $"uri={uri}, playIdx={playIndex}, type={type}, " +
                 $"targets={targets}, known={known}, uList={unapproved}, orders={orders}, " +
-                $"moves=[{string.Join(";", moves)}]";
+                $"manifest={manifest}, moves=[{string.Join(";", moves)}]";
+        }
+
+        private static string DescribeActionManifest(
+            Dictionary<string, object> data)
+        {
+            if (data == null ||
+                !data.TryGetValue(P2PBattleProtocol.ActionManifestKey,
+                    out object rawManifest) ||
+                !(rawManifest is Dictionary<string, object> manifest))
+            {
+                return "-";
+            }
+            string sequence = Read(manifest, "seq", "?");
+            int evaluations = Count(manifest, "p2pAuthoritativeSkillEvaluations");
+            int targets = Count(manifest, "p2pAuthoritativeSkillTargets");
+            int conditions = 0;
+            if (manifest.TryGetValue(
+                    "p2pAuthoritativeSkillEvaluations", out object rawEvaluations))
+            {
+                foreach (object rawEvaluation in Enumerate(rawEvaluations))
+                {
+                    if (rawEvaluation is Dictionary<string, object> evaluation)
+                    {
+                        conditions += Count(evaluation, "conditions");
+                    }
+                }
+            }
+            return $"seq={sequence}/eval={evaluations}/target={targets}/condition={conditions}";
         }
 
         private static Dictionary<string, string> Flatten(

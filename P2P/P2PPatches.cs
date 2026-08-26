@@ -1298,9 +1298,21 @@ namespace Shadowbus
                 {
                     return;
                 }
+
+                // Conditions are resolved by the action source. On the receiving
+                // peer consume the recorded boolean before any local hidden-zone
+                // reevaluation can change the execution path.
+                if (P2PRuntime.TryGetAuthoritativeSkillConditionResult(
+                        skill, isPrePlay, isSkipTarget, out bool authoritativeResult))
+                {
+                    __result = authoritativeResult;
+                    return;
+                }
                 if (skill.SkillPrm.ownerCard.IsPlayer ||
                     !UsesPrivateCardInformation(skill))
                 {
+                    P2PRuntime.ObserveAuthoritativeSkillConditionResult(
+                        skill, isPrePlay, isSkipTarget, __result);
                     return;
                 }
 
@@ -1328,6 +1340,8 @@ namespace Shadowbus
                         $"local={localResult}.");
                 }
                 __result = localResult;
+                P2PRuntime.ObserveAuthoritativeSkillConditionResult(
+                    skill, isPrePlay, isSkipTarget, __result);
             }
             catch (Exception ex)
             {
