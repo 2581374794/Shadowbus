@@ -1939,11 +1939,53 @@ namespace Shadowbus
                     !string.Equals(expectedValue, actualValue, StringComparison.Ordinal))
                 {
                     differences.Add(
-                        $"{key}: expected={(hasExpected ? expectedValue : "<missing>")}, " +
-                        $"actual={(hasActual ? actualValue : "<missing>")}");
+                        $"{key}: expected={SummarizeDifferenceValue(
+                            hasExpected ? expectedValue : "<missing>")}, " +
+                        $"actual={SummarizeDifferenceValue(
+                            hasActual ? actualValue : "<missing>")}");
                 }
             }
             return differences;
+        }
+
+        internal static string DescribeDifferences(
+            IReadOnlyList<string> differences,
+            int maximum = 12)
+        {
+            if (differences == null || differences.Count == 0)
+            {
+                return "no differing fields";
+            }
+
+            int count = Math.Max(1, maximum);
+            IEnumerable<string> preview = differences.Take(count);
+            string result = string.Join("; ", preview);
+            int remaining = differences.Count - count;
+            return remaining > 0
+                ? result + $"; +{remaining} differing field(s)"
+                : result;
+        }
+
+        private static string SummarizeDifferenceValue(string value)
+        {
+            if (value == null || value.Length <= 180)
+            {
+                return value ?? "null";
+            }
+
+            // Card/history snapshots can contain thousands of characters. Keep
+            // the field name and stable size/hash, while avoiding a full dump of
+            // the snapshot in both peers' logs.
+            unchecked
+            {
+                uint hash = 2166136261;
+                for (int i = 0; i < value.Length; i++)
+                {
+                    hash ^= value[i];
+                    hash *= 16777619;
+                }
+                return $"<len={value.Length},hash={hash:X8}>";
+            }
         }
 
         internal static string DescribeBattleMessage(Dictionary<string, object> data)

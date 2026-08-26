@@ -2350,6 +2350,26 @@ namespace Shadowbus
             Assert(P2PBattleStateDiagnostics.Compare(expected,
                     P2PJson.CloneDictionary(expected)).Count == 0,
                 "Equal battle states were reported as desynchronized.");
+
+            Dictionary<string, object> largeExpected = new Dictionary<string, object>
+            {
+                ["handState"] = new string('x', 512)
+            };
+            Dictionary<string, object> largeActual = new Dictionary<string, object>
+            {
+                ["handState"] = new string('y', 512)
+            };
+            IReadOnlyList<string> largeDifferences =
+                P2PBattleStateDiagnostics.Compare(largeExpected, largeActual);
+            Assert(largeDifferences.Count == 1 &&
+                largeDifferences[0].Length < 180 &&
+                largeDifferences[0].Contains("len=512"),
+                "Large diagnostic values were not summarized.");
+            Assert(P2PBattleStateDiagnostics.DescribeDifferences(
+                    Enumerable.Range(0, 15).Select(index => "field" + index)
+                        .ToList())
+                    .Contains("+3 differing field(s)"),
+                "Diagnostic difference output was not capped.");
         }
 
         private static void Wait(ManualResetEventSlim signal, string error)

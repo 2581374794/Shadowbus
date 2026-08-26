@@ -258,9 +258,13 @@ namespace Shadowbus
             TryCompleteReceivedBattleAction();
             TryClearConsumedAuthoritativeSkillTargets();
             TryClearConsumedAuthoritativeSkillEvaluations();
+            TryCheckPendingBattleStates();
+            // Check the boundary that just became idle before injecting the next
+            // queued action. Otherwise a TurnEnd/TurnStart transition can make
+            // the previous checkpoint look one turn ahead and produce a false
+            // DATA DESYNC report.
             TryInjectPendingReceivedPlayAction();
             ObserveLocalHiddenCardStates();
-            TryCheckPendingBattleStates();
             if (!peerDisconnected)
             {
                 return;
@@ -2127,7 +2131,8 @@ namespace Shadowbus
             {
                 if (pendingStateCheck != null)
                 {
-                    pendingStateCheck.InjectionError = ex.ToString();
+                    pendingStateCheck.InjectionError =
+                        ex.GetType().Name + ": " + ex.Message;
                 }
                 ReportBattleDiagnostic(
                     $"Failed to inject '{uri}' message; " +
@@ -8202,6 +8207,14 @@ namespace Shadowbus
             while (PendingBattleStateChecks.Count > 0)
             {
                 PendingBattleStateCheck pending = PendingBattleStateChecks.Peek();
+                if (HasQueuedNewerBattleStateCheckpoint())
+                {
+                    // A newer checkpoint is already waiting behind the current
+                    // VFX operation. The old snapshot can no longer be compared
+                    // to a stable boundary and must not generate a stale error.
+                    PendingBattleStateChecks.Dequeue();
+                    continue;
+                }
                 bool timedOut = now >= pending.DeadlineUtc;
                 Dictionary<string, object> actual = CaptureBattleState();
                 if (actual == null)
@@ -8240,7 +8253,7 @@ namespace Shadowbus
                             pending.InjectionError);
                         continue;
                     }
-                    Plugin.Logger.LogInfo(
+                    Plugin.Logger.LogDebug(
                         $"[P2P] State synchronized after {pending.Uri}.");
                     continue;
                 }
@@ -8266,8 +8279,21 @@ namespace Shadowbus
                 ReportBattleDiagnostic(
                     $"DATA DESYNC after {pending.Uri}.{waitReason}" +
                     injectionReason + " " +
-                    string.Join("; ", differences));
+                    P2PBattleStateDiagnostics.DescribeDifferences(differences));
             }
+        }
+
+        private static bool HasQueuedNewerBattleStateCheckpoint()
+        {
+            foreach (Dictionary<string, object> queued in
+                PendingReceivedBattleMessages)
+            {
+                if (P2PBattleProtocol.CarriesBattleStateCheckpoint(GetUri(queued)))
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         private static string DescribeEffectQueue(NetworkBattleManagerBase manager)
@@ -8276,8 +8302,15 @@ namespace Shadowbus
             {
                 string current = manager?.VfxMgr?.CurrentVfxName;
                 List<string> queued = manager?.VfxMgr?.GetSequentialVfxPlayerNames();
+                List<string> names = queued ?? new List<string>();
+                const int maxNames = 4;
+                string preview = string.Join(",", names.Take(maxNames));
+                if (names.Count > maxNames)
+                {
+                    preview += $",+{names.Count - maxNames}";
+                }
                 return $"currentVfx={current ?? "<none>"}, " +
-                    $"queuedVfx=[{string.Join(",", queued ?? new List<string>())}]";
+                    $"queuedCount={names.Count}, queuedVfx=[{preview}]";
             }
             catch (Exception ex)
             {
