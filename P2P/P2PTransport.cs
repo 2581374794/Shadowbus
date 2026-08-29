@@ -12,6 +12,15 @@ namespace Shadowbus
 {
     internal sealed class P2PTransport : IDisposable
     {
+        // Protocol 3 removes the retired authority request/result replay
+        // transport.  Do not allow a v2 peer to join a v3 room: its packets
+        // have different battle-response semantics.
+        internal const int ProtocolVersion = 3;
+        internal const string AuthorityMode = "host-authoritative";
+        // Keep this value in lockstep with the plugin/package version. A room
+        // never mixes protocol implementations because hidden-state replay is
+        // not safe across different action schemas.
+        internal const string ModVersion = "2.5.1";
         // The initial trusted private-state exchange contains the complete hand,
         // deck, and mutable card metadata. Allow a larger single frame for that
         // one-time snapshot; ordinary action frames remain small.
@@ -90,7 +99,9 @@ namespace Shadowbus
                         Data = new System.Collections.Generic.Dictionary<string, object>
                         {
                             ["token"] = Convert.ToBase64String(expectedToken),
-                            ["protocol"] = 1
+                            ["protocol"] = ProtocolVersion,
+                            ["authority"] = AuthorityMode,
+                            ["modVersion"] = ModVersion
                         }
                     });
                 }
@@ -348,9 +359,23 @@ namespace Shadowbus
                 {
                     int.TryParse(protocolValue?.ToString(), out protocol);
                 }
-                if (protocol != 1)
+                string authority = message.Data != null &&
+                    message.Data.TryGetValue("authority", out object authorityValue)
+                        ? authorityValue?.ToString() : string.Empty;
+                string modVersion = message.Data != null &&
+                    message.Data.TryGetValue("modVersion", out object modVersionValue)
+                        ? modVersionValue?.ToString() : string.Empty;
+                if (protocol != ProtocolVersion)
                 {
                     RejectHandshake("Unsupported P2P protocol version.");
+                }
+                if (!string.Equals(authority, AuthorityMode, StringComparison.Ordinal))
+                {
+                    RejectHandshake("The client does not support Host authoritative mode.");
+                }
+                if (!string.Equals(modVersion, ModVersion, StringComparison.Ordinal))
+                {
+                    RejectHandshake("Both players must use the same Shadowbus mod version.");
                 }
                 if (!TokenEquals(expectedToken, actual))
                 {
@@ -360,12 +385,32 @@ namespace Shadowbus
                 client.ReceiveTimeout = 0;
                 try { listener?.Stop(); } catch { }
                 listener = null;
-                Send(new P2PWireMessage { Type = "hello_ok" });
+                Send(new P2PWireMessage
+                {
+                    Type = "hello_ok",
+                    Protocol = ProtocolVersion,
+                    Authority = AuthorityMode,
+                    ModVersion = ModVersion
+                });
                 Connected?.Invoke();
                 return true;
             }
             if (message.Type == "hello_ok")
             {
+                if (message.Protocol != 0 && message.Protocol != ProtocolVersion)
+                {
+                    throw new InvalidDataException("The host selected an unsupported P2P protocol version.");
+                }
+                if (!string.IsNullOrEmpty(message.Authority) &&
+                    !string.Equals(message.Authority, AuthorityMode, StringComparison.Ordinal))
+                {
+                    throw new InvalidDataException("The host did not select Host authoritative mode.");
+                }
+                if (!string.IsNullOrEmpty(message.ModVersion) &&
+                    !string.Equals(message.ModVersion, ModVersion, StringComparison.Ordinal))
+                {
+                    throw new InvalidDataException("The host uses a different Shadowbus mod version.");
+                }
                 handshakeComplete = true;
                 client.ReceiveTimeout = 0;
                 Connected?.Invoke();

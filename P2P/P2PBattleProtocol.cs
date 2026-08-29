@@ -23,6 +23,41 @@ namespace Shadowbus
 
     internal static class P2PBattleProtocol
     {
+        internal const string AuthorityRequestUri = "authority_request";
+        internal const string AuthorityResultUri = "authority_result";
+        internal const string AuthorityRejectUri = "authority_reject";
+        internal const string AuthorityAckUri = "authority_ack";
+        internal const string AuthorityActionKey = "action";
+        internal const string AuthorityRequestIdKey = "requestId";
+        internal const string AuthoritySourceKey = "source";
+        internal const string AuthorityCardIndexKey = "cardIdx";
+        internal const string AuthorityTargetKey = "target";
+        internal const string AuthorityTargetsKey = "targets";
+        internal const string AuthoritySelectedKey = "selected";
+        internal const string AuthorityChoiceKey = "choiceIds";
+        internal const string AuthorityIsChoiceBraveKey = "choiceBrave";
+        internal const string AuthoritySelectSkillKey = "selectSkillIndexes";
+        internal const string AuthorityTurnKey = "turn";
+        internal const string AuthorityStateKey = "privateState";
+        internal const string AuthorityResultRequestIdKey = "p2pAuthorityRequestId";
+        // Each native URI emitted by the Host is an independent replay
+        // boundary. A request ID can cover several URIs (TurnEndActions,
+        // TurnEnd, TurnStart), so it is not sufficient to identify one replay
+        // transaction on the Guest.
+        internal const string AuthorityResultActionIdKey = "p2pAuthorityActionId";
+        // A Host-authoritative result may mutate either player's private zones.
+        // Keep the two owner snapshots in one optional field so the native
+        // knownList/uList protocol remains unchanged while both peers can
+        // reconcile hand/deck card objects after the replay.
+        internal const string AuthorityHiddenStatesKey =
+            "p2pAuthorityHiddenStates";
+        internal const string AuthorityPlayerHistoryStatesKey =
+            "p2pAuthorityPlayerHistoryStates";
+        internal const string AuthorityTurnOwnerKey =
+            "p2pAuthorityTurnOwner";
+        internal const string AuthorityTurnExtraKey =
+            "p2pAuthorityTurnExtra";
+        internal const string PrivateStateAckUri = "private_state_ack";
         internal const string PlayActionsUri = "PlayActions";
         internal const string TurnEndActionsUri = "TurnEndActions";
         internal const string TurnEndUri = "TurnEnd";
@@ -197,11 +232,113 @@ namespace Shadowbus
             return P2PBattleRoute.Opponent;
         }
 
+        internal static bool TryValidateAuthorityRequest(
+            P2PWireMessage message,
+            string expectedBattleId,
+            int expectedGuestViewerId,
+            out string error)
+        {
+            error = string.Empty;
+            if (message == null)
+            {
+                error = "the authority request was null";
+                return false;
+            }
+            if (!string.Equals(message.Type, AuthorityRequestUri,
+                    StringComparison.Ordinal))
+            {
+                error = "the message was not an authority request";
+                return false;
+            }
+            if (message.Data == null)
+            {
+                error = "the authority request had no data";
+                return false;
+            }
+            if (string.IsNullOrWhiteSpace(expectedBattleId))
+            {
+                error = "the Host battle ID was not initialized";
+                return false;
+            }
+            if (!string.Equals(message.BattleId, expectedBattleId,
+                    StringComparison.Ordinal))
+            {
+                error = "the authority request targeted a different battle";
+                return false;
+            }
+            if (!message.Data.TryGetValue("bid", out object rawPayloadBattleId) ||
+                !string.Equals(rawPayloadBattleId?.ToString(), expectedBattleId,
+                    StringComparison.Ordinal))
+            {
+                error = "the authority request payload targeted a different battle";
+                return false;
+            }
+            if (expectedGuestViewerId <= 0 ||
+                message.ViewerId != expectedGuestViewerId)
+            {
+                error = "the authority request came from an unknown Guest";
+                return false;
+            }
+
+            string requestId = message.RequestId;
+            if (string.IsNullOrWhiteSpace(requestId) &&
+                message.Data.TryGetValue(AuthorityRequestIdKey,
+                    out object rawRequestId))
+            {
+                requestId = rawRequestId?.ToString();
+            }
+            if (string.IsNullOrWhiteSpace(requestId))
+            {
+                error = "the request had no requestId";
+                return false;
+            }
+            if (!message.Data.TryGetValue(AuthorityRequestIdKey,
+                    out rawRequestId) ||
+                string.IsNullOrWhiteSpace(rawRequestId?.ToString()))
+            {
+                error = "the authority request payload had no requestId";
+                return false;
+            }
+            if (!string.Equals(requestId, rawRequestId?.ToString(),
+                    StringComparison.Ordinal))
+            {
+                error = "the requestId envelope and payload did not match";
+                return false;
+            }
+
+            if (!message.Data.TryGetValue(AuthoritySourceKey,
+                    out object rawSource) ||
+                !TryConvertInt(rawSource, out int source) || source != 0)
+            {
+                error = "the authority request source was not Guest (source=0)";
+                return false;
+            }
+
+            if (!message.Data.TryGetValue(AuthorityActionKey,
+                    out object rawAction) ||
+                !IsSupportedAuthorityAction(rawAction?.ToString()))
+            {
+                error = "the authority request had an unsupported action";
+                return false;
+            }
+            return true;
+        }
+
+        private static bool IsSupportedAuthorityAction(string action)
+        {
+            return string.Equals(action, "play", StringComparison.Ordinal) ||
+                string.Equals(action, "evolution", StringComparison.Ordinal) ||
+                string.Equals(action, "fusion", StringComparison.Ordinal) ||
+                string.Equals(action, "attack", StringComparison.Ordinal) ||
+                string.Equals(action, "turn_end", StringComparison.Ordinal);
+        }
+
         internal static bool RequiresActiveTurnState(string uri)
         {
             return string.Equals(uri, PlayActionsUri, StringComparison.Ordinal) ||
                 string.Equals(uri, TurnEndActionsUri, StringComparison.Ordinal) ||
                 string.Equals(uri, TurnEndUri, StringComparison.Ordinal) ||
+                string.Equals(uri, TurnEndFinalUri, StringComparison.Ordinal) ||
                 string.Equals(uri, TurnStartUri, StringComparison.Ordinal) ||
                 string.Equals(uri, JudgeUri, StringComparison.Ordinal);
         }
@@ -354,6 +491,16 @@ namespace Shadowbus
             isSelectionActive = false;
             isBurialRite = false;
             isEvolutionSelection = false;
+        }
+
+        internal List<int> TakeAuthoritySkillIndexes()
+        {
+            List<int> result = announcedSkillIndexes
+                .Where(index => index >= 0)
+                .Distinct()
+                .ToList();
+            Reset();
+            return result;
         }
 
         internal bool RecordHandData(

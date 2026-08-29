@@ -34,7 +34,16 @@ namespace Shadowbus
                 "UniteList",
                 "GetOnList",
                 "BlackHole",
+                // These lists back the native destroyed-card and Choice Brave
+                // filters. They are persistent inputs to later skills, not
+                // merely view/VFX scratch lists.
+                "DestroyedWhenDestroyCards",
                 "ChoiceBraveCardList",
+                "ChoiceBraveCards",
+                // last_target filters read this nested list across the next
+                // action. It is persistent battle history, not the temporary
+                // target list used while an operation is executing.
+                "LastTargetCardsList",
                 // The native skill filter uses this persistent list for
                 // conditions such as {me.evolved_card_list.count}. It is not
                 // merely a VFX work list: the count must match on the peer
@@ -76,6 +85,45 @@ namespace Shadowbus
                 "GameSkillBuffCountList",
                 "GameSkillMetamorphoseCountList",
                 "GameQuickAttackCards"
+            });
+
+        // These are the BattlePlayerBase scalar inputs read by the native
+        // condition/history code. Keeping the list beside the synchronized
+        // lists makes the coverage auditable and prevents a newly discovered
+        // turn/PP/evolution condition from silently falling back to the local
+        // mirror on the receiving peer.
+        internal static IReadOnlyList<string> SynchronizedScalarNames { get; } =
+            Array.AsReadOnly(new[]
+            {
+                "Turn",
+                "IsSelfTurn",
+                "Pp",
+                "PpTotal",
+                "Bp",
+                "EpTotal",
+                "CurrentEpCount",
+                "EvolveWaitTurnCount",
+                "NowTurnEvol",
+                "IsEpEvolveThisTurn",
+                "GameUsedEpCount",
+                "TurnUsedEpCount",
+                "IsAlreadyChoiceBraveInThisTurn",
+                "IsChoiceBraveEffectTiming",
+                "TurnNecromanceCount",
+                "GameNecromanceCount",
+                "GameUsedPpCount",
+                "RallyCount",
+                "DeckBanishCount",
+                "GameResonanceStartCount",
+                "TurnResonanceStartCount",
+                "GameUsedWhiteRitualCount",
+                "LastInplayWhiteRitualStack",
+                "GameSkillDiscardCount",
+                "IsShortageDeck",
+                "IsShortageDeckLose",
+                "extraTurnCount",
+                "cardTotalNum",
+                "_cumulativeEvolutionCount"
             });
 
         internal static bool ShouldAttachPreActionHistory(string uri, int turn)

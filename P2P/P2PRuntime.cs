@@ -8,6 +8,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Globalization;
 using Newtonsoft.Json;
@@ -20,8 +21,22 @@ namespace Shadowbus
     internal static class P2PRuntime
     {
         private const int BattleStateCheckTimeoutSeconds = 15;
+        private const int AuthorityExecutionTimeoutSeconds = 45;
         private const int MaxDeferredAgentDeliveries = 128;
         private const int MaxPendingReceivedBattleMessages = 128;
+
+        // The official battle client starts its own operation immediately and
+        // sends the native operation envelope while that operation's VFX is
+        // being played.  The server never makes client-side VFX a prerequisite
+        // for routing the action.  P2P must keep that timing: the Host routes
+        // and receives native messages, but it must not turn the Guest into a
+        // thin client which waits for the Host's VFX and then replays itself.
+        //
+        // This is deliberately not a user setting.  The old request/result
+        // replay gate remains only as unused compatibility code for decoding
+        // an in-flight packet from an older build; all new local actions use
+        // the stock client sender path.
+        private static bool UseNativeClientActionTiming => true;
 
         private static readonly ConcurrentQueue<Action> MainThreadActions =
             new ConcurrentQueue<Action>();
@@ -37,6 +52,13 @@ namespace Shadowbus
         private static readonly Queue<Dictionary<string, object>>
             PendingReceivedBattleMessages =
             new Queue<Dictionary<string, object>>();
+        // Authority results bypass RealTimeNetworkBattleAgent's normal packet
+        // receiver. Keep them in a dedicated FIFO so that a later result cannot
+        // enter NetworkBattleReceiver while the previous result's native VFX
+        // and post-action snapshots are still being finalized.
+        private static readonly Queue<PendingAuthorityReplayAction>
+            PendingAuthorityReplayActions =
+            new Queue<PendingAuthorityReplayAction>();
         private static readonly P2PBattleSelectionTracker BattleSelectionTracker =
             new P2PBattleSelectionTracker();
         private static readonly Queue<PendingBattleStateCheck> PendingBattleStateChecks =
@@ -85,6 +107,13 @@ namespace Shadowbus
         private static readonly Dictionary<string, Dictionary<string, object>>
             ReceivedHiddenCardStates =
             new Dictionary<string, Dictionary<string, object>>();
+        // Keep complete local/remote states behind the wire-level delta. The
+        // native receiver still needs a complete state when applying
+        // P2P-only fields, while the transport should carry only fields that
+        // changed since the last boundary.
+        private const string HiddenCardStateDeltaKey = "p2pStateDelta";
+        private const string HiddenCardStateRemovedFieldsKey =
+            "p2pRemovedFields";
         // A hidden-card snapshot attached to an action describes the state after
         // that action. Keep it out of ReceivedHiddenCardStates until the native
         // operation has finished, otherwise a card condition can observe its own
@@ -92,18 +121,49 @@ namespace Shadowbus
         private static readonly Dictionary<string, Dictionary<string, object>>
             PendingReceivedHiddenCardStates =
             new Dictionary<string, Dictionary<string, object>>();
+        // Identity/zone changes belonging to an ordered action are required to
+        // arrive through that action's native knownList/orderList/uList data.
+        // Keep this provenance so the deferred private-state adapter can never
+        // replace a real hand card after the original VFX has already bound its
+        // view/touch object.
+        private static readonly HashSet<string> PostActionHiddenCardStateKeys =
+            new HashSet<string>(StringComparer.Ordinal);
+        // Only the one-time private_state baseline may use the compatibility
+        // object replacement path. Native action snapshots must never replace
+        // a card after the original receiver boundary has passed.
+        private static readonly HashSet<string> NativeBaselineHiddenCardStateKeys =
+            new HashSet<string>(StringComparer.Ordinal);
+        private static readonly HashSet<string> ReportedMissingNativePrivateIdentities =
+            new HashSet<string>(StringComparer.Ordinal);
         private static readonly Dictionary<string, string>
             ReceivedHiddenCardStateSignatures =
             new Dictionary<string, string>();
         private static readonly Dictionary<string, AppliedHiddenCardState>
             AppliedReceivedHiddenCardStates =
             new Dictionary<string, AppliedHiddenCardState>();
+        // A Host-authoritative packet carries a post-action private snapshot,
+        // but the native client needs the card identity *before* it builds the
+        // receive operation.  Keep the signatures that were promoted into that
+        // packet's knownList so the post-action adapter can apply only the
+        // P2P-only fields after VFX, without replacing a hand object a second
+        // time.
+        private static readonly Dictionary<string, string>
+            NativePromotedReceivedHiddenCardStateSignatures =
+            new Dictionary<string, string>();
+        // A promoted entry can still have no dummy to replace (for example a
+        // token that is created by the operation itself). Record the actual
+        // ReplaceReceivedCard callback separately; only that callback proves
+        // the original pre-operation replacement path materialized the card.
+        private static readonly Dictionary<string, string>
+            NativeReplacedReceivedHiddenCardStateSignatures =
+            new Dictionary<string, string>();
         private static readonly HashSet<string> PrivateConditionWarnings =
             new HashSet<string>(StringComparer.Ordinal);
         // Both clients are trusted in a friends-only room. Exchange the complete
         // private-zone baseline once so ordinary actions do not carry the same
         // hand/deck state over and over again.
         private static bool localPrivateStateSent;
+        private static bool localPrivateStateAcknowledged;
         private static bool remotePrivateStateReceived;
         private static readonly Queue<Dictionary<string, object>> PendingFusionActions =
             new Queue<Dictionary<string, object>>();
@@ -116,9 +176,10 @@ namespace Shadowbus
         // built. Keep the latest cumulative list by index because metamorphose
         // can replace the object before the outbound PlayActions message is
         // finally prepared.
-        private static readonly Dictionary<int, List<P2PFusionIngredientState>>
+        private static readonly Dictionary<string, List<P2PFusionIngredientState>>
             LocalFusionIngredientSnapshots =
-            new Dictionary<int, List<P2PFusionIngredientState>>();
+            new Dictionary<string, List<P2PFusionIngredientState>>(
+                StringComparer.Ordinal);
         private const string AuthoritativeSkillTargetsKey =
             "p2pAuthoritativeSkillTargets";
         private const string AuthoritativeSkillEvaluationsKey =
@@ -169,10 +230,19 @@ namespace Shadowbus
         private static int localActionManifestSequence;
         private static bool localActionCaptureActive;
         private static bool processingReceivedBattleAction;
+        // A normal ordered packet can be stocked by the native agent before it
+        // reaches NetworkBattleReceiver. Reserve its boundary at injection time
+        // so another P2P packet cannot overtake it during that gap.
+        private static bool receivedBattleActionInjectionPending;
         private static bool receivedBattleActionPendingUntilVfx;
+        // ReceivedMessage only constructs the native operation. The operation
+        // itself starts later from OperateReceive, so VfxMgr.IsEnd alone is not
+        // a valid action-completion signal.
+        private static bool receivedBattleActionOperationStarted;
         private static DateTime receivedBattleActionStartedUtc;
         private static bool receivedBattleActionStallReported;
         private static bool nativeReceivedMetadataActive;
+        private static Dictionary<string, object> currentAuthorityReplayData;
         private const string PlayerHistoryStateKey = "p2pPlayerHistory";
         private const string PlayerHistoryStateBeforeKey =
             "p2pPlayerHistoryBefore";
@@ -207,6 +277,400 @@ namespace Shadowbus
         private static Dictionary<string, object> hostDeckEntry;
         private static Dictionary<string, object> guestDeckEntry;
         private static int sessionGeneration;
+
+        // Host-authoritative action gate. Guest input is converted into a
+        // request before the native OperateMgr mutates the battle. The host
+        // executes the original operation once; the resulting PlayActions /
+        // TurnEnd packets then travel through the existing native replay path.
+        private static int authorityRequestSequence;
+        private static int authorityTransitionSequence;
+        private static long authorityResultActionSequence;
+        private static bool authorityReplayDispatchActive;
+        private static bool guestAuthorityBusy;
+        private static string guestAuthorityRequestId;
+        private static string guestAuthorityRequestAction;
+        private static DateTime guestAuthorityRequestSentUtc;
+        private static string receivedAuthorityRequestId;
+        // URI of the ordered authority result currently being replayed on the
+        // Guest.  A turn-end request spans TurnEndActions, TurnEnd, and the
+        // following TurnStart; the input gate must stay closed until the whole
+        // transition has completed.
+        private static string activeReceivedBattleActionUri;
+        private static string activeAuthorityExecutionRequestId;
+        // A Host operation may run asynchronously while its native VFX graph
+        // resolves card effects. Track the start separately so a genuinely
+        // stuck authority operation can fail closed instead of accepting a
+        // later Guest input against an unknown state.
+        private static DateTime activeAuthorityExecutionStartedUtc;
+        private static readonly HashSet<string> processedAuthorityRequests =
+            new HashSet<string>(StringComparer.Ordinal);
+        // Authority result packets are reliable, but a delayed packet can still
+        // arrive after a request was rejected/timed out or after the same
+        // boundary was already replayed.  Keep a small per-battle history so a
+        // stale result cannot re-enter the native receiver and mutate the Guest
+        // mirror a second time.
+        private static readonly HashSet<string> completedAuthorityRequestIds =
+            new HashSet<string>(StringComparer.Ordinal);
+        private static readonly HashSet<string> appliedAuthorityResultBoundaries =
+            new HashSet<string>(StringComparer.Ordinal);
+        private static readonly Dictionary<string, DateTime> authorityRequestTimes =
+            new Dictionary<string, DateTime>(StringComparer.Ordinal);
+        private static readonly List<int> localAuthorityChoiceCardIndexes =
+            new List<int>();
+        // The native OperateMgr resolves RandomAttackCount immediately before
+        // constructing the attack VFX.  Keep the candidate list for that one
+        // StableRandom call so the Host can publish the actual target selected
+        // by its RNG instead of the card initially clicked by the Guest.
+        private static List<BattleCardBase> authorityRandomAttackCandidates;
+        private static BattleCardBase authorityResolvedAttackTarget;
+        // During Guest-side authority replay OperateMgr.Attack still executes
+        // the native RandomAttackCount branch. Keep the Host-selected target
+        // and replace only that StableRandom result in a postfix, so the
+        // native RNG counters continue advancing exactly once.
+        private static int authorityReplayRandomAttackCandidateCount;
+        private static int authorityReplayRandomAttackTargetIndex = -1;
+        private static readonly HashSet<int> authorityGuestKnownIndices =
+            new HashSet<int>();
+        // ActionProcessor instances created while the Host executes a Guest
+        // request need the same network-registration callbacks as a normal
+        // local-player processor.  NetworkBattleManagerBase intentionally
+        // skips several callbacks when card.IsPlayer is false (that is correct
+        // for a client receiving an opponent action, but incorrect for the
+        // authority that must publish the complete native replay).  Keep a
+        // transient set so the Harmony postfix below cannot attach duplicate
+        // callbacks if a derived manager initializes a processor more than once.
+        private static readonly HashSet<Wizard.Battle.ActionProcessor>
+            AuthorityActionProcessors =
+            new HashSet<Wizard.Battle.ActionProcessor>();
+        // Per-owner baselines used by Host-authoritative results.  The legacy
+        // local/remote snapshot tables only track the sender's own zones, while
+        // an authoritative action can also discard, draw, transform, or attach
+        // skills to the other player's hand/deck.
+        private static readonly Dictionary<int, HashSet<int>>
+            authorityKnownPrivateIndicesByOwner =
+            new Dictionary<int, HashSet<int>>
+            {
+                [0] = new HashSet<int>(),
+                [1] = new HashSet<int>()
+            };
+        private static readonly Dictionary<string, string>
+            authorityPrivateStateSignatures =
+            new Dictionary<string, string>(StringComparer.Ordinal);
+        private static readonly Dictionary<string, Dictionary<string, object>>
+            authorityPrivateStates =
+            new Dictionary<string, Dictionary<string, object>>(
+                StringComparer.Ordinal);
+        // A fusion metamorphose is evaluated against the card that existed at
+        // the beginning of the action.  The native orderList only contains the
+        // post-transform identity, so keep a transient absolute-owner snapshot
+        // for every private card while an action is being assembled.  This is
+        // used by both local Host emits and Host-authoritative Guest requests.
+        private static readonly Dictionary<string, Dictionary<string, object>>
+            actionPreHiddenCardStates =
+            new Dictionary<string, Dictionary<string, object>>(
+                StringComparer.Ordinal);
+        private static readonly Dictionary<int, string>
+            authorityPlayerHistorySignatures =
+            new Dictionary<int, string>();
+        private static readonly Dictionary<int, int>
+            authorityPlayerHistoryRevisions =
+            new Dictionary<int, int>();
+        private static bool authorityLocalReplayActive;
+        // NetworkBattleData creates ReplaceReceivedCard from a CardDataModel
+        // that already contains the exact owner (isOpponent).  Keep that
+        // owner beside the short-lived receiver object so authority replay can
+        // disambiguate two cards that legitimately share the same index/cardId
+        // on opposite sides.  ConditionalWeakTable avoids retaining receivers
+        // after the native replacement pass completes.
+        private sealed class AuthorityReceivedCardOwnerHint
+        {
+            internal bool GuestOwnsCard;
+        }
+
+        private static readonly ConditionalWeakTable<ReplaceReceivedCard,
+            AuthorityReceivedCardOwnerHint> AuthorityReceivedCardOwnerHints =
+            new ConditionalWeakTable<ReplaceReceivedCard,
+                AuthorityReceivedCardOwnerHint>();
+
+        internal static bool IsHostAuthorityMode => IsActive &&
+            (Role == P2PRole.Host || Role == P2PRole.Guest);
+        internal static bool UsesNativeClientActionTiming =>
+            UseNativeClientActionTiming;
+        internal static bool IsProcessingNativeReceivedBattleAction =>
+            processingReceivedBattleAction;
+        internal static bool IsAuthorityLocalReplayActive => authorityLocalReplayActive;
+
+        internal static void ApplyAuthorityReplayReceiverOwnership(
+            Dictionary<string, object> data,
+            ref bool isPlayer)
+        {
+            if (!IsHostAuthorityMode || Role != P2PRole.Guest ||
+                !ReadAuthorityBool(data, "p2pAuthorityLocalReplay"))
+            {
+                return;
+            }
+
+            authorityLocalReplayActive = true;
+            isPlayer = true;
+        }
+
+        internal static void MarkReceivedNativeBattleOperationStarted()
+        {
+            if (!IsActive || !processingReceivedBattleAction ||
+                !receivedBattleActionPendingUntilVfx)
+            {
+                return;
+            }
+
+            receivedBattleActionOperationStarted = true;
+        }
+
+        internal static bool ShouldSuppressNativeBattleEmit =>
+            IsActive &&
+            (peerDisconnected ||
+                authorityLocalReplayActive ||
+                (Role == P2PRole.Host &&
+                    !string.IsNullOrEmpty(activeAuthorityExecutionRequestId)));
+
+        internal static bool ShouldQueueSuppressedNativeBattleAcknowledgement =>
+            IsActive && !peerDisconnected &&
+            (authorityLocalReplayActive ||
+                (Role == P2PRole.Host &&
+                    !string.IsNullOrEmpty(activeAuthorityExecutionRequestId)));
+
+        internal static bool SuppressNativeBattleEmit(
+            string uri,
+            Action onFinishedSend)
+        {
+            if (!ShouldSuppressNativeBattleEmit)
+            {
+                return false;
+            }
+
+            try
+            {
+                // The native caller treats the callback as local send
+                // completion.  Complete it immediately because no remote
+                // acknowledgement exists during an authority execution or a
+                // Guest-side replay.
+                onFinishedSend?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Suppressed native emit completion callback failed: " +
+                    ex.Message);
+            }
+            Plugin.Logger.LogDebug(
+                "[P2P] Suppressed native battle emit during authority " +
+                "execution/replay: " + (uri ?? "?") + ".");
+            return true;
+        }
+
+        internal static bool SuppressNativeBattleInput()
+        {
+            return ShouldSuppressNativeBattleEmit;
+        }
+
+        internal static bool IsAuthorityGuestExecution =>
+            IsActive && Role == P2PRole.Host &&
+            !string.IsNullOrEmpty(activeAuthorityExecutionRequestId);
+
+        internal static void AttachAuthorityActionProcessorEvents(
+            NetworkBattleManagerBase manager,
+            Wizard.Battle.ActionProcessor processor)
+        {
+            if (!IsAuthorityGuestExecution || manager == null || processor == null ||
+                !AuthorityActionProcessors.Add(processor))
+            {
+                return;
+            }
+
+            // These are the same registrations made by
+            // NetworkBattleManagerBase.SetupNetworkActionProcessorEvent, but
+            // without its local-player gate.  The native SendCardDataMaker then
+            // receives the exact metamorphose/choice/fusion/condition records
+            // that it would have received for a normal player action.
+            processor.OnTransform += (card, id, isChoice) =>
+                CaptureAuthorityTransform(manager, card, id, isChoice);
+            processor.OnSpecialAccelerate += skill =>
+                CaptureAuthoritySpecialAccelerate(manager, skill);
+            processor.OnBeforeChosenPlayCard +=
+                (originalCard, playCard, chosenIndexes) =>
+                    CaptureAuthorityChosenPlay(
+                        manager, originalCard, playCard, chosenIndexes);
+            processor.OnBeforeChosenEvolution +=
+                (originalCard, evolCard, chosenIndexes) =>
+                    CaptureAuthorityChosenEvolution(
+                        manager, originalCard, evolCard, chosenIndexes);
+            processor.OnBeforeFusion += (originalCard, selectedCards) =>
+                CaptureAuthorityFusion(manager, originalCard, selectedCards);
+        }
+
+        private static bool IsAuthorityGuestCard(BattleCardBase card)
+        {
+            return IsAuthorityGuestExecution && card != null && !card.IsPlayer;
+        }
+
+        private static void CaptureAuthorityTransform(
+            NetworkBattleManagerBase manager,
+            BattleCardBase originalCard,
+            int transformCardId,
+            bool isChoice)
+        {
+            if (!IsAuthorityGuestCard(originalCard) || transformCardId <= 0 ||
+                manager.RegisterActionManager == null)
+            {
+                return;
+            }
+
+            bool alreadyRegistered = manager.RegisterActionManager.RegisterDataList
+                .OfType<RegisterMetamorphoseData>()
+                .Any(item => item.Index == originalCard.Index &&
+                    item.AfterId == transformCardId &&
+                    item.IsSelf == originalCard.IsPlayer &&
+                    item.IsChoice == isChoice);
+            if (!alreadyRegistered)
+            {
+                manager.RegisterActionManager.Add(
+                    new RegisterMetamorphoseData(
+                        transformCardId,
+                        originalCard.Index,
+                        originalCard.IsPlayer,
+                        null,
+                        isChoice,
+                        false,
+                        false));
+            }
+
+            // The native sender normally records this mutation from the local
+            // player's OnTransform callback.  A Host executes Guest cards as
+            // BattleEnemy, so that callback is skipped by the stock manager.
+            // Keep the transformed identity in the same tracker used by local
+            // emits; the authority result can then publish the transformed
+            // knownList entry while retaining the original pre-action cost.
+            if (!isChoice)
+            {
+                try
+                {
+                    int keyActionType = NetworkBattleGenericTool.IsAcceleratedCard(
+                            originalCard)
+                        ? (int)SendKeyActionDataManager.KeyActionType.Accelerated
+                        : NetworkBattleGenericTool.IsCrystallizeCard(originalCard)
+                            ? (int)SendKeyActionDataManager.KeyActionType.Crystallize
+                            : 0;
+                    if (keyActionType != 0)
+                    {
+                        BattleCardBase transformed = originalCard.MetamorphoseCard;
+                        int transformedCost = transformed?.Cost ?? originalCard.Cost;
+                        RememberCardMutationForOwner(
+                            false,
+                            originalCard.Index,
+                            originalCard.CardId,
+                            originalCard.Cost,
+                            transformCardId,
+                            transformedCost,
+                            keyActionType);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Logger.LogDebug(
+                        "[P2P] Could not cache the Guest card mutation: " +
+                        ex.Message);
+                }
+            }
+        }
+
+        private static void CaptureAuthoritySpecialAccelerate(
+            NetworkBattleManagerBase manager,
+            SkillBase skill)
+        {
+            if (!IsAuthorityGuestCard(skill?.SkillPrm?.ownerCard) ||
+                !RegisterSkillConditionCheck.IsSkillConditionCheck(
+                    skill, false, false) ||
+                manager._networkBattleSetupCardEventBase == null)
+            {
+                return;
+            }
+
+            manager._networkBattleSetupCardEventBase.Event_SkillConditionCheck(
+                skill, new List<BattleCardBase>(), null);
+        }
+
+        private static SendKeyActionDataManager
+            GetAuthoritySendKeyActionDataManager(
+                NetworkBattleManagerBase manager)
+        {
+            if (manager == null || !TryFindInstanceField(
+                    manager.GetType(), "sendKeyActionDataManager",
+                    out FieldInfo field))
+            {
+                return null;
+            }
+
+            try
+            {
+                return field.GetValue(manager) as SendKeyActionDataManager;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not read authority key-action manager: " +
+                    ex.Message);
+                return null;
+            }
+        }
+
+        private static void CaptureAuthorityChosenPlay(
+            NetworkBattleManagerBase manager,
+            BattleCardBase originalCard,
+            BattleCardBase playCard,
+            List<int> chosenIndexes)
+        {
+            if (!IsAuthorityGuestCard(originalCard) || playCard == null ||
+                NetworkBattleGenericTool.IsAcceleratedCard(originalCard) ||
+                NetworkBattleGenericTool.IsCrystallizeCard(originalCard) ||
+                playCard.IsChoiceBraveSkillCard)
+            {
+                // Accelerated/Crystallize and ChoiceBrave are already covered by
+                // the original manager callback, whose condition explicitly
+                // allows those two cases even for an opponent card.
+                return;
+            }
+
+            GetAuthoritySendKeyActionDataManager(manager)?.SettingKeyActionData(
+                originalCard, playCard, chosenIndexes, false);
+        }
+
+        private static void CaptureAuthorityChosenEvolution(
+            NetworkBattleManagerBase manager,
+            BattleCardBase originalCard,
+            BattleCardBase evolCard,
+            List<int> chosenIndexes)
+        {
+            if (!IsAuthorityGuestCard(originalCard) || evolCard == null)
+            {
+                return;
+            }
+
+            GetAuthoritySendKeyActionDataManager(manager)?.SettingKeyActionData(
+                originalCard, evolCard, chosenIndexes, true);
+        }
+
+        private static void CaptureAuthorityFusion(
+            NetworkBattleManagerBase manager,
+            BattleCardBase originalCard,
+            IEnumerable<BattleCardBase> selectedCards)
+        {
+            if (!IsAuthorityGuestCard(originalCard) || selectedCards == null)
+            {
+                return;
+            }
+
+            GetAuthoritySendKeyActionDataManager(manager)?.SettingFusionKeyActionData(
+                originalCard, selectedCards);
+        }
 
         internal static P2PRole Role { get; private set; }
         internal static bool IsActive { get; private set; }
@@ -265,15 +729,31 @@ namespace Shadowbus
             TryApplyPendingPlayerHistoryStates();
             TryApplyPendingFusionActions();
             TryCompleteReceivedBattleAction();
-            TryClearConsumedAuthoritativeSkillTargets();
-            TryClearConsumedAuthoritativeSkillEvaluations();
+            if (!UseNativeClientActionTiming)
+            {
+                TryClearConsumedAuthoritativeSkillTargets();
+                TryClearConsumedAuthoritativeSkillEvaluations();
+                TryCheckAuthorityExecutionTimeout();
+                TryCheckAuthorityRequestTimeout();
+            }
             TryCheckPendingBattleStates();
-            // Check the boundary that just became idle before injecting the next
-            // queued action. Otherwise a TurnEnd/TurnStart transition can make
-            // the previous checkpoint look one turn ahead and produce a false
-            // DATA DESYNC report.
+            if (!UseNativeClientActionTiming)
+            {
+                // Check the completed boundary before dispatching the next one.
+                // Authority replay is deliberately single-flight: a newer native
+                // URI must not observe or mutate the previous action's VFX/state.
+                TryInjectPendingAuthorityReplayAction();
+            }
             TryInjectPendingReceivedPlayAction();
-            ObserveLocalHiddenCardStates();
+            if (!UseNativeClientActionTiming)
+            {
+                // The legacy replay model needed a continuously refreshed
+                // private-card cache because it replaced hand/deck objects
+                // after another client had executed the action.  The native
+                // client path does not do that replacement, so walking every
+                // private card every frame is pure CPU/GC overhead.
+                ObserveLocalHiddenCardStates();
+            }
             if (!peerDisconnected)
             {
                 return;
@@ -462,7 +942,7 @@ namespace Shadowbus
                 CharaId = deck.GetSkinId(false),
                 SleeveId = deck.GetDeckSleeveID()
             };
-            if (Role == P2PRole.Guest)
+            if (Role == P2PRole.Guest || Role == P2PRole.Host)
             {
                 SendWire(new P2PWireMessage { Type = "deck", Deck = LocalDeck });
             }
@@ -536,6 +1016,7 @@ namespace Shadowbus
                 {
                     localActionCaptureActive = false;
                     PendingLocalConditionResults.Clear();
+                    actionPreHiddenCardStates.Clear();
                 }
             }
         }
@@ -570,16 +1051,95 @@ namespace Shadowbus
             messageData["uri"] = uri;
             messageData["viewerId"] = LocalProfile?.ViewerId ?? P2PIdentity.ViewerId;
             messageData["bid"] = BattleId ?? string.Empty;
-            AppendLocalHiddenCardState(uri, messageData);
-            AppendLocalPlayerHistoryState(uri, messageData,
-                preActionHistoryState, preActionHistoryRevision);
-            if (IsOrderedLocalBattleMessage(uri))
+            if (UseNativeClientActionTiming)
+            {
+                // Native v3 has one authoritative source: the original
+                // orderList/uList/knownList response. Do not let a stale
+                // compatibility manifest or snapshot hitch a ride on a new
+                // native packet.
+                messageData.Remove(P2PBattleProtocol.ActionManifestKey);
+                messageData.Remove("p2pAuthoritativeSkillTargets");
+                messageData.Remove("p2pAuthoritativeSkillEvaluations");
+                messageData.Remove(P2PBattleStateDiagnostics.StateKey);
+            }
+            if (Role == P2PRole.Host && !string.IsNullOrEmpty(activeAuthorityExecutionRequestId))
+            {
+                messageData[P2PBattleProtocol.AuthorityResultRequestIdKey] =
+                    activeAuthorityExecutionRequestId;
+            }
+            if (!UseNativeClientActionTiming)
+            {
+                // Legacy request/result replay required post-action private
+                // snapshots because the Guest had not executed the operation.
+                // With native client timing both peers execute the same native
+                // operation and the stock orderList/knownList/uList envelope
+                // is the source of truth.  Capturing complete hand/deck and
+                // history objects here is both non-native and expensive.
+                AppendLocalHiddenCardState(uri, messageData);
+                if (Role == P2PRole.Host && IsOrderedLocalBattleMessage(uri))
+                {
+                    AttachActionPreHiddenMetamorphoseOriginals(messageData);
+                }
+                AppendLocalPlayerHistoryState(uri, messageData,
+                    preActionHistoryState, preActionHistoryRevision);
+                if (Role == P2PRole.Host &&
+                    IsHostAuthorityMode &&
+                    IsOrderedLocalBattleMessage(uri) &&
+                    BattleManagerBase.GetIns() is NetworkBattleManagerBase authorityManager)
+                {
+                    EnsureNativePrivateMoveIdentities(
+                        authorityManager, messageData);
+                    AppendAuthorityResultMetadata(authorityManager, messageData);
+                }
+            }
+            else if (IsHostAuthorityMode && IsOrderedLocalBattleMessage(uri))
+            {
+                // Native client timing keeps the original local action/VFX
+                // order, but Host authority still needs the changed private
+                // card state before the next condition is evaluated. Reuse the
+                // existing incremental hidden-state adapter here: it scans the
+                // native card objects, emits only changed signatures, and the
+                // receiver applies the data at its normal
+                // BeforeSettingReceiveData/native post-action boundaries.
+                //
+                // This is deliberately not a complete hand/deck snapshot and
+                // does not replace knownList/uList/orderList. It only carries
+                // state that the closed official server would have returned
+                // for a private-zone mutation that the native wire format
+                // cannot expose to the opponent.
+                AppendLocalHiddenCardState(uri, messageData);
+                // History-dependent conditions use the same native
+                // BattlePlayerBase lists/scalars as the local client. Keep the
+                // state incremental and let the receiver apply it only after
+                // the ordered native action boundary, so this does not alter
+                // operation or VFX ordering.
+                AppendLocalPlayerHistoryState(uri, messageData);
+                AttachActionPreHiddenMetamorphoseOriginals(messageData);
+            }
+            else if (IsOrderedLocalBattleMessage(uri))
+            {
+                // The native payload does not expose the pre-transform hand
+                // identity needed by its own fusion-metamorphose receiver
+                // path. Preserve that one card identity only; do not rebuild
+                // complete private-zone snapshots.
+                AttachActionPreHiddenMetamorphoseOriginals(messageData);
+            }
+            if (ShouldPublishAuthoritativeActionManifest(uri, messageData))
             {
                 DrainPendingLocalConditionResults();
+                AppendLocalActionManifest(uri, messageData);
+                AppendLocalAuthoritativeSkillTargets(uri, messageData);
+                AppendLocalAuthoritativeSkillEvaluations(uri, messageData);
             }
-            AppendLocalActionManifest(uri, messageData);
-            AppendLocalAuthoritativeSkillTargets(uri, messageData);
-            AppendLocalAuthoritativeSkillEvaluations(uri, messageData);
+            else if (IsOrderedLocalBattleMessage(uri))
+            {
+                // Ordinary Host packets are already committed authority output.
+                // Do not attach a second private-condition program for the
+                // Guest to replay; it is both redundant and the source of the
+                // old "unconsumed evaluation" batches.
+                LocalAuthoritativeSkillTargets.Clear();
+                LocalAuthoritativeSkillEvaluations.Clear();
+            }
             RemovePrivateTwoPickDraftData(messageData, uri);
             if (string.Equals(
                     uri,
@@ -590,11 +1150,9 @@ namespace Shadowbus
                     $"[P2P] Emitting RoomEntry as {Role}; agentReady={currentAgent != null}.");
             }
 
-            if (P2PBattleProtocol.CarriesBattleStateCheckpoint(uri))
+            if (!IsHostAuthorityMode &&
+                P2PBattleProtocol.CarriesBattleStateCheckpoint(uri))
             {
-                // A local checkpoint means the battle has advanced beyond any peer
-                // snapshot still waiting for the shared VFX queue to become idle.
-                PendingBattleStateChecks.Clear();
                 Dictionary<string, object> state = CaptureBattleState();
                 if (state != null)
                 {
@@ -684,6 +1242,8 @@ namespace Shadowbus
                     selectionSummary + ".");
             }
 
+            CaptureLocalChoiceSelection(parameters, uri);
+
             if (uri != NetworkBattleSender.HAND_URI_TYPE.SELECT_SKILL_URI &&
                 uri != NetworkBattleSender.HAND_URI_TYPE.SLIDE_OBJECT_URI)
             {
@@ -715,6 +1275,67 @@ namespace Shadowbus
                     ["pubSeq"] = sequenceNumber
                 };
             Enqueue(() => agent?.OnAck?.Invoke(acknowledgement));
+        }
+
+        private static void CaptureLocalChoiceSelection(
+            IList<object> parameters,
+            NetworkBattleSender.HAND_URI_TYPE uri)
+        {
+            if (Role != P2PRole.Guest ||
+                uri != NetworkBattleSender.HAND_URI_TYPE.SELECT_SKILL_URI ||
+                parameters == null || parameters.Count == 0 ||
+                !TryConvertAuthorityInt(parameters[0], out int operation))
+            {
+                return;
+            }
+            // SELECT_CHOICE_CARD and COMPLETE_CHOICE_SELECT carry the selected
+            // hand-card indices as a comma separated operation number.
+            if (operation == 0 || operation == 3 || operation == 5)
+            {
+                localAuthorityChoiceCardIndexes.Clear();
+                return;
+            }
+            if (operation != 4 && operation != 6)
+            {
+                return;
+            }
+            if (parameters.Count < 4)
+            {
+                return;
+            }
+            string encoded = parameters[3]?.ToString();
+            if (string.IsNullOrWhiteSpace(encoded))
+            {
+                return;
+            }
+            foreach (string part in encoded.Split(','))
+            {
+                if (int.TryParse(part, NumberStyles.Integer,
+                        CultureInfo.InvariantCulture, out int index) && index > 0 &&
+                    !localAuthorityChoiceCardIndexes.Contains(index))
+                {
+                    localAuthorityChoiceCardIndexes.Add(index);
+                }
+            }
+        }
+
+        private static List<int> ResolveCachedChoiceIds(BattlePlayerBase player)
+        {
+            List<int> result = new List<int>();
+            if (player == null)
+            {
+                return result;
+            }
+            foreach (int index in localAuthorityChoiceCardIndexes)
+            {
+                BattleCardBase card = NetworkBattleGenericTool.GetIndexToCardBase(
+                    BattleManagerBase.GetIns(), player, index);
+                if (card != null && card.CardId > 0)
+                {
+                    result.Add(card.BaseParameter?.CardId ?? card.CardId);
+                }
+            }
+            return result;
         }
 
         internal static void QueueAcknowledgement(
@@ -785,10 +1406,16 @@ namespace Shadowbus
             LocalHiddenCardStates.Clear();
             ReceivedHiddenCardStates.Clear();
             PendingReceivedHiddenCardStates.Clear();
+            PostActionHiddenCardStateKeys.Clear();
+            NativeBaselineHiddenCardStateKeys.Clear();
+            ReportedMissingNativePrivateIdentities.Clear();
             ReceivedHiddenCardStateSignatures.Clear();
             AppliedReceivedHiddenCardStates.Clear();
+            NativePromotedReceivedHiddenCardStateSignatures.Clear();
+            NativeReplacedReceivedHiddenCardStateSignatures.Clear();
             PrivateConditionWarnings.Clear();
             localPrivateStateSent = false;
+            localPrivateStateAcknowledged = false;
             remotePrivateStateReceived = false;
             PendingFusionActions.Clear();
             PendingFusionActionSignatures.Clear();
@@ -810,15 +1437,54 @@ namespace Shadowbus
             localActionManifestSequence = 0;
             localActionCaptureActive = false;
             processingReceivedBattleAction = false;
+            receivedBattleActionInjectionPending = false;
             receivedBattleActionPendingUntilVfx = false;
+            receivedBattleActionOperationStarted = false;
             receivedBattleActionStartedUtc = DateTime.MinValue;
             receivedBattleActionStallReported = false;
             nativeReceivedMetadataActive = false;
+            currentAuthorityReplayData = null;
             PendingReceivedBattleMessages.Clear();
+            PendingAuthorityReplayActions.Clear();
+            authorityReplayDispatchActive = false;
             LocalFusionIngredientSnapshots.Clear();
             ReceivedPlayerHistoryStates.Clear();
             PendingPreActionPlayerHistoryStates.Clear();
             AppliedPlayerHistoryRevisions.Clear();
+            authorityTransitionSequence = 0;
+            authorityResultActionSequence = 0;
+            authorityGuestKnownIndices.Clear();
+            foreach (HashSet<int> indices in authorityKnownPrivateIndicesByOwner.Values)
+            {
+                indices.Clear();
+            }
+            authorityPrivateStateSignatures.Clear();
+            authorityPrivateStates.Clear();
+            actionPreHiddenCardStates.Clear();
+            authorityPlayerHistorySignatures.Clear();
+            authorityPlayerHistoryRevisions.Clear();
+            // A new RoomReady boundary starts a fresh battle while the TCP
+            // session (and therefore BattleId) remains alive.  Request IDs are
+            // only unique within one battle round; retaining the old dedupe
+            // table would silently drop a valid request in the next round.
+            processedAuthorityRequests.Clear();
+            authorityRequestTimes.Clear();
+            completedAuthorityRequestIds.Clear();
+            appliedAuthorityResultBoundaries.Clear();
+            guestAuthorityBusy = false;
+            guestAuthorityRequestId = null;
+            guestAuthorityRequestAction = null;
+            guestAuthorityRequestSentUtc = DateTime.MinValue;
+            receivedAuthorityRequestId = null;
+            activeReceivedBattleActionUri = null;
+            activeAuthorityExecutionRequestId = null;
+            activeAuthorityExecutionStartedUtc = DateTime.MinValue;
+            authorityLocalReplayActive = false;
+            authorityRandomAttackCandidates = null;
+            authorityResolvedAttackTarget = null;
+            authorityReplayRandomAttackCandidateCount = 0;
+            authorityReplayRandomAttackTargetIndex = -1;
+            AuthorityActionProcessors.Clear();
             localPlayerHistoryStateSignature = string.Empty;
             localPlayerHistoryRevision = 0;
             localPlayerHistoryBaselineSignature = string.Empty;
@@ -835,6 +1501,7 @@ namespace Shadowbus
             mulliganReadySent = false;
             battleSeed = 0;
             DealState.Reset();
+            P2PAuthoritativeServer.Reset();
         }
 
         internal static void FailJoin(string error)
@@ -906,13 +1573,32 @@ namespace Shadowbus
             int mutationCost,
             int keyActionType)
         {
+            RememberCardMutationForOwner(
+                Role == P2PRole.Host,
+                playIndex,
+                originalCardId,
+                originalCost,
+                mutationCardId,
+                mutationCost,
+                keyActionType);
+        }
+
+        private static void RememberCardMutationForOwner(
+            bool ownerIsHost,
+            int playIndex,
+            int originalCardId,
+            int originalCost,
+            int mutationCardId,
+            int mutationCost,
+            int keyActionType)
+        {
             if (!IsActive)
             {
                 return;
             }
 
             bool recorded = BattleCardTracker.RememberSourceCardMutation(
-                Role == P2PRole.Host,
+                ownerIsHost,
                 playIndex,
                 originalCardId,
                 originalCost,
@@ -925,7 +1611,8 @@ namespace Shadowbus
             }
 
             Plugin.Logger.LogInfo(
-                $"[P2P] Recorded card mutation: playIdx={playIndex}, " +
+                $"[P2P] Recorded {SideName(ownerIsHost)} card mutation: " +
+                $"playIdx={playIndex}, " +
                 $"type={keyActionType}, originalCardId={originalCardId}, " +
                 $"originalCost={originalCost}, mutationCardId={mutationCardId}, " +
                 $"mutationCost={mutationCost}.");
@@ -1016,9 +1703,36 @@ namespace Shadowbus
                         HandleServerEmit(false, message.Data);
                     }
                     break;
+                case P2PBattleProtocol.AuthorityRequestUri:
+                    if (Role == P2PRole.Host)
+                    {
+                        // New P2P rounds use the native sender/receiver packet
+                        // flow exclusively. Do not reactivate the former
+                        // request/result replay architecture because a delayed
+                        // legacy frame can otherwise suppress native emits and
+                        // strand the current battle in an authority VFX gate.
+                        SendAuthorityReject(message.RequestId,
+                            "legacy authority requests are not supported by this P2P protocol version");
+                        Plugin.Logger.LogWarning(
+                            "[P2P] Rejected a legacy authority request; native " +
+                            "client timing is required for this battle.");
+                    }
+                    break;
+                case P2PBattleProtocol.AuthorityRejectUri:
+                    Plugin.Logger.LogWarning(
+                        "[P2P] Ignored a legacy authority rejection packet.");
+                    break;
+                case P2PBattleProtocol.AuthorityAckUri:
+                    Plugin.Logger.LogWarning(
+                        "[P2P] Ignored a legacy authority acknowledgement packet.");
+                    break;
                 case "deliver":
                     if (Role == P2PRole.Guest && message.Data != null)
                     {
+                        if (!IsCurrentBattleMessage(message))
+                        {
+                            return;
+                        }
                         string deliveredUri = GetUri(message.Data);
                         if (string.Equals(
                                 deliveredUri,
@@ -1047,7 +1761,28 @@ namespace Shadowbus
                 case "private_state":
                     if (message.Data != null)
                     {
+                        if (Role == P2PRole.Host)
+                        {
+                            // Host owns the authoritative protocol cache. Keep
+                            // the Guest baseline here as wire data, before any
+                            // legacy client-side compatibility adapter touches
+                            // BattleEnemy card objects.
+                            P2PAuthoritativeServer.RememberPrivateStateSnapshot(
+                                message.Data);
+                        }
                         RememberReceivedPrivateStateSnapshot(message.Data);
+                        if (TryGetStateInt(message.Data, "owner",
+                                out int receivedOwner) &&
+                            (receivedOwner == 0 || receivedOwner == 1))
+                        {
+                            // A sender may omit its full private baseline only
+                            // after the receiver has acknowledged this exact
+                            // owner. Acknowledging both directions also closes
+                            // the startup race where the Host emits its first
+                            // action before the Guest has installed the Host
+                            // hand/deck identity table.
+                            SendPrivateStateAcknowledgement(receivedOwner);
+                        }
                         // The host answers the guest's baseline with its own
                         // baseline. If cards are not loaded yet, Update() will
                         // retry this after the battle manager becomes ready.
@@ -1057,11 +1792,46 @@ namespace Shadowbus
                         }
                     }
                     break;
+                case P2PBattleProtocol.PrivateStateAckUri:
+                    if (message.Data == null ||
+                        !TryGetStateInt(message.Data, "owner",
+                            out int acknowledgedOwner) ||
+                        (acknowledgedOwner != 0 && acknowledgedOwner != 1) ||
+                        acknowledgedOwner != (Role == P2PRole.Host ? 1 : 0))
+                    {
+                        // Ignore malformed acknowledgements and acknowledgements
+                        // for the peer's baseline. The sender must only mark its
+                        // local baseline as acknowledged.
+                        break;
+                    }
+                    localPrivateStateAcknowledged = true;
+                    Plugin.Logger.LogDebug(
+                        "[P2P] Peer acknowledged the local private-state baseline " +
+                        "(owner=" + acknowledgedOwner + ").");
+                    break;
                 case "diagnostic":
                     if (Role == P2PRole.Host && !string.IsNullOrEmpty(message.Error))
                     {
-                        Plugin.Logger.LogError(
-                            "[P2P] Remote client diagnostic: " + message.Error);
+                        bool isDesync = IsDesyncDiagnostic(message.Error);
+                        string severity = message.Data != null &&
+                            message.Data.TryGetValue("severity", out object rawSeverity)
+                            ? rawSeverity?.ToString()
+                            : null;
+                        if (string.Equals(severity, "error",
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            isDesync = true;
+                        }
+                        if (isDesync)
+                        {
+                            Plugin.Logger.LogError(
+                                "[P2P] Remote client diagnostic: " + message.Error);
+                        }
+                        else
+                        {
+                            Plugin.Logger.LogWarning(
+                                "[P2P] Remote client diagnostic: " + message.Error);
+                        }
                     }
                     break;
                 case "close":
@@ -1234,56 +2004,4152 @@ namespace Shadowbus
                 return;
             }
 
-            bool revealed = P2PBattleProtocol.TryReadPreparedAction(
-                data, out int playIndex, out int cardId);
-            if (!revealed)
+            if (!P2PAuthoritativeServer.TryCreateAction(
+                    sourceIsHost,
+                    SourceViewerId(sourceIsHost),
+                    data,
+                    out P2PHostAuthoritativeAction action,
+                    out string actionError))
             {
-                // Compatibility fallback for an unprepared peer. Current peers
-                // prepare at the source, so forwarding must preserve that data.
-                revealed = BattleCardTracker.PrepareOutgoingAction(
-                    sourceIsHost, data, out playIndex, out cardId,
-                    null, null,
-                    warning => Plugin.Logger.LogWarning(
-                        $"[P2P] {SideName(sourceIsHost)} hidden-card synchronization: " +
-                        warning + "."));
+                Plugin.Logger.LogError(
+                    "[P2P] Host rejected malformed client battle request: " +
+                    actionError + ".");
+                return;
             }
+
+            bool revealed = P2PBattleProtocol.TryReadPreparedAction(
+                action.Request.Data, out int playIndex, out int cardId);
+            if (!revealed && uri == NetworkBattleDefine.NetworkBattleURI.PlayActions.ToString())
+            {
+                // Protocol v3 requires the originating NetworkBattleSender
+                // path to supply native knownList/orderList/uList information
+                // before the request reaches Host. Do not reconstruct a Guest
+                // action from the Host client's BattleEnemy here: that was the
+                // former custom replay path and can bind a response to an
+                // already-mutated local card object.
+                Plugin.Logger.LogDebug(
+                    "[P2P] Host response actionId=" + action.ServerActionId +
+                    " has no prepared play-card marker; preserving the native " +
+                    "request envelope without Host-side card reconstruction.");
+            }
+
             if (uri == NetworkBattleDefine.NetworkBattleURI.PlayActions.ToString())
             {
                 Plugin.Logger.LogInfo(
-                    $"[P2P] Battle emit {SideName(sourceIsHost)} -> opponent: {uri} " +
+                    $"[P2P] Host accepted client PlayActions from {SideName(sourceIsHost)}: " +
                     $"playIdx={playIndex}, cardId={(revealed ? cardId : 0)}, " +
-                    $"keys=[{string.Join(",", data.Keys)}]; " +
-                    P2PBattleStateDiagnostics.DescribeBattleMessage(data) + ".");
+                    $"requestSeq={action.Request.SourceSequence}, " +
+                    $"serverActionId={action.ServerActionId}, " +
+                    $"keys=[{string.Join(",", action.Request.Data.Keys)}]; " +
+                    P2PBattleStateDiagnostics.DescribeBattleMessage(
+                        action.ServerResponse) + ".");
             }
 
-            P2PBattleRoute route = P2PBattleProtocol.GetRoute(uri);
-            if (route == P2PBattleRoute.Consume)
+            if (!P2PAuthoritativeServer.TryCreateDelivery(
+                    action, out P2PServerBattleDelivery delivery))
             {
                 Plugin.Logger.LogInfo(
-                    $"[P2P] Consumed {uri} confirmation from {SideName(sourceIsHost)}.");
+                    $"[P2P] Host consumed {uri} confirmation from " +
+                    $"{SideName(sourceIsHost)}.");
                 return;
             }
-            if (P2PBattleProtocol.RequiresActiveTurnState(uri))
-            {
-                data["turnState"] = 0;
-            }
 
-            bool toHost = route == P2PBattleRoute.Source
-                ? sourceIsHost
-                : !sourceIsHost;
             if (uri == NetworkBattleDefine.NetworkBattleURI.TurnEndActions.ToString() ||
                 uri == NetworkBattleDefine.NetworkBattleURI.TurnEnd.ToString() ||
                 uri == NetworkBattleDefine.NetworkBattleURI.TurnStart.ToString() ||
                 uri == NetworkBattleDefine.NetworkBattleURI.Judge.ToString())
             {
                 Plugin.Logger.LogInfo(
-                    $"[P2P] Battle emit {SideName(sourceIsHost)} -> " +
-                    $"{(toHost ? "Host" : "Guest")}: {uri} (turnState=0).");
+                    $"[P2P] Host delivered actionId={delivery.ServerActionId}, {uri} " +
+                    $"from {SideName(sourceIsHost)} to " +
+                    $"{(delivery.ToHost ? "Host" : "Guest")} (turnState=0).");
             }
-            Dictionary<string, object> routedData = route == P2PBattleRoute.Opponent
-                ? P2PMessageTransform.PrepareOpponentBattleMessage(data)
-                : data;
-            Deliver(toHost, routedData, SourceViewerId(sourceIsHost));
+            Deliver(delivery.ToHost, delivery.Data, delivery.SourceViewerId);
+
+            // Match the stock server/client turn transition. The client that
+            // receives TurnEnd runs TurnEndOperation(false) and emits Judge;
+            // the server routes that Judge back to its source. The source then
+            // runs NetworkOperationCollection.JudgeOperation, which invokes
+            // ControlTurnStartPlayer through the original state machine.
+        }
+
+        private static bool IsBattleFinished(NetworkBattleManagerBase manager)
+        {
+            if (manager == null)
+            {
+                return false;
+            }
+            try
+            {
+                return P2PBattleResult.IsTerminalResult(
+                    (int)manager.JudgeCurrentFinishStatus());
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not evaluate the battle finish boundary: " +
+                    ex.Message);
+                return false;
+            }
+        }
+
+        internal static bool TryInterceptGuestPlayCard(
+            BattleCardBase card,
+            bool isPlayer,
+            List<BattleCardBase> selectedCards,
+            bool isRecovery,
+            List<int> selectChoiceId,
+            bool isChoiceBrave,
+            out Wizard.Battle.View.Vfx.VfxBase result)
+        {
+            result = null;
+            if (UseNativeClientActionTiming)
+            {
+                // Let NetworkStandardBattleMgr -> NetworkBattleSender run.
+                // It executes the Guest's action immediately and emits the
+                // original PlayActions packet from the normal callback.
+                return false;
+            }
+            if (ShouldBlockGuestAuthorityAction(isPlayer, isRecovery))
+            {
+                // A second touch can arrive while the Host is still executing
+                // the previous request.  Swallow it instead of letting the
+                // native OperateMgr mutate the Guest's local mirror.
+                result = Wizard.Battle.View.Vfx.NullVfx.GetInstance();
+                return true;
+            }
+            if (!ShouldInterceptGuestAction(isPlayer, isRecovery))
+            {
+                return false;
+            }
+            if (card == null || !IsValidAuthorityActor(card))
+            {
+                RejectLocalAuthorityAction("the selected card is unavailable");
+                result = Wizard.Battle.View.Vfx.NullVfx.GetInstance();
+                return true;
+            }
+            List<int> choiceIds = selectChoiceId == null || selectChoiceId.Count == 0
+                ? ResolveCachedChoiceIds(card.SelfBattlePlayer)
+                : new List<int>(selectChoiceId);
+            List<int> selectSkillIndexes =
+                BattleSelectionTracker.TakeAuthoritySkillIndexes();
+            SendAuthorityRequest("play", card, selectedCards, null, choiceIds,
+                isChoiceBrave, selectSkillIndexes);
+            result = Wizard.Battle.View.Vfx.NullVfx.GetInstance();
+            return true;
+        }
+
+        internal static bool TryInterceptGuestEvolution(
+            BattleCardBase card,
+            bool isPlayer,
+            List<BattleCardBase> selectedCards,
+            List<int> selectChoiceId,
+            out Wizard.Battle.View.Vfx.VfxBase result)
+        {
+            result = null;
+            if (UseNativeClientActionTiming)
+            {
+                return false;
+            }
+            if (ShouldBlockGuestAuthorityAction(isPlayer, false))
+            {
+                result = Wizard.Battle.View.Vfx.NullVfx.GetInstance();
+                return true;
+            }
+            if (!ShouldInterceptGuestAction(isPlayer, false))
+            {
+                return false;
+            }
+            if (card == null || !IsValidAuthorityActor(card))
+            {
+                RejectLocalAuthorityAction("the selected evolution card is unavailable");
+                result = Wizard.Battle.View.Vfx.NullVfx.GetInstance();
+                return true;
+            }
+            List<int> choiceIds = selectChoiceId == null || selectChoiceId.Count == 0
+                ? ResolveCachedChoiceIds(card.SelfBattlePlayer)
+                : new List<int>(selectChoiceId);
+            List<int> selectSkillIndexes =
+                BattleSelectionTracker.TakeAuthoritySkillIndexes();
+            SendAuthorityRequest("evolution", card, selectedCards, null, choiceIds,
+                false, selectSkillIndexes);
+            result = Wizard.Battle.View.Vfx.NullVfx.GetInstance();
+            return true;
+        }
+
+        internal static bool TryInterceptGuestFusion(
+            BattleCardBase card,
+            bool isPlayer,
+            List<BattleCardBase> selectedCards,
+            out Wizard.Battle.View.Vfx.VfxBase result)
+        {
+            result = null;
+            if (UseNativeClientActionTiming)
+            {
+                return false;
+            }
+            if (ShouldBlockGuestAuthorityAction(isPlayer, false))
+            {
+                result = Wizard.Battle.View.Vfx.NullVfx.GetInstance();
+                return true;
+            }
+            if (!ShouldInterceptGuestAction(isPlayer, false))
+            {
+                return false;
+            }
+            if (card == null || !IsValidAuthorityActor(card) || selectedCards == null ||
+                selectedCards.Count == 0)
+            {
+                RejectLocalAuthorityAction("the fusion card or its ingredients are unavailable");
+                result = Wizard.Battle.View.Vfx.NullVfx.GetInstance();
+                return true;
+            }
+            List<int> selectSkillIndexes =
+                BattleSelectionTracker.TakeAuthoritySkillIndexes();
+            SendAuthorityRequest("fusion", card, selectedCards, null, null, false,
+                selectSkillIndexes);
+            result = Wizard.Battle.View.Vfx.NullVfx.GetInstance();
+            return true;
+        }
+
+        internal static bool TryInterceptGuestAttack(
+            BattleCardBase attacker,
+            BattleCardBase target,
+            bool isPlayer,
+            out Wizard.Battle.View.Vfx.VfxBase result)
+        {
+            result = null;
+            if (UseNativeClientActionTiming)
+            {
+                return false;
+            }
+            if (ShouldBlockGuestAuthorityAction(isPlayer, false))
+            {
+                result = Wizard.Battle.View.Vfx.NullVfx.GetInstance();
+                return true;
+            }
+            if (!ShouldInterceptGuestAction(isPlayer, false))
+            {
+                return false;
+            }
+            // Leaders use the reserved native index 0.  They are valid attack
+            // sources/targets even though they are not present in a hand/deck
+            // card list, so validate them through the same class-card rule used
+            // by Choice Brave instead of requiring a positive zone index.
+            if (!IsValidAuthorityActor(attacker) ||
+                !IsValidAuthorityActor(target))
+            {
+                RejectLocalAuthorityAction("the attack target is unavailable");
+                result = Wizard.Battle.View.Vfx.NullVfx.GetInstance();
+                return true;
+            }
+            SendAuthorityRequest("attack", attacker, null, target, null, false,
+                null);
+            result = Wizard.Battle.View.Vfx.NullVfx.GetInstance();
+            return true;
+        }
+
+        internal static bool TryInterceptGuestTurnEnd(
+            bool isPlayer,
+            bool isAuto,
+            out Wizard.Battle.View.Vfx.VfxBase result)
+        {
+            result = null;
+            if (UseNativeClientActionTiming)
+            {
+                return false;
+            }
+            if (ShouldBlockGuestAuthorityAction(isPlayer, false))
+            {
+                result = Wizard.Battle.View.Vfx.NullVfx.GetInstance();
+                return true;
+            }
+            if (!ShouldInterceptGuestAction(isPlayer, false))
+            {
+                return false;
+            }
+            SendAuthorityRequest("turn_end", null, null, null, null, false, null);
+            result = Wizard.Battle.View.Vfx.NullVfx.GetInstance();
+            return true;
+        }
+
+        private static bool ShouldInterceptGuestAction(bool isPlayer, bool isRecovery)
+        {
+            return IsGuestAuthorityInput(isPlayer, isRecovery) &&
+                !guestAuthorityBusy;
+        }
+
+        private static bool ShouldBlockGuestAuthorityAction(
+            bool isPlayer,
+            bool isRecovery)
+        {
+            return IsGuestAuthorityInput(isPlayer, isRecovery) &&
+                guestAuthorityBusy;
+        }
+
+        private static bool IsGuestAuthorityInput(bool isPlayer, bool isRecovery)
+        {
+            return IsHostAuthorityMode && Role == P2PRole.Guest && isPlayer &&
+                !isRecovery && !authorityLocalReplayActive && !peerDisconnected;
+        }
+
+        private static bool IsValidAuthorityActor(BattleCardBase card)
+        {
+            if (card == null || card.SelfBattlePlayer == null)
+            {
+                return false;
+            }
+
+            // The class/Choice Brave card uses the reserved native index 0;
+            // all other playable cards must have a positive zone index.
+            return card.Index > 0 ||
+                ReferenceEquals(card, card.SelfBattlePlayer.Class);
+        }
+
+        private static void RejectLocalAuthorityAction(string reason)
+        {
+            guestAuthorityBusy = false;
+            guestAuthorityRequestId = null;
+            guestAuthorityRequestAction = null;
+            guestAuthorityRequestSentUtc = DateTime.MinValue;
+            LastError = reason;
+            Plugin.Logger.LogWarning("[P2P] Local authority action rejected: " + reason + ".");
+            TryEnableLocalBattleMenu();
+        }
+
+        private static void SendAuthorityRequest(
+            string action,
+            BattleCardBase card,
+            IEnumerable<BattleCardBase> selectedCards,
+            BattleCardBase target,
+            IEnumerable<int> choiceIds,
+            bool choiceBrave,
+            IEnumerable<int> selectSkillIndexes)
+        {
+            if (Role != P2PRole.Guest || transport == null)
+            {
+                return;
+            }
+
+            string requestId = string.Format(
+                CultureInfo.InvariantCulture,
+                "{0}-{1}-{2}",
+                BattleId ?? "battle",
+                P2PIdentity.ViewerId,
+                ++authorityRequestSequence);
+            Dictionary<string, object> request = new Dictionary<string, object>
+            {
+                [P2PBattleProtocol.AuthorityRequestIdKey] = requestId,
+                [P2PBattleProtocol.AuthorityActionKey] = action,
+                [P2PBattleProtocol.AuthoritySourceKey] = 0,
+                [P2PBattleProtocol.AuthorityTurnKey] = GetCurrentTurnNumber(),
+                // Keep the envelope and payload bound to the same round. This
+                // is not an anti-cheat measure; it prevents a delayed TCP
+                // frame from a prior RoomReady round from being executed by
+                // the current Host battle.
+                ["bid"] = BattleId ?? string.Empty
+            };
+            if (card != null)
+            {
+                request[P2PBattleProtocol.AuthorityCardIndexKey] = card.Index;
+                request["cardId"] = card.CardId;
+                request["cost"] = card.Cost;
+            }
+            if (target != null)
+            {
+                request[P2PBattleProtocol.AuthorityTargetKey] = CaptureAuthorityReference(target);
+            }
+            request[P2PBattleProtocol.AuthorityTargetsKey] = CaptureAuthorityReferences(selectedCards);
+            request[P2PBattleProtocol.AuthoritySelectedKey] = CaptureAuthorityReferences(selectedCards);
+            request[P2PBattleProtocol.AuthorityChoiceKey] = (choiceIds ?? Enumerable.Empty<int>())
+                .Where(value => value > 0).Select(value => (object)value).ToList();
+            request[P2PBattleProtocol.AuthorityIsChoiceBraveKey] = choiceBrave ? 1 : 0;
+            request[P2PBattleProtocol.AuthoritySelectSkillKey] =
+                (selectSkillIndexes ?? Enumerable.Empty<int>())
+                    .Where(value => value >= 0)
+                    .Distinct()
+                    .Select(value => (object)value)
+                    .ToList();
+            // The complete Guest hand/deck baseline is sent once and
+            // acknowledged by the Host.  Until that acknowledgement arrives,
+            // keep including the cards as a safe fallback; afterwards only the
+            // compact history snapshot is needed for condition evaluation.
+            request[P2PBattleProtocol.AuthorityStateKey] =
+                CaptureAuthorityPrivateState(
+                    !localPrivateStateSent || !localPrivateStateAcknowledged);
+
+            guestAuthorityBusy = true;
+            guestAuthorityRequestId = requestId;
+            guestAuthorityRequestAction = action;
+            guestAuthorityRequestSentUtc = DateTime.UtcNow;
+            authorityRequestTimes[requestId] = DateTime.UtcNow;
+            if (!SendWire(new P2PWireMessage
+            {
+                Type = P2PBattleProtocol.AuthorityRequestUri,
+                RequestId = requestId,
+                ActionSeq = authorityRequestSequence,
+                ViewerId = LocalProfile?.ViewerId ?? P2PIdentity.ViewerId,
+                BattleId = BattleId,
+                Data = request
+            }))
+            {
+                RejectLocalAuthorityAction("the P2P connection is not available");
+                return;
+            }
+            TryDisableLocalBattleMenu();
+            Plugin.Logger.LogDebug("[P2P] Authority request sent: " + action + " requestId=" + requestId + ".");
+        }
+
+        private static Dictionary<string, object> CaptureAuthorityPrivateState(
+            bool includeCards)
+        {
+            NetworkBattleManagerBase manager = BattleManagerBase.GetIns() as NetworkBattleManagerBase;
+            List<object> cards = new List<object>();
+            if (includeCards && manager != null && manager.BattlePlayer != null)
+            {
+                foreach (BattleCardBase card in EnumeratePrivateCards(manager.BattlePlayer))
+                {
+                    if (card == null || card.Index <= 0 || card.CardId <= 0)
+                    {
+                        continue;
+                    }
+                    cards.Add(CreateHiddenCardState(card));
+                }
+            }
+            Dictionary<string, object> payload = new Dictionary<string, object>
+            {
+                ["owner"] = 0
+            };
+            if (includeCards)
+            {
+                payload["cards"] = cards;
+            }
+            if (manager?.BattlePlayer != null)
+            {
+                // The request is the Guest's complete authoritative input.  A
+                // card condition can depend on persistent history (destroyed,
+                // fused, evolved, resonance, etc.), so the Host must consume
+                // that history together with the hand/deck snapshot instead of
+                // evaluating against a stale local copy.
+                try
+                {
+                    payload["history"] = CapturePlayerHistoryState(
+                        manager.BattlePlayer, false);
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Logger.LogDebug(
+                        "[P2P] Could not capture authority request history: " +
+                        ex.Message);
+                }
+            }
+            return payload;
+        }
+
+        private static Dictionary<string, object> CaptureAuthorityReference(BattleCardBase card)
+        {
+            // BattleCardBase.IsPlayer is relative to the current process.  The
+            // authority wire format uses an absolute owner (Host=1,
+            // Guest=0), so convert through the local role before serializing a
+            // reference.  Without this conversion every Guest reference was
+            // assigned to Host and attack/selection targets were resolved from
+            // the wrong player's zones.
+            bool ownerIsHost = card != null &&
+                card.IsPlayer == (Role == P2PRole.Host);
+            Dictionary<string, object> reference =
+                new Dictionary<string, object>
+            {
+                ["owner"] = ownerIsHost ? 1 : 0,
+                ["idx"] = card?.Index ?? -1
+            };
+            // The native class/leader object uses the reserved index 0 and
+            // does not have a normal card ID. Sending cardId=0 turns a valid
+            // leader target into an invalid card reference on the Host.
+            if (card != null && card.Index > 0 && card.CardId > 0)
+            {
+                reference["cardId"] = card.CardId;
+            }
+            return reference;
+        }
+
+        private static List<object> CaptureAuthorityReferences(IEnumerable<BattleCardBase> cards)
+        {
+            return cards == null
+                ? new List<object>()
+                : cards.Where(IsValidAuthorityActor)
+                    .Select(card => (object)CaptureAuthorityReference(card)).ToList();
+        }
+
+        private static int GetCurrentTurnNumber()
+        {
+            try
+            {
+                return (BattleManagerBase.GetIns() as NetworkBattleManagerBase)?.CurrentTurn ?? 0;
+            }
+            catch (Exception)
+            {
+                return 0;
+            }
+        }
+
+        private static void HandleAuthorityReject(P2PWireMessage message)
+        {
+            if (!IsCurrentBattleMessage(message))
+            {
+                return;
+            }
+            string requestId = message?.RequestId;
+            if (string.IsNullOrEmpty(requestId))
+            {
+                // A reject without an ID cannot be associated with a pending
+                // request.  Do not unlock the input gate on an unrelated or
+                // delayed malformed frame.
+                Plugin.Logger.LogWarning(
+                    "[P2P] Ignoring an authority rejection without requestId.");
+                return;
+            }
+            if (string.Equals(requestId, guestAuthorityRequestId,
+                    StringComparison.Ordinal))
+            {
+                completedAuthorityRequestIds.Add(requestId);
+                TrimAuthorityResultHistory();
+                guestAuthorityBusy = false;
+                guestAuthorityRequestId = null;
+                guestAuthorityRequestAction = null;
+                guestAuthorityRequestSentUtc = DateTime.MinValue;
+                receivedAuthorityRequestId = null;
+                localAuthorityChoiceCardIndexes.Clear();
+                LastError = message?.Error ?? "The host rejected the action.";
+                TryEnableLocalBattleMenu();
+            }
+            Plugin.Logger.LogWarning("[P2P] Host rejected authority request " +
+                (requestId ?? "?") + ": " + (message?.Error ?? "unknown reason") + ".");
+        }
+
+        private static void HandleAuthorityRequest(P2PWireMessage message)
+        {
+            if (Role != P2PRole.Host || message == null || message.Data == null)
+            {
+                return;
+            }
+
+            Dictionary<string, object> request = message.Data;
+            string requestId = message.RequestId;
+            if (string.IsNullOrEmpty(requestId) &&
+                request.TryGetValue(P2PBattleProtocol.AuthorityRequestIdKey, out object rawRequestId))
+            {
+                requestId = rawRequestId?.ToString();
+            }
+            if (string.IsNullOrEmpty(requestId))
+            {
+                SendAuthorityReject(null, "the request had no requestId");
+                return;
+            }
+            string envelopeError = null;
+            if (RemoteProfile == null ||
+                !P2PBattleProtocol.TryValidateAuthorityRequest(
+                    message,
+                    BattleId,
+                    RemoteProfile.ViewerId,
+                    out envelopeError))
+            {
+                SendAuthorityReject(requestId,
+                    string.IsNullOrEmpty(envelopeError)
+                        ? "the authority request envelope was invalid"
+                        : envelopeError);
+                return;
+            }
+            if (processedAuthorityRequests.Contains(requestId))
+            {
+                return;
+            }
+
+            if (!(BattleManagerBase.GetIns() is NetworkBattleManagerBase manager) ||
+                manager.BattlePlayer == null || manager.BattleEnemy == null)
+            {
+                SendAuthorityReject(requestId, "the battle manager is not ready");
+                return;
+            }
+
+            if (manager.VfxMgr != null && !manager.VfxMgr.IsEnd)
+            {
+                SendAuthorityReject(requestId,
+                    "the Host is still finishing the previous action");
+                return;
+            }
+            if (!string.IsNullOrEmpty(activeAuthorityExecutionRequestId))
+            {
+                SendAuthorityReject(requestId,
+                    "the Host is already executing an authoritative action");
+                return;
+            }
+
+            string action = request.TryGetValue(P2PBattleProtocol.AuthorityActionKey,
+                out object rawAction) ? rawAction?.ToString() : null;
+            if (string.IsNullOrEmpty(action))
+            {
+                SendAuthorityReject(requestId, "the request had no action");
+                return;
+            }
+            int requestedCardIndex = TryGetStateInt(
+                    request,
+                    P2PBattleProtocol.AuthorityCardIndexKey,
+                    out int requestedIndex)
+                ? requestedIndex
+                : -1;
+            int requestedCardId = ReadAuthorityCardId(request, "cardId");
+            Plugin.Logger.LogInfo(
+                "[P2P] Host received authority request: action=" + action +
+                ", requestId=" + requestId +
+                ", cardIdx=" + requestedCardIndex +
+                ", cardId=" + requestedCardId + ".");
+            if (!IsAuthorityTurnForGuest(action, manager))
+            {
+                SendAuthorityReject(requestId, "it is not the guest's turn");
+                return;
+            }
+
+            if (request.TryGetValue(P2PBattleProtocol.AuthorityTurnKey,
+                    out object rawTurn) &&
+                TryConvertAuthorityInt(rawTurn, out int requestedTurn) &&
+                requestedTurn > 0 && requestedTurn != manager.CurrentTurn)
+            {
+                // The turn number is advisory metadata from the Guest mirror.
+                // The Host is authoritative and already checked the actual
+                // IsSelfTurn flag above.  A mirror can legitimately lag by one
+                // frame while a TurnStart VFX is draining, so do not reject a
+                // valid card solely because this diagnostic value differs.
+                Plugin.Logger.LogDebug(
+                    "[P2P] Authority request turn hint differs from Host " +
+                    "state; using Host state (requested=" + requestedTurn +
+                    ", host=" + manager.CurrentTurn + ").");
+            }
+
+            // Do not consume the request until all transient admission checks
+            // have passed. In particular, a Guest request that arrives while a
+            // previous VFX queue is still draining is rejected but remains
+            // retryable; recording its ID here would make a later retry look
+            // like a duplicate and leave the Guest waiting forever.
+            processedAuthorityRequests.Add(requestId);
+            authorityRequestTimes[requestId] = DateTime.UtcNow;
+            TrimAuthorityRequestHistory();
+
+            try
+            {
+                ApplyAuthorityRequestPrivateState(request);
+                if (!TryExecuteAuthorityRequest(manager, request, action, requestId,
+                        out string error))
+                {
+                    SendAuthorityReject(requestId, error);
+                    return;
+                }
+                SendWire(new P2PWireMessage
+                {
+                    Type = P2PBattleProtocol.AuthorityAckUri,
+                    RequestId = requestId,
+                    BattleId = BattleId
+                });
+            }
+            catch (Exception ex)
+            {
+                CleanupFailedAuthorityRequest(manager, requestId);
+                Plugin.Logger.LogError(
+                    "[P2P] Authority request failed before completion for " +
+                    requestId + ": " + ex);
+                SendAuthorityReject(requestId,
+                    ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+
+        private static bool IsCurrentBattleMessage(P2PWireMessage message)
+        {
+            if (message == null || string.IsNullOrWhiteSpace(BattleId))
+            {
+                return false;
+            }
+            if (!string.IsNullOrWhiteSpace(message.BattleId) &&
+                !string.Equals(message.BattleId, BattleId,
+                    StringComparison.Ordinal))
+            {
+                Plugin.Logger.LogWarning(
+                    "[P2P] Ignoring a message for a different battle: " +
+                    (message.BattleId ?? "<missing>") + ".");
+                return false;
+            }
+            if (message.Data != null &&
+                message.Data.TryGetValue("bid", out object rawPayloadBattleId) &&
+                !string.IsNullOrWhiteSpace(rawPayloadBattleId?.ToString()) &&
+                !string.Equals(rawPayloadBattleId.ToString(), BattleId,
+                    StringComparison.Ordinal))
+            {
+                Plugin.Logger.LogWarning(
+                    "[P2P] Ignoring a message whose payload targets a different " +
+                    "battle: " + rawPayloadBattleId + ".");
+                return false;
+            }
+            return true;
+        }
+
+        private static void CleanupFailedAuthorityRequest(
+            NetworkBattleManagerBase manager,
+            string requestId)
+        {
+            if (!string.IsNullOrEmpty(activeAuthorityExecutionRequestId) &&
+                (string.IsNullOrEmpty(requestId) ||
+                 string.Equals(activeAuthorityExecutionRequestId, requestId,
+                     StringComparison.Ordinal)))
+            {
+                activeAuthorityExecutionRequestId = null;
+                activeAuthorityExecutionStartedUtc = DateTime.MinValue;
+            }
+            try
+            {
+                manager?.ClearRegisterCardList();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not clear failed authority register data: " +
+                    ex.Message);
+            }
+            EndAuthorityActionCapture();
+        }
+
+        private static bool IsAuthorityTurnForGuest(string action,
+            NetworkBattleManagerBase manager)
+        {
+            if (manager == null || manager.IsBattleEnd)
+            {
+                return false;
+            }
+            if (string.Equals(action, "turn_end", StringComparison.Ordinal))
+            {
+                return manager.BattleEnemy.IsSelfTurn;
+            }
+            return manager.BattleEnemy.IsSelfTurn;
+        }
+
+        private static void ApplyAuthorityRequestPrivateState(
+            Dictionary<string, object> request)
+        {
+            if (request == null ||
+                !request.TryGetValue(P2PBattleProtocol.AuthorityStateKey, out object rawState) ||
+                !(rawState is Dictionary<string, object> state))
+            {
+                return;
+            }
+            RememberReceivedPrivateStateSnapshot(state);
+            if (Role == P2PRole.Host &&
+                TryGetStateInt(state, "owner", out int owner) && owner == 0)
+            {
+                // The request itself carries the Guest baseline when the
+                // one-shot private_state frame was delayed. Treat it as an
+                // equivalent baseline receipt so the Guest can switch back to
+                // compact request payloads after this boundary.
+                SendPrivateStateAcknowledgement(owner);
+            }
+            TryApplyPendingHiddenCardStates();
+            if (state.TryGetValue("history", out object rawHistory) &&
+                rawHistory is Dictionary<string, object> history &&
+                BattleManagerBase.GetIns() is NetworkBattleManagerBase manager &&
+                manager.BattleEnemy != null)
+            {
+                // Apply the Guest's pre-action history synchronously.  This is
+                // a request boundary, not a native receive boundary, so the
+                // Host must have the exact condition inputs before it executes
+                // the requested operation.
+                if (!ApplyPlayerHistoryState(manager.BattleEnemy, history,
+                        out string unresolved) &&
+                    !string.IsNullOrEmpty(unresolved))
+                {
+                    Plugin.Logger.LogWarning(
+                        "[P2P] Authority request history is incomplete; " +
+                        "continuing with the Host copy. Waiting for: " +
+                        unresolved + ".");
+                }
+            }
+            TryApplyPendingPlayerHistoryStates();
+        }
+
+        private static void SendPrivateStateAcknowledgement(int owner)
+        {
+            if (!IsActive || (owner != 0 && owner != 1))
+            {
+                return;
+            }
+            SendWire(new P2PWireMessage
+            {
+                Type = P2PBattleProtocol.PrivateStateAckUri,
+                ViewerId = LocalProfile?.ViewerId ?? P2PIdentity.ViewerId,
+                BattleId = BattleId,
+                Data = new Dictionary<string, object>
+                {
+                    ["owner"] = owner
+                }
+            });
+        }
+
+        private static bool TryExecuteAuthorityRequest(
+            NetworkBattleManagerBase manager,
+            Dictionary<string, object> request,
+            string action,
+            string requestId,
+            out string error)
+        {
+            error = string.Empty;
+            BattleCardBase actor = null;
+            BattleCardBase target = null;
+            if (!IsSupportedAuthorityAction(action))
+            {
+                error = "unsupported authority action '" + action + "'";
+                return false;
+            }
+
+            if (!TryResolveAuthorityCardList(
+                    manager, request, P2PBattleProtocol.AuthoritySelectedKey, 0,
+                    out List<BattleCardBase> selected, out error))
+            {
+                return false;
+            }
+            List<int> selectedHandIndices = selected
+                .Where(card => card != null && card.IsInHand)
+                .Select(card => card.Index)
+                .Distinct()
+                .ToList();
+            List<int> choiceIds = ReadAuthorityIntList(request,
+                P2PBattleProtocol.AuthorityChoiceKey);
+            bool choiceBrave = ReadAuthorityBool(request,
+                P2PBattleProtocol.AuthorityIsChoiceBraveKey);
+            List<int> selectSkillIndexes = ReadAuthoritySkillIndexes(request,
+                P2PBattleProtocol.AuthoritySelectSkillKey);
+
+            if (!string.Equals(action, "turn_end", StringComparison.Ordinal))
+            {
+                if (!TryGetStateInt(request,
+                        P2PBattleProtocol.AuthorityCardIndexKey, out int actorIndex) ||
+                    actorIndex < 0)
+                {
+                    error = "the request had no valid acting card index";
+                    return false;
+                }
+                // Choice Brave is represented by the player's class card,
+                // whose native index is 0 and which is not present in any card
+                // zone.  All other actions resolve through the normal indexed
+                // card lookup.
+                actor = actorIndex == 0
+                    ? manager.BattleEnemy.Class
+                    : NetworkBattleGenericTool.GetIndexToCardBase(
+                        manager, manager.BattleEnemy, actorIndex);
+                if (actor == null)
+                {
+                    error = "the acting card is not present in the guest zones";
+                    return false;
+                }
+                int requestedCardId = ReadAuthorityCardId(request, "cardId");
+                if (request.ContainsKey("cardId") && requestedCardId <= 0)
+                {
+                    error = "the acting card has an invalid cardId";
+                    return false;
+                }
+                if (requestedCardId > 0 && actor.CardId != requestedCardId)
+                {
+                    // Card identity is a hint only.  Fusion/choice/accelerate
+                    // can replace the Guest mirror before the request reaches
+                    // the Host; the indexed Host object is the authoritative
+                    // one to execute.
+                    Plugin.Logger.LogDebug(
+                        "[P2P] Authority card identity hint differs from Host " +
+                        "state; using Host card (idx=" + actorIndex +
+                        ", requested=" + requestedCardId + ", host=" +
+                        actor.CardId + ").");
+                }
+                int requestedCost = ReadAuthorityCardCost(request);
+                if (request.ContainsKey("cost") && requestedCost < 0)
+                {
+                    error = "the acting card has an invalid cost";
+                    return false;
+                }
+                if (requestedCost >= 0 && actor.Cost != requestedCost)
+                {
+                    Plugin.Logger.LogDebug(
+                        "[P2P] Authority card cost hint differs from Host " +
+                        "state; using Host cost (idx=" + actorIndex +
+                        ", requested=" + requestedCost + ", host=" +
+                        actor.Cost + ").");
+                }
+            }
+            if (string.Equals(action, "attack", StringComparison.Ordinal))
+            {
+                if (!request.TryGetValue(P2PBattleProtocol.AuthorityTargetKey,
+                        out object rawTarget) ||
+                    !(rawTarget is Dictionary<string, object> targetRef))
+                {
+                    error = "the attack request had no target";
+                    return false;
+                }
+                if (!TryResolveAuthorityReference(
+                        manager, targetRef, out target, out error))
+                {
+                    return false;
+                }
+            }
+
+            manager.ClearRegisterCardList();
+            BeginAuthorityActionCapture(manager.BattleEnemy);
+            activeAuthorityExecutionRequestId = requestId;
+            activeAuthorityExecutionStartedUtc = DateTime.UtcNow;
+            AuthorityReceiveContext receiveContext = null;
+            bool completionScheduled = false;
+            try
+            {
+                receiveContext = CaptureAuthorityReceiveContext(manager);
+                Wizard.Battle.View.Vfx.VfxBase vfx;
+                switch (action)
+                {
+                    case "play":
+                        // A Host-authoritative action must enter at the same
+                        // boundary as a packet returned by the original battle
+                        // server.  Do not manufacture ReceiveData and call
+                        // ConductReceiveData directly: that bypasses
+                        // NetworkBattleReceiver.ConvertReceiveDataToMakeData,
+                        // which establishes card ownership, key actions, and
+                        // the exact hand-card object subsequently consumed by
+                        // SpellBattleCard.OnPlay.  Build the original wire
+                        // payload and feed it to the stock receiver instead.
+                        ExecuteAuthorityPlayThroughNativeReceiver(
+                            manager, actor, selected, choiceIds, choiceBrave,
+                            selectSkillIndexes, selectedHandIndices);
+                        // ReceivedMessage registered the native operation with
+                        // VfxMgr. Queue the authority completion after it;
+                        // NullVfx is only a local placeholder for the common
+                        // completion scheduling code below.
+                        vfx = NullVfx.GetInstance();
+                        break;
+                    case "evolution":
+                        vfx = manager.OperateMgr.EvolutionCard(actor, false,
+                            selected, choiceIds);
+                        break;
+                    case "fusion":
+                        vfx = manager.OperateMgr.FusionCard(actor, false, selected);
+                        break;
+                    case "attack":
+                        BeginAuthorityRandomAttackCapture(actor);
+                        vfx = manager.OperateMgr.Attack(actor, target, false);
+                        target = ConsumeAuthorityResolvedAttackTarget(target);
+                        break;
+                    case "turn_end":
+                        vfx = manager.OperateMgr.TurnEndOperation(false);
+                        break;
+                    default:
+                        // IsSupportedAuthorityAction above makes this
+                        // unreachable, but keep the switch defensive if a
+                        // future action is added without an execution branch.
+                        error = "unsupported authority action '" + action + "'";
+                        return false;
+                }
+                if (vfx == null)
+                {
+                    vfx = Wizard.Battle.View.Vfx.NullVfx.GetInstance();
+                }
+                // OperateMgr only builds the VFX graph here.  Card movement,
+                // skills, transforms, random effects, and register callbacks
+                // run when that graph is played by VfxMgr.  Build and deliver
+                // the authority result after the operation VFX has completed;
+                // doing it before then publishes the pre-action state and
+                // clears the capture context while native effects are still
+                // executing.
+                PendingAuthorityExecution execution =
+                    new PendingAuthorityExecution
+                    {
+                        Manager = manager,
+                        Action = action,
+                        Actor = actor,
+                        Target = target,
+                        Selected = selected,
+                        ChoiceIds = choiceIds,
+                        ChoiceBrave = choiceBrave,
+                        SelectSkillIndexes = selectSkillIndexes,
+                        SelectedHandIndices = selectedHandIndices,
+                        RequestId = requestId,
+                        OriginalActorCardId = ReadAuthorityCardId(request, "cardId"),
+                        OriginalActorCost = ReadAuthorityCardCost(request),
+                        ReceiveContext = receiveContext
+                    };
+                VfxBase completionVfx = InstantVfx.Create(() =>
+                    CompleteAuthorityExecution(execution));
+                manager.VfxMgr.RegisterSequentialVfx<SequentialVfxPlayer>(
+                    SequentialVfxPlayer.Create(new VfxBase[] { vfx, completionVfx }));
+                completionScheduled = true;
+                Plugin.Logger.LogInfo(
+                    "[P2P] Host scheduled authority action: action=" + action +
+                    ", requestId=" + requestId + ".");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.GetType().Name + ": " + ex.Message;
+                Plugin.Logger.LogError("[P2P] Host authority execution failed for " +
+                    requestId + ": " + ex);
+                return false;
+            }
+            finally
+            {
+                if (!completionScheduled)
+                {
+                    RestoreAuthorityReceiveContext(manager, receiveContext);
+                    activeAuthorityExecutionRequestId = null;
+                    activeAuthorityExecutionStartedUtc = DateTime.MinValue;
+                    EndAuthorityActionCapture();
+                }
+            }
+        }
+
+        private static void ExecuteAuthorityPlayThroughNativeReceiver(
+            NetworkBattleManagerBase manager,
+            BattleCardBase actor,
+            List<BattleCardBase> selected,
+            List<int> choiceIds,
+            bool choiceBrave,
+            List<int> selectSkillIndexes,
+            List<int> selectedHandIndices)
+        {
+            if (manager == null)
+            {
+                throw new InvalidOperationException(
+                    "the network battle manager is unavailable for the authority play");
+            }
+
+            NetworkBattleReceiver receiver = manager.GetNetworkBattleReceiver();
+            if (receiver == null)
+            {
+                throw new InvalidOperationException(
+                    "the native network battle receiver is unavailable for the authority play");
+            }
+
+            Dictionary<string, object> payload = BuildAuthorityNativePlayPayload(
+                manager, actor, selected, choiceIds, choiceBrave,
+                selectSkillIndexes, selectedHandIndices);
+            if (!receiver.ReceivedMessage(
+                    NetworkBattleDefine.NetworkBattleURI.PlayActions,
+                    true,
+                    payload,
+                    false,
+                    null,
+                    true))
+            {
+                throw new InvalidOperationException(
+                    "the native receiver rejected the authoritative PlayActions payload");
+            }
+        }
+
+        private sealed class PendingAuthorityExecution
+        {
+            internal NetworkBattleManagerBase Manager;
+            internal string Action;
+            internal BattleCardBase Actor;
+            internal BattleCardBase Target;
+            internal List<BattleCardBase> Selected;
+            internal List<int> ChoiceIds;
+            internal bool ChoiceBrave;
+            internal List<int> SelectSkillIndexes;
+            internal List<int> SelectedHandIndices;
+            internal string RequestId;
+            internal int OriginalActorCardId;
+            internal int OriginalActorCost;
+            internal AuthorityReceiveContext ReceiveContext;
+        }
+
+        private static void CompleteAuthorityExecution(
+            PendingAuthorityExecution execution)
+        {
+            if (execution == null)
+            {
+                return;
+            }
+
+            bool succeeded = false;
+            bool finalResultSent = false;
+            bool isTurnEnd = string.Equals(
+                execution.Action, "turn_end", StringComparison.Ordinal);
+            try
+            {
+                if (peerDisconnected)
+                {
+                    Plugin.Logger.LogDebug(
+                        "[P2P] Dropped completed authority execution after the " +
+                        "peer disconnected: " +
+                        (execution.RequestId ?? "?") + ".");
+                    return;
+                }
+                if (isTurnEnd)
+                {
+                    Dictionary<string, object> turnEndActions =
+                        BuildAuthorityTurnEndActionsData(
+                            execution.Manager, execution.RequestId);
+                    if (turnEndActions == null)
+                    {
+                        throw new InvalidOperationException(
+                            "the native turn-end produced no replay data");
+                    }
+                    EnsureAuthorityRandomResultsAreValid(
+                        turnEndActions, execution.RequestId);
+                    DeliverAuthorityResult(turnEndActions);
+                    Dictionary<string, object> turnEnd =
+                        BuildAuthorityTurnEndData(
+                            execution.Manager, execution.RequestId);
+                    if (turnEnd == null)
+                    {
+                        throw new InvalidOperationException(
+                            "the native turn-end produced no completion data");
+                    }
+                    DeliverAuthorityResult(turnEnd);
+                    // Do not synthesize TurnEndFinal here. During local
+                    // authority replay the Guest is the native action owner;
+                    // its stock BattleFinishToTurnEndFinal path already runs
+                    // through the suppressed send callback. Sending the same
+                    // packet back to that Guest would create an extra Judge
+                    // round-trip after Host has already determined the result.
+                    finalResultSent = TrySendHostAuthoritativeFinishResult(
+                        execution.Manager, execution.RequestId);
+                    succeeded = true;
+                    Plugin.Logger.LogInfo(
+                        "[P2P] Host completed authority action: action=turn_end, " +
+                        "requestId=" + (execution.RequestId ?? "?") + ".");
+                }
+                else
+                {
+                    Dictionary<string, object> response =
+                        BuildAuthorityResultData(
+                            execution.Manager,
+                            execution.Action,
+                            execution.Actor,
+                            execution.Target,
+                            execution.Selected,
+                            execution.ChoiceIds,
+                            execution.ChoiceBrave,
+                            execution.SelectSkillIndexes,
+                            execution.SelectedHandIndices,
+                            execution.RequestId,
+                            execution.OriginalActorCardId,
+                            execution.OriginalActorCost);
+                    if (response == null)
+                    {
+                        throw new InvalidOperationException(
+                            "the native action produced no replay data");
+                    }
+                    EnsureAuthorityRandomResultsAreValid(
+                        response, execution.RequestId);
+                    DeliverAuthorityResult(response);
+                    finalResultSent = TrySendHostAuthoritativeFinishResult(
+                        execution.Manager, execution.RequestId);
+                    succeeded = true;
+                    Plugin.Logger.LogInfo(
+                        "[P2P] Host completed authority action: action=" +
+                        execution.Action + ", requestId=" +
+                        (execution.RequestId ?? "?") + ".");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogError(
+                    "[P2P] Host authority completion failed for " +
+                    (execution.RequestId ?? "?") + ": " + ex);
+                SendAuthorityReject(
+                    execution.RequestId,
+                    ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                try
+                {
+                    execution.Manager?.ClearRegisterCardList();
+                }
+                catch (Exception)
+                {
+                }
+                RestoreAuthorityReceiveContext(
+                    execution.Manager, execution.ReceiveContext);
+                activeAuthorityExecutionRequestId = null;
+                activeAuthorityExecutionStartedUtc = DateTime.MinValue;
+                EndAuthorityActionCapture();
+            }
+
+            if (succeeded && isTurnEnd && !finalResultSent && !finishResultSent)
+            {
+                // The native server selects the next owner only after all
+                // turn-end effects have completed.  Queue that transition
+                // after cleanup so the next turn cannot observe the previous
+                // action's receive context or capture buffers.
+                QueueAuthorityNextTurnStart(
+                    execution.Manager, execution.RequestId);
+            }
+        }
+
+        private static bool TrySendHostAuthoritativeFinishResult(
+            NetworkBattleManagerBase manager,
+            string requestId)
+        {
+            if (manager == null || finishResultSent || peerDisconnected)
+            {
+                return finishResultSent;
+            }
+
+            int localResult;
+            try
+            {
+                localResult = (int)manager.JudgeCurrentFinishStatus();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not evaluate authoritative finish status: " +
+                    ex.Message);
+                return false;
+            }
+
+            if (!P2PBattleResult.IsTerminalResult(localResult))
+            {
+                return false;
+            }
+
+            Dictionary<string, object> resultRequest =
+                new Dictionary<string, object>
+                {
+                    ["p2pLocalResult"] = localResult
+                };
+            if (!string.IsNullOrEmpty(requestId))
+            {
+                resultRequest[P2PBattleProtocol.AuthorityResultRequestIdKey] =
+                    requestId;
+            }
+
+            Plugin.Logger.LogInfo(
+                "[P2P] Host-authoritative battle boundary reached final result " +
+                localResult + "; delivering JudgeResult." +
+                (string.IsNullOrEmpty(requestId)
+                    ? string.Empty
+                    : " requestId=" + requestId + "."));
+            SendFinishResult(true, resultRequest);
+            return finishResultSent;
+        }
+
+        private sealed class AuthorityReceiveContext
+        {
+            internal NetworkBattleReceiver.ReceiveData Previous;
+        }
+
+        private static AuthorityReceiveContext CaptureAuthorityReceiveContext(
+            NetworkBattleManagerBase manager)
+        {
+            if (manager?.networkBattleData == null)
+            {
+                return null;
+            }
+
+            AuthorityReceiveContext context = new AuthorityReceiveContext
+            {
+                Previous = manager.networkBattleData.GetReceiveData()
+            };
+            return context;
+        }
+
+        private static void RestoreAuthorityReceiveContext(
+            NetworkBattleManagerBase manager,
+            AuthorityReceiveContext context)
+        {
+            if (manager?.networkBattleData == null || context == null)
+            {
+                return;
+            }
+            manager.networkBattleData.SetReceiveData(context.Previous);
+        }
+
+        // Converts a Guest input request into the same raw dictionary shape
+        // consumed by NetworkBattleReceiver.  Keep this at the wire boundary:
+        // the receiver, not P2P code, must create ReceiveData/CardDataModel.
+        private static Dictionary<string, object> BuildAuthorityNativePlayPayload(
+            NetworkBattleManagerBase manager,
+            BattleCardBase actor,
+            List<BattleCardBase> selected,
+            List<int> choiceIds,
+            bool choiceBrave,
+            List<int> selectSkillIndexes,
+            List<int> selectedHandIndices)
+        {
+            Dictionary<string, object> payload = new Dictionary<string, object>
+            {
+                ["playIdx"] = actor?.Index ?? -1,
+                ["type"] = (int)AuthorityActionPlayType("play", selected)
+            };
+            List<object> knownCards = BuildAuthorityNativeReceiveKnownCards(
+                manager, actor, selected);
+            if (knownCards.Count > 0)
+            {
+                payload["knownList"] = knownCards;
+            }
+
+            List<object> targets = BuildAuthorityNativeReceiveTargets(
+                manager, selected, selectSkillIndexes);
+            if (targets.Count > 0)
+            {
+                payload["targetList"] = targets;
+            }
+
+            List<object> keyActions = BuildAuthorityNativePlayKeyActions(
+                actor, choiceIds, choiceBrave, selectedHandIndices);
+            if (keyActions.Count > 0)
+            {
+                payload["keyAction"] = keyActions;
+            }
+            return payload;
+        }
+
+        private static List<object> BuildAuthorityNativeReceiveKnownCards(
+            NetworkBattleManagerBase manager,
+            BattleCardBase actor,
+            IEnumerable<BattleCardBase> selected)
+        {
+            List<object> result = new List<object>();
+            IEnumerable<BattleCardBase> cards = new[] { actor }
+                .Concat(selected ?? Enumerable.Empty<BattleCardBase>())
+                .Where(card => card != null && card.Index > 0)
+                // Card indexes are only unique within one player's zones;
+                // preserve the owner when an action targets a card whose
+                // index happens to match the acting card.
+                .GroupBy(card => new
+                {
+                    IsGuestOwner = manager != null &&
+                        ReferenceEquals(card.SelfBattlePlayer,
+                            manager.BattleEnemy),
+                    card.Index
+                })
+                .Select(group => group.First());
+            foreach (BattleCardBase card in cards)
+            {
+                bool isGuestActionOwner = manager != null &&
+                    ReferenceEquals(card.SelfBattlePlayer, manager.BattleEnemy);
+                // The original Guest sender writes isSelf from the source
+                // player's perspective.  On the Host this same raw packet is
+                // received with isPlayer=false and is therefore applied to
+                // BattleEnemy by NetworkOperationCollection.
+                result.Add(new Dictionary<string, object>
+                {
+                    ["idx"] = card.Index,
+                    ["cardId"] = card.CardId,
+                    ["isSelf"] = isGuestActionOwner ? 1 : 0,
+                    ["is_open"] = 1,
+                    ["cost"] = card.Cost,
+                    ["spellboost"] = card.SpellChargeCount,
+                    ["from"] = (int)NetworkBattleGenericTool.GetCardPlaceState(
+                        card.SelfBattlePlayer, card.Index)
+                });
+            }
+            return result;
+        }
+
+        private static List<object> BuildAuthorityNativeReceiveTargets(
+            NetworkBattleManagerBase manager,
+            List<BattleCardBase> selected,
+            List<int> selectSkillIndexes)
+        {
+            List<object> result = new List<object>();
+            if (manager == null || selected == null)
+            {
+                return result;
+            }
+
+            List<int> skillIndexes = (selectSkillIndexes ??
+                    Enumerable.Empty<int>())
+                .Where(index => index >= 0)
+                .Distinct()
+                .ToList();
+            foreach (BattleCardBase card in selected)
+            {
+                if (!IsValidAuthorityActor(card))
+                {
+                    continue;
+                }
+
+                bool isGuestActionOwner = ReferenceEquals(
+                    card.SelfBattlePlayer, manager.BattleEnemy);
+                Dictionary<string, object> target =
+                    new Dictionary<string, object>
+                    {
+                        ["targetIdx"] = card.Index,
+                        ["isSelf"] = isGuestActionOwner ? 1 : 0
+                    };
+                if (skillIndexes.Count > 0)
+                {
+                    target["selectSkillIndex"] = skillIndexes
+                        .Select(index => (object)index)
+                        .ToList();
+                }
+                result.Add(target);
+            }
+            return result;
+        }
+
+        private static List<object> BuildAuthorityNativePlayKeyActions(
+            BattleCardBase actor,
+            List<int> choiceIds,
+            bool choiceBrave,
+            IEnumerable<int> selectedHandIndices)
+        {
+            List<object> result = new List<object>();
+            if (actor == null)
+            {
+                return result;
+            }
+
+            List<int> buried = (selectedHandIndices ?? Enumerable.Empty<int>())
+                .Where(index => index > 0)
+                .Distinct()
+                .ToList();
+            bool burialRite = buried.Count > 0 &&
+                HasAuthorityBurialRiteSkill(actor, "play");
+            foreach (SendKeyActionDataManager.KeyActionType type in
+                ResolveAuthorityKeyActionTypes(
+                    actor, "play", choiceIds, choiceBrave, burialRite))
+            {
+                Dictionary<string, object> keyAction =
+                    new Dictionary<string, object>
+                    {
+                        ["type"] = (int)type,
+                        ["cardId"] = actor.CardId
+                    };
+                switch (type)
+                {
+                    case SendKeyActionDataManager.KeyActionType.Choice:
+                    case SendKeyActionDataManager.KeyActionType.HaveBeforeSkillChoice:
+                    case SendKeyActionDataManager.KeyActionType.ChoiceEvolution:
+                    case SendKeyActionDataManager.KeyActionType.ChoiceBrave:
+                        keyAction["selectCard"] =
+                            new Dictionary<string, object>
+                            {
+                                ["cardId"] = (choiceIds ?? new List<int>())
+                                    .Select(value => (object)value)
+                                    .ToList(),
+                                ["open"] = 1
+                            };
+                        break;
+                    case SendKeyActionDataManager.KeyActionType.BurialRate:
+                        keyAction["cardIdx"] = buried
+                            .Select(index => (object)index)
+                            .ToList();
+                        break;
+                }
+                result.Add(keyAction);
+            }
+            return result;
+        }
+
+        private static bool HasAuthorityBurialRiteSkill(
+            BattleCardBase actor,
+            string action)
+        {
+            if (actor == null ||
+                (!string.Equals(action, "play", StringComparison.Ordinal) &&
+                 !string.Equals(action, "evolution", StringComparison.Ordinal)))
+            {
+                return false;
+            }
+
+            try
+            {
+                bool isEvolution = string.Equals(
+                    action, "evolution", StringComparison.Ordinal);
+                return actor.GetSelectTypeSkill(
+                        isEvolution, false, false, false, false)
+                    .Any(skill => skill != null && skill.IsBurialRite);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        private static List<SendKeyActionDataManager.KeyActionType>
+            ResolveAuthorityKeyActionTypes(
+                BattleCardBase actor,
+                string action,
+                List<int> choiceIds,
+                bool choiceBrave,
+                bool burialRite)
+        {
+            List<SendKeyActionDataManager.KeyActionType> result =
+                new List<SendKeyActionDataManager.KeyActionType>();
+            if (string.Equals(action, "fusion", StringComparison.Ordinal))
+            {
+                result.Add(SendKeyActionDataManager.KeyActionType.Fusion);
+            }
+
+            if (choiceBrave)
+            {
+                result.Add(SendKeyActionDataManager.KeyActionType.ChoiceBrave);
+            }
+            else if (choiceIds != null && choiceIds.Count > 0)
+            {
+                bool isEvolution = string.Equals(
+                    action, "evolution", StringComparison.Ordinal);
+                bool haveBeforeSkillChoice = false;
+                try
+                {
+                    SkillCollectionBase skills = isEvolution
+                        ? actor?.EvolutionSkills
+                        : actor?.Skills;
+                    haveBeforeSkillChoice = skills != null &&
+                        skills.HaveBeforeChoiceSkill();
+                }
+                catch (Exception)
+                {
+                }
+                result.Add(isEvolution
+                    ? SendKeyActionDataManager.KeyActionType.ChoiceEvolution
+                    : (haveBeforeSkillChoice
+                        ? SendKeyActionDataManager.KeyActionType.HaveBeforeSkillChoice
+                        : SendKeyActionDataManager.KeyActionType.Choice));
+            }
+
+            if (actor != null &&
+                string.Equals(action, "play", StringComparison.Ordinal))
+            {
+                try
+                {
+                    if (NetworkBattleGenericTool.IsAcceleratedCard(actor))
+                    {
+                        result.Add(SendKeyActionDataManager.KeyActionType.Accelerated);
+                    }
+                    else if (NetworkBattleGenericTool.IsCrystallizeCard(actor))
+                    {
+                        result.Add(SendKeyActionDataManager.KeyActionType.Crystallize);
+                    }
+                }
+                catch (Exception)
+                {
+                }
+            }
+
+            if (burialRite)
+            {
+                result.Add(SendKeyActionDataManager.KeyActionType.BurialRate);
+            }
+            return result.Distinct().ToList();
+        }
+
+        private static NetworkBattleDefine.PlayActionType AuthorityActionPlayType(
+            string action,
+            List<BattleCardBase> selected)
+        {
+            if (string.Equals(action, "attack", StringComparison.Ordinal))
+            {
+                return NetworkBattleDefine.PlayActionType.ATTACK;
+            }
+            if (string.Equals(action, "evolution", StringComparison.Ordinal))
+            {
+                return selected != null && selected.Count > 0
+                    ? NetworkBattleDefine.PlayActionType.EVOLUTION_SELECT
+                    : NetworkBattleDefine.PlayActionType.EVOLUTION;
+            }
+            if (string.Equals(action, "fusion", StringComparison.Ordinal))
+            {
+                return NetworkBattleDefine.PlayActionType.FUSION;
+            }
+            if (string.Equals(action, "play", StringComparison.Ordinal))
+            {
+                return selected != null && selected.Count > 0
+                    ? NetworkBattleDefine.PlayActionType.PLAY_HAND_SELECT
+                    : NetworkBattleDefine.PlayActionType.PLAY_HAND;
+            }
+            return NetworkBattleDefine.PlayActionType.NONE;
+        }
+
+        private static void SendAuthorityReject(string requestId, string reason)
+        {
+            SendWire(new P2PWireMessage
+            {
+                Type = P2PBattleProtocol.AuthorityRejectUri,
+                RequestId = requestId,
+                BattleId = BattleId,
+                Error = string.IsNullOrWhiteSpace(reason)
+                    ? "The host rejected the action."
+                    : reason
+            });
+        }
+
+        private static void BeginAuthorityActionCapture(
+            BattlePlayerBase sourcePlayer)
+        {
+            if (!IsActive || Role != P2PRole.Host)
+            {
+                return;
+            }
+
+            // A Host-authoritative operation can be owned by BattlePlayer or
+            // BattleEnemy.  The existing local-action hooks only arm capture
+            // for BattlePlayer, so arm the same manifest collectors explicitly
+            // for Guest requests and Guest turn transitions.
+            localActionCaptureActive = true;
+            PendingLocalConditionResults.Clear();
+            LocalAuthoritativeSkillTargets.Clear();
+            LocalAuthoritativeSkillEvaluations.Clear();
+            CaptureActionPreHiddenCardStates(manager: BattleManagerBase.GetIns()
+                as NetworkBattleManagerBase);
+            localActionPreHistoryState = null;
+            localActionPreHistoryRevision = 0;
+
+            if (sourcePlayer == null)
+            {
+                return;
+            }
+
+            try
+            {
+                bool ownerIsHost = sourcePlayer.IsPlayer;
+                localActionPreHistoryState = CapturePlayerHistoryState(
+                    sourcePlayer, ownerIsHost);
+                localActionPreHistoryRevision = ownerIsHost
+                    ? Math.Max(1, localPlayerHistoryRevision)
+                    : 0;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not capture authority action-start history: " +
+                    ex.Message);
+            }
+        }
+
+        private static void EndAuthorityActionCapture()
+        {
+            localActionCaptureActive = false;
+            PendingLocalConditionResults.Clear();
+            // Non-Play authority transitions no longer publish a compatibility
+            // manifest. Their captured values must not leak into a later
+            // PlayActions result.
+            LocalAuthoritativeSkillTargets.Clear();
+            LocalAuthoritativeSkillEvaluations.Clear();
+            localActionPreHistoryState = null;
+            localActionPreHistoryRevision = 0;
+            actionPreHiddenCardStates.Clear();
+            authorityRandomAttackCandidates = null;
+            authorityResolvedAttackTarget = null;
+            ClearAuthorityRandomAttackReplay();
+            AuthorityActionProcessors.Clear();
+        }
+
+        private static void BeginAuthorityRandomAttackCapture(
+            BattleCardBase attacker)
+        {
+            authorityRandomAttackCandidates = null;
+            authorityResolvedAttackTarget = null;
+            if (attacker == null ||
+                attacker.SkillApplyInformation == null ||
+                attacker.SkillApplyInformation.RandomAttackCount <= 0 ||
+                attacker.SelfBattlePlayer == null ||
+                attacker.OpponentBattlePlayer == null)
+            {
+                return;
+            }
+
+            authorityRandomAttackCandidates =
+                attacker.SelfBattlePlayer.ClassAndInPlayCardList
+                    .Where(card => card != null && card != attacker)
+                    .Concat(attacker.OpponentBattlePlayer.ClassAndInPlayCardList ??
+                        Enumerable.Empty<BattleCardBase>())
+                    .Where(card => card != null && (card.IsUnit || card.IsClass) &&
+                        !card.CantBeFocusedAttack(attacker))
+                    .ToList();
+
+            if (authorityRandomAttackCandidates.Count == 0)
+            {
+                authorityRandomAttackCandidates = null;
+            }
+        }
+
+        internal static void ObserveAuthorityRandomAttackRoll(
+            int candidateCount,
+            int selectedIndex)
+        {
+            if (authorityRandomAttackCandidates == null ||
+                authorityRandomAttackCandidates.Count != candidateCount ||
+                selectedIndex < 0 ||
+                selectedIndex >= authorityRandomAttackCandidates.Count)
+            {
+                return;
+            }
+
+            authorityResolvedAttackTarget =
+                authorityRandomAttackCandidates[selectedIndex];
+            authorityRandomAttackCandidates = null;
+        }
+
+        internal static void PrepareAuthorityRandomAttackReplay(
+            BattleCardBase attacker,
+            BattleCardBase authoritativeTarget)
+        {
+            authorityReplayRandomAttackCandidateCount = 0;
+            authorityReplayRandomAttackTargetIndex = -1;
+            if (UseNativeClientActionTiming ||
+                !IsAuthorityLocalReplayActive || Role != P2PRole.Guest ||
+                attacker == null || authoritativeTarget == null ||
+                attacker.SkillApplyInformation == null ||
+                attacker.SkillApplyInformation.RandomAttackCount <= 0 ||
+                attacker.SelfBattlePlayer == null ||
+                attacker.OpponentBattlePlayer == null)
+            {
+                return;
+            }
+
+            List<BattleCardBase> candidates = attacker.SelfBattlePlayer
+                .ClassAndInPlayCardList
+                .Where(card => card != null && card != attacker)
+                .Concat(attacker.OpponentBattlePlayer.ClassAndInPlayCardList ??
+                    Enumerable.Empty<BattleCardBase>())
+                .Where(card => card != null && (card.IsUnit || card.IsClass) &&
+                    !card.CantBeFocusedAttack(attacker))
+                .ToList();
+            if (candidates.Count == 0)
+            {
+                return;
+            }
+
+            int selected = candidates.FindIndex(card =>
+                ReferenceEquals(card, authoritativeTarget));
+            if (selected < 0)
+            {
+                selected = candidates.FindIndex(card =>
+                    card.Index == authoritativeTarget.Index &&
+                    card.IsPlayer == authoritativeTarget.IsPlayer &&
+                    card.CardId == authoritativeTarget.CardId);
+            }
+            if (selected < 0)
+            {
+                Plugin.Logger.LogWarning(
+                    "[P2P] Authority random-attack target was not present in " +
+                    "the Guest candidate list; native selection will be used.");
+                return;
+            }
+
+            authorityReplayRandomAttackCandidateCount = candidates.Count;
+            authorityReplayRandomAttackTargetIndex = selected;
+        }
+
+        internal static void OverrideAuthorityRandomAttackRoll(
+            int candidateCount,
+            ref int selectedIndex)
+        {
+            if (UseNativeClientActionTiming ||
+                authorityReplayRandomAttackCandidateCount <= 0 ||
+                candidateCount != authorityReplayRandomAttackCandidateCount ||
+                authorityReplayRandomAttackTargetIndex < 0 ||
+                authorityReplayRandomAttackTargetIndex >= candidateCount)
+            {
+                return;
+            }
+
+            selectedIndex = authorityReplayRandomAttackTargetIndex;
+            authorityReplayRandomAttackCandidateCount = 0;
+            authorityReplayRandomAttackTargetIndex = -1;
+        }
+
+        internal static void ClearAuthorityRandomAttackReplay()
+        {
+            authorityReplayRandomAttackCandidateCount = 0;
+            authorityReplayRandomAttackTargetIndex = -1;
+        }
+
+        private static BattleCardBase ConsumeAuthorityResolvedAttackTarget(
+            BattleCardBase fallback)
+        {
+            BattleCardBase resolved = authorityResolvedAttackTarget;
+            authorityResolvedAttackTarget = null;
+            authorityRandomAttackCandidates = null;
+            return resolved ?? fallback;
+        }
+
+        private static void TrimAuthorityRequestHistory()
+        {
+            if (authorityRequestTimes.Count <= 256)
+            {
+                return;
+            }
+            foreach (string id in authorityRequestTimes
+                .OrderBy(pair => pair.Value)
+                .Take(authorityRequestTimes.Count - 192)
+                .Select(pair => pair.Key)
+                .ToList())
+            {
+                authorityRequestTimes.Remove(id);
+                processedAuthorityRequests.Remove(id);
+            }
+        }
+
+        private static bool IsSupportedAuthorityAction(string action)
+        {
+            return string.Equals(action, "play", StringComparison.Ordinal) ||
+                string.Equals(action, "evolution", StringComparison.Ordinal) ||
+                string.Equals(action, "fusion", StringComparison.Ordinal) ||
+                string.Equals(action, "attack", StringComparison.Ordinal) ||
+                string.Equals(action, "turn_end", StringComparison.Ordinal);
+        }
+
+        private static bool TryResolveAuthorityCardList(
+            NetworkBattleManagerBase manager,
+            Dictionary<string, object> request,
+            string key,
+            int defaultOwner,
+            out List<BattleCardBase> result,
+            out string error)
+        {
+            result = new List<BattleCardBase>();
+            error = string.Empty;
+            if (request == null || !request.TryGetValue(key, out object rawCards) ||
+                rawCards == null)
+            {
+                return true;
+            }
+            if (rawCards is string || !(rawCards is IEnumerable cards))
+            {
+                error = "the authority field '" + key + "' is not a card list";
+                return false;
+            }
+
+            HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (object rawCard in cards)
+            {
+                if (rawCard is Dictionary<string, object> reference)
+                {
+                    if (!TryResolveAuthorityReference(
+                            manager, reference, out BattleCardBase card,
+                            out error))
+                    {
+                        return false;
+                    }
+                    string identity = AuthorityReferenceIdentity(reference);
+                    if (!seen.Add(identity))
+                    {
+                        error = "the authority field '" + key +
+                            "' contains a duplicate card reference (" +
+                            identity + ")";
+                        return false;
+                    }
+                    result.Add(card);
+                    continue;
+                }
+                if (!TryConvertAuthorityInt(rawCard, out int index) || index < 0)
+                {
+                    error = "the authority field '" + key +
+                        "' contains an invalid card index";
+                    return false;
+                }
+                BattlePlayerBase fallbackOwner =
+                    manager.GetBattlePlayer(defaultOwner == 1);
+                BattleCardBase fallback = index == 0
+                    ? fallbackOwner?.Class
+                    : NetworkBattleGenericTool.GetIndexToCardBase(
+                        manager, fallbackOwner, index);
+                if (fallback == null)
+                {
+                    error = "the authority field '" + key +
+                        "' references a card that is not present (owner=" +
+                        defaultOwner + ", idx=" + index + ")";
+                    return false;
+                }
+                string fallbackIdentity = defaultOwner + ":" + index;
+                if (!seen.Add(fallbackIdentity))
+                {
+                    error = "the authority field '" + key +
+                        "' contains a duplicate card reference (" +
+                        fallbackIdentity + ")";
+                    return false;
+                }
+                result.Add(fallback);
+            }
+            return true;
+        }
+
+        private static string AuthorityReferenceIdentity(
+            Dictionary<string, object> reference)
+        {
+            int owner = 0;
+            int index = 0;
+            TryGetStateInt(reference, "owner", out owner);
+            TryGetStateInt(reference, "idx", out index);
+            return owner + ":" + index;
+        }
+
+        private static BattleCardBase ResolveAuthorityReference(
+            NetworkBattleManagerBase manager,
+            Dictionary<string, object> reference)
+        {
+            return TryResolveAuthorityReference(
+                    manager, reference, out BattleCardBase card, out _)
+                ? card
+                : null;
+        }
+
+        private static bool TryResolveAuthorityReference(
+            NetworkBattleManagerBase manager,
+            Dictionary<string, object> reference,
+            out BattleCardBase card,
+            out string error)
+        {
+            card = null;
+            error = string.Empty;
+            if (manager == null || reference == null ||
+                !TryGetStateInt(reference, "idx", out int index) || index < 0)
+            {
+                error = "the authority card reference has no valid idx";
+                return false;
+            }
+            int owner = 0;
+            if (reference.ContainsKey("owner") &&
+                (!TryGetStateInt(reference, "owner", out owner) ||
+                 (owner != 0 && owner != 1)))
+            {
+                error = "the authority card reference has an invalid owner " +
+                    "(idx=" + index + ")";
+                return false;
+            }
+            owner = owner == 1 ? 1 : 0;
+            BattlePlayerBase ownerPlayer = manager.GetBattlePlayer(owner == 1);
+            card = index == 0
+                ? ownerPlayer?.Class
+                : NetworkBattleGenericTool.GetIndexToCardBase(
+                    manager, ownerPlayer, index);
+            if (card == null)
+            {
+                error = "the authority card reference is not present " +
+                    "(owner=" + owner + ", idx=" + index + ")";
+                return false;
+            }
+            if (reference.ContainsKey("cardId"))
+            {
+                if (!TryConvertAuthorityInt(reference["cardId"], out int cardId) ||
+                    cardId <= 0)
+                {
+                    // Older Guests serialized a class/leader target as
+                    // idx=0/cardId=0. Index 0 is already an unambiguous class
+                    // reference, so accept that legacy representation.
+                    if (index == 0)
+                    {
+                        return true;
+                    }
+                    error = "the authority card reference has an invalid cardId " +
+                        "(owner=" + owner + ", idx=" + index + ")";
+                    card = null;
+                    return false;
+                }
+                if (card.CardId == cardId)
+                {
+                    return true;
+                }
+                // References are resolved by absolute owner + index.  The
+                // optional cardId is diagnostic metadata and can be stale when
+                // a card has just fused, transformed, or received an attached
+                // skill.  Keep the Host object and continue with its state.
+                Plugin.Logger.LogDebug(
+                    "[P2P] Authority card reference identity differs from " +
+                    "Host state; using Host card (owner=" + owner +
+                    ", idx=" + index + ", requested=" + cardId + ", host=" +
+                    card.CardId + ").");
+                return true;
+            }
+            return true;
+        }
+
+        private static List<int> ReadAuthorityIntList(
+            Dictionary<string, object> data,
+            string key)
+        {
+            List<int> result = new List<int>();
+            if (data == null || !data.TryGetValue(key, out object raw) ||
+                raw is string || !(raw is IEnumerable values))
+            {
+                return result;
+            }
+            foreach (object value in values)
+            {
+                if (TryConvertAuthorityInt(value, out int converted) && converted > 0)
+                {
+                    result.Add(converted);
+                }
+            }
+            return result;
+        }
+
+        private static List<int> ReadAuthoritySkillIndexes(
+            Dictionary<string, object> data,
+            string key)
+        {
+            List<int> result = new List<int>();
+            if (data == null || !data.TryGetValue(key, out object raw) ||
+                raw is string || !(raw is IEnumerable values))
+            {
+                return result;
+            }
+
+            foreach (object value in values)
+            {
+                if (TryConvertAuthorityInt(value, out int converted) &&
+                    converted >= 0 && !result.Contains(converted))
+                {
+                    result.Add(converted);
+                }
+            }
+            return result;
+        }
+
+        private static bool ReadAuthorityBool(
+            Dictionary<string, object> data,
+            string key)
+        {
+            if (data == null || !data.TryGetValue(key, out object raw))
+            {
+                return false;
+            }
+            if (raw is bool value)
+            {
+                return value;
+            }
+            return TryConvertAuthorityInt(raw, out int integer) && integer != 0;
+        }
+
+        private static int ReadAuthorityCardId(
+            Dictionary<string, object> data,
+            string key)
+        {
+            return data != null && TryGetStateInt(data, key, out int value) &&
+                value > 0
+                ? value
+                : 0;
+        }
+
+        private static int ReadAuthorityCardCost(
+            Dictionary<string, object> data)
+        {
+            return data != null && TryGetStateInt(data, "cost", out int value) &&
+                value >= 0
+                ? value
+                : -1;
+        }
+
+        private static bool TryConvertAuthorityInt(object value, out int result)
+        {
+            try
+            {
+                result = Convert.ToInt32(value, CultureInfo.InvariantCulture);
+                return true;
+            }
+            catch (Exception)
+            {
+                result = 0;
+                return false;
+            }
+        }
+
+        private static Dictionary<string, object> BuildAuthorityResultData(
+            NetworkBattleManagerBase manager,
+            string action,
+            BattleCardBase actor,
+            BattleCardBase target,
+            List<BattleCardBase> selected,
+            List<int> choiceIds,
+            bool choiceBrave,
+            List<int> selectSkillIndexes,
+            List<int> selectedHandIndices,
+            string requestId,
+            int originalActorCardId,
+            int originalActorCost)
+        {
+            if (manager == null)
+            {
+                return null;
+            }
+            Dictionary<string, object> data = new Dictionary<string, object>
+            {
+                ["uri"] = P2PBattleProtocol.PlayActionsUri,
+                ["type"] = AuthorityActionType(action),
+                ["turnState"] = 0,
+                [P2PBattleProtocol.AuthorityResultRequestIdKey] = requestId,
+                [P2PBattleProtocol.AuthoritySourceKey] = 0
+            };
+            if (actor != null)
+            {
+                // The Host executes a Guest request against BattleEnemy.  Some
+                // operations (fusion metamorphose, choice transforms, and
+                // accelerated/crystallize mutations) replace that object before
+                // the replay packet is assembled.  The native receiver must
+                // first locate the pre-action hand card; the orderList and the
+                // post-action hidden snapshot then apply the transformed state.
+                int nativeCardId = actor.CardId;
+                int nativeCost = actor.Cost;
+                if (TryGetActionPreHiddenCardState(
+                        actor.IsPlayer, actor.Index,
+                        out Dictionary<string, object> preActorState))
+                {
+                    if (TryGetStateInt(preActorState, "cardId", out int preCardId) &&
+                        preCardId > 0)
+                    {
+                        nativeCardId = preCardId;
+                    }
+                    if (TryGetStateInt(preActorState, "cost", out int preCost) &&
+                        preCost >= 0)
+                    {
+                        nativeCost = preCost;
+                    }
+                }
+                if (originalActorCardId > 0 && !actor.IsPlayer)
+                {
+                    // The request carries the Guest's identity even when the
+                    // temporary card object was already replaced before the
+                    // action-start capture could see it.
+                    nativeCardId = originalActorCardId;
+                }
+                if (originalActorCost >= 0 && !actor.IsPlayer)
+                {
+                    nativeCost = originalActorCost;
+                }
+                data["playIdx"] = actor.Index;
+                // Class/Choice Brave actions use playIdx=0, but index 0 is not
+                // a hand/deck card and must not be sent through
+                // ReplaceReceivedCard.  The native ChoiceBrave operation
+                // resolves the class directly from the acting player.
+                if (actor.Index > 0)
+                {
+                    data["knownList"] = new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["idx"] = actor.Index,
+                            ["cardId"] = nativeCardId,
+                            ["isSelf"] = actor.IsPlayer ? 1 : 0,
+                            ["is_open"] = 1,
+                            ["cost"] = nativeCost
+                        }
+                    };
+                }
+            }
+            if (target != null)
+            {
+                data["targetList"] = new List<object>
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["targetIdx"] = target.Index,
+                        ["isSelf"] = target.IsPlayer ? 1 : 0
+                    }
+                };
+            }
+            else if (selected != null && selected.Count > 0 &&
+                (string.Equals(action, "play", StringComparison.Ordinal) ||
+                 string.Equals(action, "evolution", StringComparison.Ordinal)))
+            {
+                data["targetList"] = BuildAuthorityTargetList(
+                    manager, selected, selectSkillIndexes);
+            }
+            if (string.Equals(action, "fusion", StringComparison.Ordinal) &&
+                selected != null && selected.Count > 0)
+            {
+                data["targetList"] = BuildAuthorityTargetList(
+                    manager, selected, selectSkillIndexes);
+            }
+            if (string.Equals(action, "play", StringComparison.Ordinal) &&
+                !data.ContainsKey("targetList"))
+            {
+                data["type"] = 30;
+            }
+            else if (string.Equals(action, "evolution", StringComparison.Ordinal))
+            {
+                // NetworkBattleSender.SendEvolData distinguishes a plain
+                // evolution (20) from an evolution with selected targets (21).
+                // The receiver uses that bit to decide whether it should read
+                // targetList, so preserve it in the authoritative result.
+                data["type"] = data.ContainsKey("targetList") ? 21 : 20;
+            }
+
+            BuildAuthorityRegisterData(
+                manager, false, out List<object> orderList,
+                out List<object> unapproved);
+            if (orderList.Count > 0)
+            {
+                data["orderList"] = orderList;
+            }
+            if (unapproved.Count > 0)
+            {
+                data["uList"] = unapproved;
+            }
+            // The original sender's orderList/uList is the authority for card
+            // creation and movement.  Ensure every private-zone destination
+            // also has its identity in the same native knownList packet before
+            // any P2P-only state is attached.  This covers both draw/return and
+            // generated Token cards, including effects that affect the action
+            // owner's opponent.
+            EnsureNativePrivateMoveIdentities(manager, data);
+            AppendAuthorityPreActionHistory(data);
+            AttachAuthorityFusionMetamorphoseOriginals(
+                data, orderList, actor, originalActorCardId, originalActorCost);
+            bool nativeKeyActionsAdded =
+                TryAppendAuthorityNativeKeyActions(manager, data, actor);
+            List<object> keyActions = nativeKeyActionsAdded
+                ? new List<object>()
+                : BuildAuthorityKeyActions(
+                    action, actor, selected, choiceIds, choiceBrave,
+                    selectedHandIndices, originalActorCardId);
+            if (!nativeKeyActionsAdded && keyActions.Count > 0)
+            {
+                data["keyAction"] = keyActions;
+            }
+
+            // The native sender prepares card identities from the action
+            // source's perspective.  The Host's register data above is in the
+            // Host perspective because the operation ran against BattleEnemy,
+            // so run the same preparation on a temporary Guest-perspective
+            // copy and flip the completed payload back.  This is important for
+            // every authority result, not only explicit FusionCard requests:
+            // accelerate/crystallize mutations, hidden draws, returned cards,
+            // and fusion operations registered by a normal card effect all use
+            // this path to produce the correct knownList/uList entries.
+            PrepareAuthorityOutgoingAction(manager, data);
+
+            AppendAuthorityResultMetadata(manager, data);
+            AppendAuthorityExecutionMetadata(
+                P2PBattleProtocol.PlayActionsUri, data);
+            NormalizeAuthorityResultFieldOrder(data);
+            // The register data is authored from the host's perspective because
+            // the host executed the action against BattleEnemy. Convert it to
+            // the guest's local perspective and mark it for the local replay
+            // adapter. Do not use PrepareOpponentBattleMessage here: that path
+            // intentionally routes an opponent action to BattleEnemy.
+            Dictionary<string, object> guestData = P2PMessageTransform.FlipPerspective(data);
+            FlipAuthorityTargetListPerspective(guestData);
+            P2PMessageTransform.NormalizeAuthorityLocalReplayMessage(guestData);
+            guestData["uri"] = P2PBattleProtocol.PlayActionsUri;
+            guestData["p2pAuthorityLocalReplay"] = 1;
+            guestData[P2PBattleProtocol.AuthorityResultRequestIdKey] = requestId;
+            return guestData;
+        }
+
+        private static void PrepareAuthorityOutgoingAction(
+            NetworkBattleManagerBase manager,
+            Dictionary<string, object> data)
+        {
+            if (manager == null || data == null)
+            {
+                return;
+            }
+
+            try
+            {
+                // P2PBattleCardTracker intentionally models the sender as
+                // "self" (isSelf=1).  Authority register data is currently
+                // authored in the Host perspective, where the Guest source is
+                // isSelf=0.  Convert only for the tracker pass, then restore
+                // the Host perspective before the final result flip below.
+                Dictionary<string, object> sourceData =
+                    P2PMessageTransform.FlipPerspective(data);
+                bool prepared = BattleCardTracker.PrepareOutgoingAction(
+                    false,
+                    sourceData,
+                    out _,
+                    out _,
+                    index => ResolveAuthorityCardId(manager, false, index),
+                    index => ResolveAuthorityCardCost(manager, false, index),
+                    warning => Plugin.Logger.LogWarning(
+                        "[P2P] Authority card synchronization: " +
+                        warning + "."),
+                    index => ResolveAuthorityFusionIngredients(
+                        manager, false, index));
+                if (!prepared)
+                {
+                    Plugin.Logger.LogDebug(
+                        "[P2P] Authority action did not expose a resolvable " +
+                        "playIdx/card identity; preserving native register data.");
+                }
+
+                Dictionary<string, object> hostData =
+                    P2PMessageTransform.FlipPerspective(sourceData);
+                data.Clear();
+                foreach (KeyValuePair<string, object> field in hostData)
+                {
+                    data[field.Key] = field.Value;
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning(
+                    "[P2P] Could not prepare authority card data: " + ex.Message);
+            }
+        }
+
+        private static void AttachAuthorityFusionActions(
+            NetworkBattleManagerBase manager,
+            Dictionary<string, object> data)
+        {
+            if (manager == null || data == null ||
+                !data.TryGetValue("orderList", out object rawOrderList) ||
+                rawOrderList is string || !(rawOrderList is IEnumerable))
+            {
+                return;
+            }
+
+            bool hasFusionOrder = false;
+            foreach (object rawOrder in (IEnumerable)rawOrderList)
+            {
+                if (rawOrder is Dictionary<string, object> order &&
+                    order.ContainsKey("fusion"))
+                {
+                    hasFusionOrder = true;
+                    break;
+                }
+            }
+            if (!hasFusionOrder)
+            {
+                return;
+            }
+
+            // Build the same cumulative fusion metadata that a local native
+            // emit receives from P2PBattleCardTracker. The Host is executing
+            // the Guest request against BattleEnemy, so all resolver lookups
+            // must use absolute owner=Guest (0), while targetList/isSelf stays
+            // in the action-source-relative native format until the final
+            // perspective flip below.
+            bool prepared = BattleCardTracker.PrepareOutgoingAction(
+                false,
+                data,
+                out _,
+                out _,
+                index => ResolveAuthorityCardId(manager, false, index),
+                index => ResolveAuthorityCardCost(manager, false, index),
+                warning => Plugin.Logger.LogWarning(
+                    "[P2P] Authority fusion synchronization: " + warning + "."),
+                index => ResolveAuthorityFusionIngredients(manager, false, index));
+            if (!prepared)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Authority fusion result did not expose a resolvable " +
+                    "playIdx/card identity; native replay will use its current " +
+                    "fusion state.");
+            }
+        }
+
+        private static int ResolveAuthorityCardId(
+            NetworkBattleManagerBase manager,
+            bool ownerIsHost,
+            int index)
+        {
+            BattleCardBase card = ResolveAuthorityCard(manager, ownerIsHost, index);
+            return card?.CardId ?? 0;
+        }
+
+        private static int ResolveAuthorityCardCost(
+            NetworkBattleManagerBase manager,
+            bool ownerIsHost,
+            int index)
+        {
+            BattleCardBase card = ResolveAuthorityCard(manager, ownerIsHost, index);
+            return card?.Cost ?? -1;
+        }
+
+        private static BattleCardBase ResolveAuthorityCard(
+            NetworkBattleManagerBase manager,
+            bool ownerIsHost,
+            int index)
+        {
+            if (manager == null || index <= 0)
+            {
+                return null;
+            }
+
+            // Absolute owner values are stable across the two processes. In
+            // the Host process owner=1 is BattlePlayer and owner=0 is
+            // BattleEnemy; the conditional also keeps this helper correct if
+            // it is reused from a Guest-side diagnostic path.
+            bool localPlayerOwnsCard = ownerIsHost == (Role == P2PRole.Host);
+            BattlePlayerBase player = localPlayerOwnsCard
+                ? manager.BattlePlayer
+                : manager.BattleEnemy;
+            return player == null
+                ? null
+                : NetworkBattleGenericTool.GetIndexToCardBase(
+                    manager, player, index);
+        }
+
+        private static IEnumerable<P2PFusionIngredientState>
+            ResolveAuthorityFusionIngredients(
+                NetworkBattleManagerBase manager,
+                bool ownerIsHost,
+                int index)
+        {
+            BattleCardBase card = ResolveAuthorityCard(manager, ownerIsHost, index);
+            SkillApplyInformation information = card?.SkillApplyInformation as
+                SkillApplyInformation;
+            List<P2PFusionIngredientState> current = information?.FusionIngredients == null
+                ? new List<P2PFusionIngredientState>()
+                : information.FusionIngredients
+                    .Where(ingredient => ingredient?.Card != null &&
+                        ingredient.Card.Index > 0)
+                    .Select(ingredient => new P2PFusionIngredientState(
+                        ingredient.Card.Index,
+                        ingredient.Card.CardId,
+                        ingredient.FusionTurn))
+                    .ToList();
+
+            string key = FusionIngredientSnapshotKey(ownerIsHost, index);
+            if (current.Count > 0)
+            {
+                LocalFusionIngredientSnapshots[key] = current
+                    .Select(item => new P2PFusionIngredientState(
+                        item.Index, item.CardId, item.Turn))
+                    .ToList();
+                return current;
+            }
+
+            return LocalFusionIngredientSnapshots.TryGetValue(
+                    key,
+                    out List<P2PFusionIngredientState> snapshot)
+                ? snapshot.ToList()
+                : Enumerable.Empty<P2PFusionIngredientState>();
+        }
+
+        private static List<object> BuildAuthorityTargetList(
+            NetworkBattleManagerBase manager,
+            IEnumerable<BattleCardBase> cards,
+            IEnumerable<int> selectSkillIndexes)
+        {
+            List<object> result = new List<object>();
+            if (cards == null)
+            {
+                return result;
+            }
+
+            List<int> skillIndexes = (selectSkillIndexes ?? Enumerable.Empty<int>())
+                .Where(index => index >= 0)
+                .Distinct()
+                .ToList();
+            foreach (BattleCardBase card in cards)
+            {
+                if (!IsValidAuthorityActor(card))
+                {
+                    continue;
+                }
+                Dictionary<string, object> target = new Dictionary<string, object>
+                {
+                    ["targetIdx"] = card.Index,
+                    ["isSelf"] = card.IsPlayer ? 1 : 0
+                };
+                if (skillIndexes.Count > 0)
+                {
+                    target["selectSkillIndex"] = skillIndexes
+                        .Select(index => (object)index)
+                        .ToList();
+                }
+                List<int> validateIndexes =
+                    ReadAuthorityValidateSkillIndexes(manager, card);
+                if (validateIndexes.Count > 0)
+                {
+                    target["skillIndex"] = validateIndexes
+                        .Select(index => (object)index)
+                        .ToList();
+                }
+                result.Add(target);
+            }
+            return result;
+        }
+
+        private static List<int> ReadAuthorityValidateSkillIndexes(
+            NetworkBattleManagerBase manager,
+            BattleCardBase target)
+        {
+            List<int> result = new List<int>();
+            if (manager == null || target == null)
+            {
+                return result;
+            }
+
+            try
+            {
+                object rawList = null;
+                if (TryFindInstanceProperty(manager.GetType(),
+                        "validateSkillIndexList", out PropertyInfo property))
+                {
+                    rawList = property.GetValue(manager, null);
+                }
+                else if (TryFindInstanceField(manager.GetType(),
+                        "validateSkillIndexList", out FieldInfo field))
+                {
+                    rawList = field.GetValue(manager);
+                }
+                if (rawList is string || !(rawList is IEnumerable values))
+                {
+                    return result;
+                }
+
+                foreach (object value in values)
+                {
+                    NetworkBattleManagerBase.ValidateSkillData validate =
+                        value as NetworkBattleManagerBase.ValidateSkillData;
+                    if (validate == null || validate.CardIndex != target.Index ||
+                        validate.isPlayer != target.IsPlayer ||
+                        validate.SkillIndex < 0 ||
+                        result.Contains(validate.SkillIndex))
+                    {
+                        continue;
+                    }
+                    result.Add(validate.SkillIndex);
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not read authoritative validate-skill " +
+                    "indexes: " + ex.Message);
+            }
+            return result;
+        }
+
+        private static void NormalizeAuthorityResultFieldOrder(
+            Dictionary<string, object> data)
+        {
+            if (data == null || !data.ContainsKey("keyAction"))
+            {
+                return;
+            }
+
+            // SendCardDataMaker.MakePlayActionsSendCardData writes keyAction as
+            // part of the basic card payload, before orderList/uList.  The
+            // NetworkBattleReceiver consumes dictionary entries in insertion
+            // order and uses keyAction to establish transformBeforeCardId
+            // before knownList is converted.  Rebuild the dictionary so the
+            // manually assembled authority result has the same native order.
+            if (!data.ContainsKey("knownList") && !data.ContainsKey("orderList"))
+            {
+                return;
+            }
+
+            List<KeyValuePair<string, object>> fields = data.ToList();
+            data.Clear();
+            HashSet<string> moved = new HashSet<string>(StringComparer.Ordinal)
+            {
+                "targetList", "keyAction", "knownList", "orderList", "uList"
+            };
+            foreach (KeyValuePair<string, object> field in fields)
+            {
+                if (moved.Contains(field.Key))
+                {
+                    continue;
+                }
+                data[field.Key] = field.Value;
+            }
+            foreach (string key in new[]
+            {
+                "targetList", "keyAction", "knownList", "orderList", "uList"
+            })
+            {
+                KeyValuePair<string, object> field = fields.FirstOrDefault(item =>
+                    string.Equals(item.Key, key, StringComparison.Ordinal));
+                if (field.Key != null)
+                {
+                    data[field.Key] = field.Value;
+                }
+            }
+        }
+
+        private static bool TryAppendAuthorityNativeKeyActions(
+            NetworkBattleManagerBase manager,
+            Dictionary<string, object> data,
+            BattleCardBase actor)
+        {
+            if (manager == null || data == null || actor == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                if (!TryFindInstanceField(
+                        manager.GetType(), "sendKeyActionDataManager",
+                        out FieldInfo field))
+                {
+                    return false;
+                }
+                object keyActionManager = field.GetValue(manager);
+                MethodInfo makeSendData = keyActionManager?.GetType().GetMethod(
+                    "MakeSendData",
+                    BindingFlags.Instance | BindingFlags.Public,
+                    null,
+                    new[] { typeof(Dictionary<string, object>), typeof(int) },
+                    null);
+                if (makeSendData == null)
+                {
+                    return false;
+                }
+
+                object value = makeSendData.Invoke(
+                    keyActionManager, new object[] { data, actor.Index });
+                return value is Dictionary<string, object> result &&
+                    result.TryGetValue("keyAction", out object rawActions) &&
+                    rawActions is IEnumerable actions &&
+                    !(rawActions is string) && actions.Cast<object>().Any();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not reuse native key-action data for the " +
+                    "authority result: " + ex.Message);
+                return false;
+            }
+        }
+
+        private static void BuildAuthorityRegisterData(
+            NetworkBattleManagerBase manager,
+            bool isTurnStart,
+            out List<object> orderList,
+            out List<object> unapproved)
+        {
+            orderList = new List<object>();
+            unapproved = new List<object>();
+            if (manager == null)
+            {
+                return;
+            }
+
+            try
+            {
+                List<RegisterUnapproved> source =
+                    GetRegisterUnapprovedList(manager);
+                SendCardDataMaker maker = new SendCardDataMaker(
+                    manager, manager.RegisterActionManager, source);
+
+                // Preserve the exact ordering used by the native sender.
+                InvokePrivateSendMaker(maker, "SwapTransformMetamorphoseData");
+                InvokePrivateSendMaker(maker, "DisCardCheckAndRemoveUlist");
+                if (source.Count > 0)
+                {
+                    object rawUnapproved = InvokePrivateSendMaker(
+                        maker, "MakeUList", source);
+                    if (rawUnapproved is IEnumerable values)
+                    {
+                        foreach (object value in values)
+                        {
+                            unapproved.Add(value);
+                        }
+                    }
+                }
+                InvokePrivateSendMaker(maker, "GatheredRegisterCard");
+                InvokePrivateSendMaker(
+                    maker, "SettingStateChangeCardToSkillTarget");
+                InvokePrivateSendMaker(
+                    maker, "InsertionTokenAfterStateChange");
+                InvokePrivateSendMaker(
+                    maker, "InsertionExtractAfterValidate");
+                object rawOrder = InvokePrivateSendMaker(
+                    maker, "OrderListCreate", isTurnStart);
+                if (rawOrder is IEnumerable orderValues)
+                {
+                    foreach (object value in orderValues)
+                    {
+                        orderList.Add(value);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning(
+                    "[P2P] Could not build authoritative native register data: " +
+                    ex.Message);
+            }
+        }
+
+        // The native sender normally exposes every card movement through
+        // orderList/uList.  In a friends-only authority room both sides may
+        // know private identities, but those identities still have to travel in
+        // the original knownList field before NetworkBattleData constructs the
+        // operation.  Do not defer an identity replacement until after VFX.
+        private static void EnsureNativePrivateMoveIdentities(
+            NetworkBattleManagerBase manager,
+            Dictionary<string, object> data)
+        {
+            if (manager == null || data == null)
+            {
+                return;
+            }
+
+            List<object> knownList = GetOrCreateKnownList(data);
+            int ensured = 0;
+            foreach (string listName in new[] { "orderList", "uList" })
+            {
+                if (!data.TryGetValue(listName, out object rawEntries) ||
+                    rawEntries is string || !(rawEntries is IEnumerable entries))
+                {
+                    continue;
+                }
+
+                foreach (object rawEntry in entries)
+                {
+                    foreach (Dictionary<string, object> move in
+                        EnumerateNativeMoveData(rawEntry))
+                    {
+                        if (!TryGetStateInt(move, "to", out int to) ||
+                            !IsNativePrivateDestination(to) ||
+                            !TryGetStateInt(move, "isSelf", out int rawSelf))
+                        {
+                            continue;
+                        }
+
+                        bool ownerIsHost = rawSelf != 0;
+                        foreach (int index in EnumerateNativeMoveIndices(move))
+                        {
+                            if (index <= 0)
+                            {
+                                continue;
+                            }
+
+                            int cardId = TryGetStateInt(move, "cardId",
+                                out int listedCardId)
+                                ? listedCardId
+                                : 0;
+                            int cost = -1;
+                            BattleCardBase card = ResolveAuthorityCard(
+                                manager, ownerIsHost, index);
+                            if (cardId <= 0)
+                            {
+                                cardId = card?.CardId ?? 0;
+                            }
+                            if (card != null)
+                            {
+                                cost = card.Cost;
+                            }
+                            else if (TryGetStateInt(move, "cost", out int listedCost))
+                            {
+                                cost = listedCost;
+                            }
+
+                            if (cardId <= 0)
+                            {
+                                Plugin.Logger.LogWarning(
+                                    "[P2P] Native private move has no resolvable " +
+                                    "card identity: owner=" +
+                                    (ownerIsHost ? "Host" : "Guest") +
+                                    ", idx=" + index + ", from=" +
+                                    (TryGetStateInt(move, "from", out int from)
+                                        ? from.ToString(CultureInfo.InvariantCulture)
+                                        : "?") + ", to=" + to + ".");
+                                continue;
+                            }
+
+                            UpsertNativeKnownCard(knownList, index, cardId,
+                                ownerIsHost, cost, move);
+                            ensured++;
+                        }
+                    }
+                }
+            }
+
+            if (ensured > 0)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Added " + ensured +
+                    " private movement identity entry(s) to native knownList.");
+            }
+        }
+
+        private static IEnumerable<Dictionary<string, object>>
+            EnumerateNativeMoveData(object rawEntry, int depth = 0)
+        {
+            if (rawEntry is Dictionary<string, object> entry)
+            {
+                if (entry.ContainsKey("from") && entry.ContainsKey("to") &&
+                    (entry.ContainsKey("idx") || entry.ContainsKey("idxList")))
+                {
+                    yield return entry;
+                    yield break;
+                }
+
+                if (depth >= 3)
+                {
+                    yield break;
+                }
+                foreach (object value in entry.Values)
+                {
+                    foreach (Dictionary<string, object> nested in
+                        EnumerateNativeMoveData(value, depth + 1))
+                    {
+                        yield return nested;
+                    }
+                }
+                yield break;
+            }
+
+            if (rawEntry is IEnumerable entries && !(rawEntry is string) &&
+                depth < 3)
+            {
+                foreach (object item in entries)
+                {
+                    foreach (Dictionary<string, object> nested in
+                        EnumerateNativeMoveData(item, depth + 1))
+                    {
+                        yield return nested;
+                    }
+                }
+            }
+        }
+
+        private static IEnumerable<int> EnumerateNativeMoveIndices(
+            Dictionary<string, object> move)
+        {
+            if (move == null)
+            {
+                yield break;
+            }
+            if (TryGetStateInt(move, "idx", out int scalar) && scalar > 0)
+            {
+                yield return scalar;
+                yield break;
+            }
+            if (!move.TryGetValue("idxList", out object rawIndices) ||
+                rawIndices is string || !(rawIndices is IEnumerable indices))
+            {
+                yield break;
+            }
+            foreach (object rawIndex in indices)
+            {
+                if (TryConvertAuthorityInt(rawIndex, out int index) && index > 0)
+                {
+                    yield return index;
+                }
+            }
+        }
+
+        private static bool IsNativePrivateDestination(int place)
+        {
+            return place == (int)NetworkBattleDefine.NetworkCardPlaceState.Deck ||
+                place == (int)NetworkBattleDefine.NetworkCardPlaceState.Hand ||
+                place == (int)NetworkBattleDefine.NetworkCardPlaceState.FusionIngredient ||
+                place == (int)NetworkBattleDefine.NetworkCardPlaceState.Reservation;
+        }
+
+        private static void UpsertNativeKnownCard(
+            List<object> knownList,
+            int index,
+            int cardId,
+            bool ownerIsHost,
+            int cost,
+            Dictionary<string, object> move)
+        {
+            if (knownList == null || index <= 0 || cardId <= 0)
+            {
+                return;
+            }
+
+            Dictionary<string, object> canonical = null;
+            foreach (Dictionary<string, object> entry in knownList
+                .OfType<Dictionary<string, object>>()
+                .Where(entry => IsSelfKnownCard(entry) == ownerIsHost &&
+                    KnownCardContainsIndex(entry, index))
+                .ToList())
+            {
+                if (TryGetStateInt(entry, "idx", out int scalarIndex) &&
+                    scalarIndex == index)
+                {
+                    if (canonical == null)
+                    {
+                        canonical = entry;
+                    }
+                    else
+                    {
+                        knownList.Remove(entry);
+                    }
+                    continue;
+                }
+
+                if (entry.TryGetValue("idxList", out object rawIndices) &&
+                    rawIndices is IEnumerable indices && !(rawIndices is string))
+                {
+                    List<object> remaining = indices.Cast<object>()
+                        .Where(rawIndex => !TryConvertAuthorityInt(rawIndex,
+                            out int groupedIndex) || groupedIndex != index)
+                        .ToList();
+                    if (remaining.Count == 0)
+                    {
+                        knownList.Remove(entry);
+                    }
+                    else
+                    {
+                        entry["idxList"] = remaining;
+                    }
+                }
+            }
+
+            if (canonical == null)
+            {
+                canonical = new Dictionary<string, object>();
+                knownList.Add(canonical);
+            }
+            canonical.Remove("idxList");
+            canonical["idx"] = index;
+            canonical["cardId"] = cardId;
+            canonical["isSelf"] = ownerIsHost ? 1 : 0;
+            canonical["is_open"] = 1;
+            if (cost >= 0)
+            {
+                canonical["cost"] = cost;
+            }
+            if (TryGetStateInt(move, "from", out int from))
+            {
+                canonical["from"] = from;
+            }
+            if (TryGetStateInt(move, "to", out int to))
+            {
+                canonical["to"] = to;
+            }
+        }
+
+        private static int AuthorityActionType(string action)
+        {
+            switch (action)
+            {
+                case "attack": return 10;
+                case "evolution": return 20;
+                case "fusion": return 40;
+                case "play": return 31;
+                default: return 30;
+            }
+        }
+
+        private static Dictionary<string, object> BuildAuthorityTurnEndActionsData(
+            NetworkBattleManagerBase manager,
+            string requestId)
+        {
+            if (manager == null)
+            {
+                return null;
+            }
+            Dictionary<string, object> data = new Dictionary<string, object>
+            {
+                ["uri"] = P2PBattleProtocol.TurnEndActionsUri,
+                ["type"] = 0,
+                ["turnState"] = 0,
+                [P2PBattleProtocol.AuthorityResultRequestIdKey] = requestId,
+                [P2PBattleProtocol.AuthoritySourceKey] = 0
+            };
+            BuildAuthorityRegisterData(
+                manager, false, out List<object> orderList,
+                out List<object> unapproved);
+            if (orderList.Count > 0)
+            {
+                data["orderList"] = orderList;
+            }
+            if (unapproved.Count > 0)
+            {
+                data["uList"] = unapproved;
+            }
+            EnsureNativePrivateMoveIdentities(manager, data);
+            AppendAuthorityPreActionHistory(data);
+            AttachActionPreHiddenMetamorphoseOriginals(data);
+            AppendAuthorityResultMetadata(manager, data);
+            AppendAuthorityExecutionMetadata(
+                P2PBattleProtocol.TurnEndActionsUri, data);
+            Dictionary<string, object> endState = !IsHostAuthorityMode
+                ? CaptureBattleState()
+                : null;
+            if (endState != null)
+            {
+                data[P2PBattleStateDiagnostics.StateKey] = endState;
+            }
+            Dictionary<string, object> guestData = P2PMessageTransform.FlipPerspective(data);
+            guestData["uri"] = P2PBattleProtocol.TurnEndActionsUri;
+            guestData["p2pAuthorityLocalReplay"] = 1;
+            guestData[P2PBattleProtocol.AuthorityResultRequestIdKey] = requestId;
+            return guestData;
+        }
+
+        private static Dictionary<string, object> BuildAuthorityTurnEndData(
+            NetworkBattleManagerBase manager,
+            string requestId)
+        {
+            if (manager == null)
+            {
+                return null;
+            }
+
+            // TurnEndActions carries registered skill/card operations. The
+            // separate TurnEnd packet is not optional: the stock receiver uses
+            // it to close the turn boundary, validate the consistency payload,
+            // and decide whether to emit the compatibility Judge. Earlier
+            // authority code sent only a marker here, which diverged from the
+            // native NetworkBattleSender.SendTurnEnd envelope.
+            Dictionary<string, object> data = new Dictionary<string, object>
+            {
+                ["uri"] = P2PBattleProtocol.TurnEndUri,
+                ["type"] = 0,
+                ["turnState"] = 0,
+                [P2PBattleProtocol.AuthorityResultRequestIdKey] = requestId,
+                [P2PBattleProtocol.AuthoritySourceKey] = 0,
+                ["actionSeq"] = GetNativeTurnSequence(manager),
+                ["cemetery"] = new List<object>
+                {
+                    manager.BattlePlayer?.CemeteryList?.Count ?? 0,
+                    manager.BattleEnemy?.CemeteryList?.Count ?? 0
+                }
+            };
+            Dictionary<string, object> consistency =
+                BuildAuthorityConsistency(manager);
+            if (consistency != null && consistency.Count > 0)
+            {
+                data["battleCode"] = consistency;
+            }
+
+            // Turn-end effects can still mutate a private zone after the last
+            // register entry was assembled. Capture the final state at this
+            // protocol boundary as the native server does for its final
+            // TurnEnd envelope. Signature tracking keeps this empty when the
+            // preceding TurnEndActions already published the same state.
+            AppendAuthorityResultMetadata(manager, data);
+            Dictionary<string, object> endState = !IsHostAuthorityMode
+                ? CaptureBattleState()
+                : null;
+            if (endState != null)
+            {
+                data[P2PBattleStateDiagnostics.StateKey] = endState;
+            }
+
+            Dictionary<string, object> guestData =
+                P2PMessageTransform.FlipPerspective(data);
+            guestData["uri"] = P2PBattleProtocol.TurnEndUri;
+            guestData["p2pAuthorityLocalReplay"] = 1;
+            guestData[P2PBattleProtocol.AuthorityResultRequestIdKey] = requestId;
+            return guestData;
+        }
+
+        private static Dictionary<string, object> BuildAuthorityConsistency(
+            NetworkBattleManagerBase manager)
+        {
+            if (manager == null || !TryFindInstanceField(
+                    manager.GetType(), "networkConsistency",
+                    out FieldInfo field))
+            {
+                return null;
+            }
+
+            try
+            {
+                object consistency = field.GetValue(manager);
+                if (consistency == null)
+                {
+                    return null;
+                }
+                consistency.GetType().GetMethod(
+                        "SetupConsistency",
+                        BindingFlags.Instance | BindingFlags.Public)
+                    ?.Invoke(consistency, null);
+                return consistency.GetType().GetMethod(
+                        "GetConsistency",
+                        BindingFlags.Instance | BindingFlags.Public)
+                    ?.Invoke(consistency, null) as Dictionary<string, object>;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not build authoritative TurnEnd consistency: " +
+                    ex.Message);
+                return null;
+            }
+        }
+
+        private static int GetNativeTurnSequence(
+            NetworkBattleManagerBase manager)
+        {
+            try
+            {
+                RealTimeNetworkAgent agent = currentAgent ??
+                    ToolboxGame.RealTimeNetworkAgent;
+                if (agent != null)
+                {
+                    int sequence = agent.GetTurnSequence();
+                    if (sequence >= 0)
+                    {
+                        return sequence;
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+            return manager?.CurrentTurn ?? 0;
+        }
+
+        private static Dictionary<string, object> BuildAuthorityTurnStartData(
+            NetworkBattleManagerBase manager,
+            string requestId,
+            int turnOwner,
+            bool extraTurn)
+        {
+            if (manager == null || (turnOwner != 0 && turnOwner != 1))
+            {
+                return null;
+            }
+
+            Dictionary<string, object> data = new Dictionary<string, object>
+            {
+                ["uri"] = P2PBattleProtocol.TurnStartUri,
+                ["turnState"] = 0,
+                [P2PBattleProtocol.AuthorityResultRequestIdKey] = requestId,
+                [P2PBattleProtocol.AuthoritySourceKey] = 0,
+                [P2PBattleProtocol.AuthorityTurnOwnerKey] = turnOwner,
+                [P2PBattleProtocol.AuthorityTurnExtraKey] = extraTurn ? 1 : 0,
+                ["actionSeq"] = GetNativeTurnSequence(manager)
+            };
+
+            BuildAuthorityRegisterData(
+                manager, true, out List<object> orderList,
+                out List<object> unapproved);
+            if (orderList.Count > 0)
+            {
+                data["orderList"] = orderList;
+            }
+            if (unapproved.Count > 0)
+            {
+                data["uList"] = unapproved;
+            }
+            EnsureNativePrivateMoveIdentities(manager, data);
+            AppendAuthorityPreActionHistory(data);
+            AttachActionPreHiddenMetamorphoseOriginals(data);
+            AppendAuthorityResultMetadata(manager, data);
+            AppendAuthorityExecutionMetadata(
+                P2PBattleProtocol.TurnStartUri, data);
+            Dictionary<string, object> startState = !IsHostAuthorityMode
+                ? CaptureBattleState()
+                : null;
+            if (startState != null)
+            {
+                data[P2PBattleStateDiagnostics.StateKey] = startState;
+            }
+
+            Dictionary<string, object> guestData =
+                P2PMessageTransform.FlipPerspective(data);
+            guestData["uri"] = P2PBattleProtocol.TurnStartUri;
+            guestData["p2pAuthorityLocalReplay"] = 1;
+            guestData[P2PBattleProtocol.AuthorityResultRequestIdKey] = requestId;
+            return guestData;
+        }
+
+        private static List<object> BuildAuthorityOrderList(NetworkBattleManagerBase manager)
+        {
+            List<object> result = new List<object>();
+            try
+            {
+                SendCardDataMaker maker = new SendCardDataMaker(
+                    manager, manager.RegisterActionManager, GetRegisterUnapprovedList(manager));
+                InvokePrivateSendMaker(maker, "DisCardCheckAndRemoveUlist");
+                InvokePrivateSendMaker(maker, "GatheredRegisterCard");
+                InvokePrivateSendMaker(maker, "SettingStateChangeCardToSkillTarget");
+                InvokePrivateSendMaker(maker, "InsertionTokenAfterStateChange");
+                InvokePrivateSendMaker(maker, "InsertionExtractAfterValidate");
+                object raw = InvokePrivateSendMaker(maker, "OrderListCreate", false);
+                if (raw is IEnumerable values)
+                {
+                    foreach (object value in values)
+                    {
+                        result.Add(value);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning("[P2P] Could not build authoritative orderList: " + ex.Message);
+            }
+            return result;
+        }
+
+        private static List<object> BuildAuthorityUnapprovedList(NetworkBattleManagerBase manager)
+        {
+            List<object> result = new List<object>();
+            try
+            {
+                List<RegisterUnapproved> source = GetRegisterUnapprovedList(manager);
+                if (source.Count == 0)
+                {
+                    return result;
+                }
+                SendCardDataMaker maker = new SendCardDataMaker(
+                    manager, manager.RegisterActionManager, source);
+                object raw = InvokePrivateSendMaker(maker, "MakeUList", source);
+                if (raw is IEnumerable values)
+                {
+                    foreach (object value in values)
+                    {
+                        result.Add(value);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning("[P2P] Could not build authoritative uList: " + ex.Message);
+            }
+            return result;
+        }
+
+        private static object InvokePrivateSendMaker(
+            SendCardDataMaker maker,
+            string name,
+            params object[] args)
+        {
+            MethodInfo method = maker.GetType().GetMethod(
+                name,
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            if (method == null)
+            {
+                throw new MissingMethodException(typeof(SendCardDataMaker).FullName, name);
+            }
+            return method.Invoke(maker, args);
+        }
+
+        private static List<RegisterUnapproved> GetRegisterUnapprovedList(
+            NetworkBattleManagerBase manager)
+        {
+            return manager?.RegisterUnapprovedList ?? new List<RegisterUnapproved>();
+        }
+
+        private static List<object> BuildAuthorityKeyActions(
+            string action,
+            BattleCardBase actor,
+            List<BattleCardBase> selected,
+            List<int> choiceIds,
+            bool choiceBrave,
+            IEnumerable<int> selectedHandIndices,
+            int originalCardIdOverride = 0)
+        {
+            List<object> result = new List<object>();
+            if (actor == null)
+            {
+                return result;
+            }
+            int originalId = originalCardIdOverride > 0
+                ? originalCardIdOverride
+                : actor.CardId;
+            if (string.Equals(action, "fusion", StringComparison.Ordinal))
+            {
+                if (selected != null && selected.Count > 0)
+                {
+                    result.Add(new Dictionary<string, object>
+                    {
+                        ["type"] = (int)SendKeyActionDataManager.KeyActionType.Fusion,
+                        ["cardId"] = originalId,
+                        ["selectCard"] = new Dictionary<string, object>
+                        {
+                            ["cardId"] = selected.Select(card => (object)card.CardId).ToList(),
+                            ["open"] = 1
+                        }
+                    });
+                }
+                return result;
+            }
+            if (choiceBrave)
+            {
+                result.Add(new Dictionary<string, object>
+                {
+                    ["type"] = (int)SendKeyActionDataManager.KeyActionType.ChoiceBrave,
+                    ["cardId"] = originalId,
+                    ["selectCard"] = new Dictionary<string, object>
+                    {
+                        ["cardId"] = new List<object> { originalId },
+                        ["open"] = 1
+                    }
+                });
+                return result;
+            }
+            if (choiceIds != null && choiceIds.Count > 0)
+            {
+                result.Add(new Dictionary<string, object>
+                {
+                    ["type"] = (int)SendKeyActionDataManager.KeyActionType.Choice,
+                    ["cardId"] = originalId,
+                    ["selectCard"] = new Dictionary<string, object>
+                    {
+                        ["cardId"] = choiceIds.Select(value => (object)value).ToList(),
+                        ["open"] = 1
+                    }
+                });
+            }
+            List<int> handIndices = selectedHandIndices == null
+                ? new List<int>()
+                : selectedHandIndices.Where(index => index > 0).Distinct().ToList();
+            if (handIndices.Count > 0)
+            {
+                result.Add(new Dictionary<string, object>
+                {
+                    ["type"] = (int)SendKeyActionDataManager.KeyActionType.BurialRate,
+                    ["cardId"] = originalId,
+                    ["selectCard"] = new Dictionary<string, object>
+                    {
+                        ["cardIdx"] = handIndices
+                            .Select(index => (object)index).ToList(),
+                        ["open"] = 1
+                    }
+                });
+            }
+            return result;
+        }
+
+        private static void AppendAuthorityResultMetadata(
+            NetworkBattleManagerBase manager,
+            Dictionary<string, object> data)
+        {
+            if (manager == null || data == null)
+            {
+                return;
+            }
+            Dictionary<int, Dictionary<string, object>> hiddenSnapshots =
+                new Dictionary<int, Dictionary<string, object>>();
+            Dictionary<int, Dictionary<string, object>> historySnapshots =
+                new Dictionary<int, Dictionary<string, object>>();
+
+            // Until the peer has acknowledged this process's initial private
+            // baseline, include every current private card in each ordered
+            // authority result. This closes the startup race where an action
+            // arrives before the one-shot baseline has reached the receiver.
+            // Once the baseline is acknowledged, the same method falls back to
+            // signature-based incremental snapshots.
+            bool forceAll = !localPrivateStateAcknowledged;
+            CaptureAuthorityPrivateSnapshot(
+                manager.BattlePlayer, true, hiddenSnapshots, forceAll);
+            CaptureAuthorityPrivateSnapshot(
+                manager.BattleEnemy, false, hiddenSnapshots, forceAll);
+            CaptureAuthorityPlayerHistorySnapshot(
+                manager.BattlePlayer, true, historySnapshots);
+            CaptureAuthorityPlayerHistorySnapshot(
+                manager.BattleEnemy, false, historySnapshots);
+
+            if (hiddenSnapshots.Count > 0)
+            {
+                data[P2PBattleProtocol.AuthorityHiddenStatesKey] =
+                    hiddenSnapshots.Values
+                        .Select(snapshot => (object)P2PJson.CloneDictionary(snapshot))
+                        .ToList();
+            }
+            if (historySnapshots.Count > 0)
+            {
+                data[P2PBattleProtocol.AuthorityPlayerHistoryStatesKey] =
+                    historySnapshots.Values
+                        .Select(snapshot => (object)P2PJson.CloneDictionary(snapshot))
+                        .ToList();
+            }
+
+            // Keep the original single-owner side channel populated for the
+            // current protocol and for a peer that has not yet learned the
+            // multi-owner extension.  Guest authority requests always use the
+            // absolute Guest owner (0) as their source.
+            if (hiddenSnapshots.TryGetValue(
+                    0, out Dictionary<string, object> guestHidden))
+            {
+                data["p2pHiddenOwner"] = 0;
+                data["p2pHiddenCards"] = guestHidden.TryGetValue(
+                        "cards", out object rawCards)
+                    ? P2PJson.CloneValue(rawCards)
+                    : new List<object>();
+                if (guestHidden.TryGetValue("removed", out object rawRemoved))
+                {
+                    data["p2pHiddenRemoved"] = P2PJson.CloneValue(rawRemoved);
+                }
+            }
+            if (historySnapshots.TryGetValue(
+                    0, out Dictionary<string, object> guestHistory))
+            {
+                data["p2pPlayerHistory"] = P2PJson.CloneDictionary(guestHistory);
+            }
+        }
+
+        private static void AppendAuthorityPreActionHistory(
+            Dictionary<string, object> data)
+        {
+            if (data == null || localActionPreHistoryState == null ||
+                !TryGetStateInt(localActionPreHistoryState, "owner",
+                    out int owner) || owner != 0)
+            {
+                return;
+            }
+
+            // The Guest request is evaluated by the Host against this
+            // pre-action history. Reapply the same state before the Guest
+            // invokes the native receiver; otherwise deterministic filters
+            // can still observe the post-action counters too early.
+            Dictionary<string, object> before =
+                P2PJson.CloneDictionary(localActionPreHistoryState);
+            before.Remove("revision");
+            before["revision"] = Math.Max(1, localActionPreHistoryRevision);
+            data[PlayerHistoryStateBeforeKey] = before;
+        }
+
+        private static void AppendAuthorityExecutionMetadata(
+            string uri,
+            Dictionary<string, object> data)
+        {
+            if (!ShouldPublishAuthoritativeActionManifest(uri, data))
+            {
+                return;
+            }
+
+            // Native network emits are suppressed while the Host executes a
+            // Guest request, so the normal HandleEmitNow path cannot attach the
+            // source-side random-target and private-condition manifest. Reuse
+            // that exact path here before the result is perspective-transformed.
+            DrainPendingLocalConditionResults();
+            AppendLocalActionManifest(uri, data);
+            AppendLocalAuthoritativeSkillTargets(uri, data);
+            AppendLocalAuthoritativeSkillEvaluations(uri, data);
+        }
+
+        private static bool ShouldPublishAuthoritativeActionManifest(
+            string uri,
+            Dictionary<string, object> data)
+        {
+            // Protocol v3 uses the native server envelope exclusively.  The
+            // manifest was a migration side-channel for the retired replay
+            // implementation; publishing it during native timing would make
+            // the receiver evaluate conditions/random targets twice.
+            if (UseNativeClientActionTiming)
+            {
+                return false;
+            }
+
+            // A Host-generated native message is already the authoritative
+            // result. Only an explicit Guest PlayActions replay still needs
+            // the compatibility manifest while the remaining hidden-state
+            // adapter is being retired. TurnStart/TurnEnd and normal Host
+            // actions must not carry a second condition program.
+            return IsHostAuthorityMode && Role == P2PRole.Host &&
+                string.Equals(uri,
+                    NetworkBattleDefine.NetworkBattleURI.PlayActions.ToString(),
+                    StringComparison.Ordinal) &&
+                data != null && data.TryGetValue(
+                    P2PBattleProtocol.AuthorityResultRequestIdKey,
+                    out object requestId) &&
+                !string.IsNullOrEmpty(requestId?.ToString());
+        }
+
+        private static void CaptureAuthorityPrivateSnapshot(
+            BattlePlayerBase player,
+            bool ownerIsHost,
+            Dictionary<int, Dictionary<string, object>> destination,
+            bool forceAll = false)
+        {
+            if (player == null || destination == null)
+            {
+                return;
+            }
+
+            int owner = ownerIsHost ? 1 : 0;
+            if (!authorityKnownPrivateIndicesByOwner.TryGetValue(
+                    owner, out HashSet<int> knownIndices))
+            {
+                knownIndices = new HashSet<int>();
+                authorityKnownPrivateIndicesByOwner[owner] = knownIndices;
+            }
+
+            HashSet<int> present = new HashSet<int>();
+            List<object> changedCards = new List<object>();
+            try
+            {
+                foreach (BattleCardBase card in EnumeratePrivateCards(player))
+                {
+                    if (card == null || card.Index <= 0 || card.CardId <= 0)
+                    {
+                        continue;
+                    }
+
+                    present.Add(card.Index);
+                    Dictionary<string, object> state = CreateHiddenCardState(card);
+                    string signature = JsonConvert.SerializeObject(
+                        state, P2PJson.Settings);
+                    string key = HiddenStateKey(ownerIsHost, card.Index);
+                    authorityPrivateStates.TryGetValue(
+                        key, out Dictionary<string, object> previousState);
+                    bool changed = forceAll ||
+                        !authorityPrivateStateSignatures.TryGetValue(
+                            key, out string previous) ||
+                        !string.Equals(previous, signature, StringComparison.Ordinal);
+                    if (changed)
+                    {
+                        authorityPrivateStateSignatures[key] = signature;
+                        authorityPrivateStates[key] =
+                            P2PJson.CloneDictionary(state);
+                        changedCards.Add(forceAll
+                            ? P2PJson.CloneDictionary(state)
+                            : CreateHiddenCardDelta(previousState, state)
+                                ?? P2PJson.CloneDictionary(state));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not capture authoritative private state for " +
+                    SideName(ownerIsHost) + ": " + ex.Message);
+            }
+
+            List<object> removed = knownIndices
+                .Where(index => !present.Contains(index))
+                .Select(index => (object)index)
+                .ToList();
+            foreach (int index in removed)
+            {
+                authorityPrivateStateSignatures.Remove(
+                    HiddenStateKey(ownerIsHost, index));
+                authorityPrivateStates.Remove(
+                    HiddenStateKey(ownerIsHost, index));
+            }
+            knownIndices.Clear();
+            foreach (int index in present)
+            {
+                knownIndices.Add(index);
+            }
+
+            if (changedCards.Count == 0 && removed.Count == 0)
+            {
+                return;
+            }
+
+            destination[owner] = new Dictionary<string, object>
+            {
+                ["owner"] = owner,
+                ["cards"] = changedCards,
+                ["removed"] = removed
+            };
+        }
+
+        private static void CaptureAuthorityPlayerHistorySnapshot(
+            BattlePlayerBase player,
+            bool ownerIsHost,
+            Dictionary<int, Dictionary<string, object>> destination)
+        {
+            if (player == null || destination == null)
+            {
+                return;
+            }
+
+            int owner = ownerIsHost ? 1 : 0;
+            Dictionary<string, object> state;
+            try
+            {
+                state = CapturePlayerHistoryState(player, ownerIsHost);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not capture authoritative history for " +
+                    SideName(ownerIsHost) + ": " + ex.Message);
+                return;
+            }
+
+            string signature = JsonConvert.SerializeObject(state, P2PJson.Settings);
+            if (authorityPlayerHistorySignatures.TryGetValue(
+                    owner, out string previous) &&
+                string.Equals(previous, signature, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            authorityPlayerHistorySignatures[owner] = signature;
+            int revision = authorityPlayerHistoryRevisions.TryGetValue(
+                    owner, out int currentRevision)
+                ? currentRevision
+                : 0;
+            if (ownerIsHost == (Role == P2PRole.Host))
+            {
+                revision = Math.Max(revision, localPlayerHistoryRevision);
+            }
+            revision = Math.Max(1, revision + 1);
+            authorityPlayerHistoryRevisions[owner] = revision;
+            state["revision"] = revision;
+            destination[owner] = state;
+        }
+
+        private static void FlipAuthorityTargetListPerspective(
+            Dictionary<string, object> data)
+        {
+            if (data == null || !data.TryGetValue("targetList", out object raw) ||
+                raw is string || !(raw is IEnumerable values))
+            {
+                return;
+            }
+            foreach (object value in values)
+            {
+                if (!(value is Dictionary<string, object> target) ||
+                    !target.TryGetValue("isSelf", out object rawSelf) ||
+                    !TryConvertAuthorityInt(rawSelf, out int isSelf))
+                {
+                    continue;
+                }
+                target["isSelf"] = isSelf == 0 ? 1 : 0;
+            }
+        }
+
+        private static void EnsureAuthorityRandomResultsAreValid(
+            Dictionary<string, object> data,
+            string requestId)
+        {
+            if (data == null || Role != P2PRole.Host)
+            {
+                return;
+            }
+
+            // Guest authority actions are executed by the Host's native
+            // NetworkOperationCollection.  The resulting RegisterUnapproved
+            // values are therefore Host-generated. Validate them immediately
+            // before delivery so an incomplete/stale compatibility manifest
+            // cannot become a second random-result source.
+            if (!P2PAuthoritativeServer.ValidateAndRecordNativeRandomResults(
+                    data,
+                    P2PAuthoritativeServer.StateRevision,
+                    false,
+                    out string error))
+            {
+                throw new InvalidOperationException(
+                    "the Host-generated native random result was invalid for " +
+                    (requestId ?? "<missing>") + ": " + error);
+            }
+        }
+
+        private static void DeliverAuthorityResult(Dictionary<string, object> data)
+        {
+            if (data == null || Role != P2PRole.Host || peerDisconnected)
+            {
+                return;
+            }
+            data[P2PBattleProtocol.AuthorityResultActionIdKey] =
+                ++authorityResultActionSequence;
+            data["viewerId"] = RemoteProfile?.ViewerId ?? 0;
+            data["bid"] = BattleId ?? string.Empty;
+            data["p2pAuthorityLocalReplay"] = 1;
+            // Authority results are ordered independently from the old host
+            // action stream. Reuse the guest delivery sequence so the native
+            // agent still observes monotonically increasing playSeq values.
+            Deliver(false, data, RemoteProfile?.ViewerId ?? 0);
+            Plugin.Logger.LogDebug("[P2P] Authority result delivered: actionId=" +
+                authorityResultActionSequence + ", requestId=" +
+                (data.TryGetValue(P2PBattleProtocol.AuthorityResultRequestIdKey, out object id)
+                    ? id?.ToString() : "?") + ".");
+        }
+
+        private static void TryDisableLocalBattleMenu()
+        {
+            try
+            {
+                NetworkBattleManagerBase manager = BattleManagerBase.GetIns() as NetworkBattleManagerBase;
+                manager?.BattleUIContainer?.DisableMenu(false);
+                manager?.BattlePlayer?.BattleView?.TurnEndButtonUI?.HideBtn();
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        private static void TryEnableLocalBattleMenu()
+        {
+            try
+            {
+                NetworkBattleManagerBase manager = BattleManagerBase.GetIns() as NetworkBattleManagerBase;
+                manager?.BattleUIContainer?.RequestEnableMenuWhenTouchable();
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        internal static bool TryProcessAuthorityLocalReplay(
+            RealTimeNetworkBattleAgent agent,
+            Dictionary<string, object> data,
+            out bool result)
+        {
+            result = false;
+            if (UseNativeClientActionTiming)
+            {
+                if (data != null && ReadAuthorityBool(
+                        data, "p2pAuthorityLocalReplay"))
+                {
+                    // A packet from the retired request/result protocol must
+                    // never fall through into the ordinary receiver: its
+                    // perspective and target fields were authored for a local
+                    // replay, not an opponent action. Consume it explicitly
+                    // and keep the current native packet stream intact.
+                    Plugin.Logger.LogWarning(
+                        "[P2P] Dropped a legacy authority replay packet: uri=" +
+                        GetUri(data) + ".");
+                    result = true;
+                    return true;
+                }
+                return false;
+            }
+            if (!IsHostAuthorityMode || Role != P2PRole.Guest ||
+                agent == null || data == null ||
+                !ReadAuthorityBool(data, "p2pAuthorityLocalReplay"))
+            {
+                return false;
+            }
+
+            if (!authorityReplayDispatchActive)
+            {
+                if (PendingAuthorityReplayActions.Count >=
+                    MaxPendingReceivedBattleMessages)
+                {
+                    ReportBattleDiagnostic(
+                        "Authority replay queue exceeded " +
+                        MaxPendingReceivedBattleMessages + "; dropping uri=" +
+                        GetUri(data) + ", actionId=" +
+                        GetAuthorityActionId(data) + ".");
+                    result = true;
+                    return true;
+                }
+
+                // InjectNow reserves an ordered-packet boundary before the
+                // realtime agent dispatches PlayReceiveData. Authority replay
+                // is intercepted at that later point and moved to this queue,
+                // so release the provisional reservation; the dispatcher will
+                // establish the real native boundary when it calls
+                // ReceivedMessage.
+                ReleaseReservedReceivedBattleActionInjection(data);
+                PendingAuthorityReplayActions.Enqueue(
+                    new PendingAuthorityReplayAction(
+                        agent,
+                        P2PJson.CloneDictionary(data)));
+                Plugin.Logger.LogDebug(
+                    "[P2P] Queued authority result: actionId=" +
+                    GetAuthorityActionId(data) + ", uri=" + GetUri(data) +
+                    ", queued=" + PendingAuthorityReplayActions.Count + ".");
+                // Consume the realtime-agent packet now. The dedicated queue
+                // dispatches it only when the preceding replay transaction has
+                // reached its native completion boundary.
+                result = true;
+                return true;
+            }
+
+            string replayUri = GetUri(data);
+            string replayRequestId = data.TryGetValue(
+                    P2PBattleProtocol.AuthorityResultRequestIdKey,
+                    out object rawReplayRequestId)
+                ? rawReplayRequestId?.ToString()
+                : null;
+            Plugin.Logger.LogInfo(
+                "[P2P] Guest received authority result: uri=" + replayUri +
+                ", requestId=" + (replayRequestId ?? "<missing>") + ".");
+            NetworkBattleManagerBase manager = null;
+            try
+            {
+                if (TryFindInstanceField(agent.GetType(), "_networkBattleManager",
+                        out FieldInfo field))
+                {
+                    manager = field.GetValue(agent) as NetworkBattleManagerBase;
+                }
+                if (manager == null)
+                {
+                    manager = BattleManagerBase.GetIns() as NetworkBattleManagerBase;
+                }
+                if (manager == null || manager.GetNetworkBattleReceiver() == null ||
+                    !data.TryGetValue("uri", out object rawUri) ||
+                    !Enum.TryParse(rawUri?.ToString(), out NetworkBattleDefine.NetworkBattleURI uri))
+                {
+                    ReportBattleDiagnostic(
+                        "Authority replay was dropped because the native battle " +
+                        "manager or URI was unavailable (uri=" + replayUri +
+                        ", requestId=" + (replayRequestId ?? "?") + ").");
+                    if (Role == P2PRole.Guest &&
+                        string.Equals(replayRequestId, guestAuthorityRequestId,
+                            StringComparison.Ordinal))
+                    {
+                        receivedAuthorityRequestId = replayRequestId;
+                    }
+                    CompleteGuestAuthorityRequestIfMatching(replayUri, true);
+                    result = true;
+                    return true;
+                }
+
+                if (!TryAcceptAuthorityReplayBoundary(
+                        replayUri, replayRequestId, GetAuthorityActionId(data),
+                        out _))
+                {
+                    // A delayed or duplicate authority frame must be consumed
+                    // at the transport boundary. Feeding it to the native
+                    // receiver a second time can execute an action twice and
+                    // strand the Guest in the turn-transition gate.
+                    result = true;
+                    return true;
+                }
+                // The normal RealTimeNetworkBattleAgent path calls
+                // SetNetworkInfo before NetworkBattleReceiver.ReceivedMessage.
+                // Authority replay bypasses that virtual method, so preserve
+                // the native agent/network state update (especially turnState,
+                // bid, and battle-start metadata) explicitly.
+                // RealTimeNetworkAgent.PlayReceiveData first dispatches the
+                // raw packet to OnReceivedEvent.  Keep that callback in the
+                // authority path as well; room/player controllers use it for
+                // receive sequence bookkeeping and lifecycle transitions.
+                agent.OnReceivedEvent?.Invoke(data);
+                NetworkBattleDefine.NetworkBattleURI networkUri = uri;
+                agent.SetNetworkInfo(data, ref networkUri);
+                authorityLocalReplayActive = true;
+                PrepareAuthorityFusionMetamorphoseReplayData(data);
+                result = manager.GetNetworkBattleReceiver().ReceivedMessage(
+                    uri,
+                    true,
+                    data,
+                    true,
+                    null,
+                    true);
+                if (!result)
+                {
+                    ReportBattleDiagnostic(
+                        "Authority replay was rejected by the native receiver: " +
+                        "uri=" + replayUri + ", requestId=" +
+                        (replayRequestId ?? "?") + ".");
+                    // PrepareNativeReceivedActionMetadata has already bound
+                    // the request ID when conversion reached the receiver.
+                    // Force the Guest gate open so a malformed frame cannot
+                    // leave the match permanently waiting for a result.
+                    if (Role == P2PRole.Guest &&
+                        string.Equals(replayRequestId, guestAuthorityRequestId,
+                            StringComparison.Ordinal) &&
+                        string.IsNullOrEmpty(receivedAuthorityRequestId))
+                    {
+                        receivedAuthorityRequestId = replayRequestId;
+                    }
+                    CompleteGuestAuthorityRequestIfMatching(replayUri, true);
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogError("[P2P] Authority local replay failed: " + ex);
+
+                // The Harmony prefix consumes the native PlayReceiveData call.
+                // If anything fails before (or outside) ReceivedMessage's own
+                // finalizer, returning false would make the realtime agent keep
+                // the same playSeq pending and leave the Guest input gate locked
+                // forever.  Treat the frame as consumed after recording the
+                // failure, and explicitly run the same cleanup path used for a
+                // rejected native receive.
+                try
+                {
+                    if (nativeReceivedMetadataActive)
+                    {
+                        CompleteNativeReceivedActionMetadata(data, false);
+                    }
+                }
+                catch (Exception cleanupException)
+                {
+                    Plugin.Logger.LogDebug(
+                        "[P2P] Authority replay cleanup failed: " +
+                        cleanupException.Message);
+                }
+
+                authorityLocalReplayActive = false;
+                localActionCaptureActive = false;
+                currentAuthorityReplayData = null;
+                currentInjectedAuthoritativeSkillTargetBatch = null;
+                currentInjectedAuthoritativeSkillEvaluationBatch = null;
+                processingReceivedBattleAction = false;
+                receivedBattleActionInjectionPending = false;
+                receivedBattleActionPendingUntilVfx = false;
+                receivedBattleActionOperationStarted = false;
+                receivedBattleActionStartedUtc = DateTime.MinValue;
+                receivedBattleActionStallReported = false;
+                activeReceivedBattleActionUri = null;
+                localActionPreHistoryState = null;
+                localActionPreHistoryRevision = 0;
+                if (Role == P2PRole.Guest &&
+                    string.Equals(replayRequestId, guestAuthorityRequestId,
+                        StringComparison.Ordinal))
+                {
+                    receivedAuthorityRequestId = replayRequestId;
+                    CompleteGuestAuthorityRequestIfMatching(replayUri, true);
+                }
+
+                // The packet has been handled (and diagnosed), so allow the
+                // outer realtime-agent sequence bookkeeping to advance.
+                result = true;
+                return true;
+            }
+            finally
+            {
+                // Keep the replay context alive until the native VFX delegate
+                // executes. NetworkOperationCollection schedules Play/Fusion
+                // calls for a later frame, so clearing it at ReceivedMessage
+                // return would route the action back to BattleEnemy.
+                if (!result)
+                {
+                    authorityLocalReplayActive = false;
+                }
+            }
+        }
+
+        private static bool TryAcceptAuthorityReplayBoundary(
+            string uri,
+            string requestId,
+            string actionId,
+            out string boundaryKey)
+        {
+            boundaryKey = null;
+            if (string.IsNullOrEmpty(requestId))
+            {
+                // Host-originated legacy messages do not carry an authority
+                // request ID and remain on the original receive path.
+                return true;
+            }
+
+            boundaryKey = !string.IsNullOrEmpty(actionId) &&
+                !string.Equals(actionId, "<missing>",
+                    StringComparison.Ordinal)
+                ? "action:" + actionId
+                : requestId + "|" + (uri ?? "?");
+            if (appliedAuthorityResultBoundaries.Contains(boundaryKey))
+            {
+                Plugin.Logger.LogWarning(
+                    "[P2P] Ignoring duplicate authority result boundary: " +
+                    boundaryKey + ".");
+                return false;
+            }
+
+            // Host-generated turn transitions use a separate ID namespace and
+            // are valid even while the Guest has no pending input request.
+            bool isHostTransition = requestId.IndexOf(
+                "-host-turn-", StringComparison.Ordinal) >= 0;
+            if (!isHostTransition &&
+                (!guestAuthorityBusy ||
+                 !string.Equals(requestId, guestAuthorityRequestId,
+                     StringComparison.Ordinal)))
+            {
+                if (!completedAuthorityRequestIds.Contains(requestId))
+                {
+                    Plugin.Logger.LogWarning(
+                        "[P2P] Ignoring stale authority result " +
+                        requestId + " for " + (uri ?? "?") +
+                        "; no matching Guest request is pending.");
+                }
+                completedAuthorityRequestIds.Add(requestId);
+                TrimAuthorityResultHistory();
+                return false;
+            }
+
+            appliedAuthorityResultBoundaries.Add(boundaryKey);
+            TrimAuthorityResultHistory();
+            return true;
+        }
+
+        private static void TrimAuthorityResultHistory()
+        {
+            const int maximumRequestIds = 512;
+            const int maximumBoundaries = 1024;
+            if (completedAuthorityRequestIds.Count > maximumRequestIds)
+            {
+                // Request IDs are monotonic within a battle. Retaining the
+                // newest half is unnecessary complexity for a tiny dedupe
+                // cache, so clear once the bound is reached.
+                completedAuthorityRequestIds.Clear();
+            }
+            if (appliedAuthorityResultBoundaries.Count > maximumBoundaries)
+            {
+                appliedAuthorityResultBoundaries.Clear();
+            }
+        }
+
+        private static void PrepareAuthorityFusionMetamorphoseReplayData(
+            Dictionary<string, object> data)
+        {
+            if (data == null ||
+                !data.TryGetValue(
+                    P2PBattleProtocol.FusionMetamorphoseOriginalsKey,
+                    out object rawEntries) ||
+                rawEntries is string || !(rawEntries is IEnumerable entries))
+            {
+                return;
+            }
+
+            List<object> knownList = GetOrCreateKnownList(data);
+            List<object> prepend = new List<object>();
+            foreach (object rawEntry in entries)
+            {
+                if (!(rawEntry is Dictionary<string, object> entry) ||
+                    !TryGetStateInt(entry, "owner", out int owner) ||
+                    (owner != 0 && owner != 1) ||
+                    !TryGetStateInt(entry, "idx", out int index) ||
+                    index <= 0 ||
+                    !TryGetStateInt(entry, "cardId", out int cardId) ||
+                    cardId <= 0)
+                {
+                    continue;
+                }
+
+                // Authority owner values are absolute (Host=1, Guest=0).
+                // Convert to the current receiver's native isSelf convention;
+                // both Host and Guest use the same original knownList schema.
+                int localOwner = Role == P2PRole.Host ? 1 : 0;
+                int relativeSelf = owner == localOwner ? 1 : 0;
+
+                // Native SendCardDataMaker is allowed to compact several
+                // cards into one knownList entry by writing idxList.  A
+                // metamorphose replay, however, needs one scalar idx entry for
+                // the card that is about to be replaced.  If we simply append
+                // that entry while leaving the compacted group intact,
+                // ReplaceReceivedCard.SearchForDummyCardInHandAndDeck sees
+                // the same index twice and its SingleOrDefault throws.  Split
+                // the target index out of every matching idxList group and
+                // remove duplicate scalar entries before inserting the one
+                // canonical original-card entry.
+                Dictionary<string, object> existing = null;
+                List<Dictionary<string, object>> matching = knownList
+                    .OfType<Dictionary<string, object>>()
+                    .Where(known =>
+                        IsSelfKnownCard(known) == (relativeSelf != 0) &&
+                        KnownCardContainsIndex(known, index))
+                    .ToList();
+                foreach (Dictionary<string, object> known in matching)
+                {
+                    if (TryGetStateInt(known, "idx", out int scalarIndex) &&
+                        scalarIndex == index)
+                    {
+                        if (existing == null)
+                        {
+                            existing = known;
+                        }
+                        else
+                        {
+                            knownList.Remove(known);
+                        }
+                        continue;
+                    }
+
+                    if (!known.TryGetValue("idxList", out object rawIndices) ||
+                        rawIndices is string || !(rawIndices is IEnumerable indices))
+                    {
+                        continue;
+                    }
+
+                    List<object> remaining = new List<object>();
+                    foreach (object rawIndex in indices)
+                    {
+                        if (!TryConvertAuthorityInt(rawIndex, out int groupedIndex) ||
+                            groupedIndex != index)
+                        {
+                            remaining.Add(rawIndex);
+                        }
+                    }
+                    if (remaining.Count == 0)
+                    {
+                        knownList.Remove(known);
+                    }
+                    else
+                    {
+                        known["idxList"] = remaining;
+                    }
+                }
+                if (existing == null)
+                {
+                    existing = new Dictionary<string, object>
+                    {
+                        ["idx"] = index,
+                        ["cardId"] = cardId,
+                        ["isSelf"] = relativeSelf,
+                        ["is_open"] = 1
+                    };
+                    if (TryGetStateInt(entry, "cost", out int cost) && cost >= 0)
+                    {
+                        existing["cost"] = cost;
+                    }
+                    prepend.Add(existing);
+                    continue;
+                }
+
+                existing["cardId"] = cardId;
+                existing["is_open"] = 1;
+                if (TryGetStateInt(entry, "cost", out int existingCost) &&
+                    existingCost >= 0)
+                {
+                    existing["cost"] = existingCost;
+                }
+                int existingIndex = knownList.IndexOf(existing);
+                if (existingIndex > 0)
+                {
+                    knownList.RemoveAt(existingIndex);
+                    prepend.Add(existing);
+                }
+            }
+
+            if (prepend.Count > 0)
+            {
+                for (int i = prepend.Count - 1; i >= 0; i--)
+                {
+                    knownList.Insert(0, prepend[i]);
+                }
+            }
+        }
+
+        internal static bool TryProcessAuthorityTurnStart(
+            NetworkOperationCollection operation)
+        {
+            if (!IsHostAuthorityMode || !authorityLocalReplayActive ||
+                Role != P2PRole.Guest || operation == null ||
+                !(BattleManagerBase.GetIns() is NetworkBattleManagerBase manager) ||
+                manager.networkBattleData?.GetReceiveData() == null)
+            {
+                return false;
+            }
+
+            NetworkBattleReceiver.ReceiveData receiveData =
+                manager.networkBattleData.GetReceiveData();
+            if (!receiveData.dataUri.Equals(
+                    NetworkBattleDefine.NetworkBattleURI.TurnStart))
+            {
+                return false;
+            }
+
+            Dictionary<string, object> rawData = currentAuthorityReplayData;
+            if (rawData == null ||
+                !TryGetStateInt(rawData,
+                    P2PBattleProtocol.AuthorityTurnOwnerKey,
+                    out int turnOwner) ||
+                (turnOwner != 0 && turnOwner != 1))
+            {
+                return false;
+            }
+
+            bool localOwnerIsHost = Role == P2PRole.Host;
+            bool localTurn = turnOwner == (localOwnerIsHost ? 1 : 0);
+            int extraValue = 0;
+            bool extraTurn = rawData.TryGetValue(
+                    P2PBattleProtocol.AuthorityTurnExtraKey,
+                    out object rawExtra) &&
+                TryConvertAuthorityInt(rawExtra, out extraValue) &&
+                extraValue != 0;
+
+            try
+            {
+                BattlePlayerBase player = localTurn
+                    ? manager.BattlePlayer
+                    : manager.BattleEnemy;
+                if (player == null)
+                {
+                    return false;
+                }
+
+                Wizard.Battle.View.Vfx.VfxBase vfx =
+                    player.StartTurnControl(extraTurn ? "ExtraTurn" : "Normal");
+                // ControlTurnStart on the Host consumes the selected player's
+                // extra-turn counter immediately after constructing this VFX.
+                // StartTurnControl itself does not decrement that counter, so
+                // mirror the native operation exactly on the Guest.  Without
+                // this, a replayed ExtraTurn remains queued locally and the
+                // next transition can select the wrong owner.
+                player.DecreasesExtraTurnCount();
+                manager.VfxMgr.RegisterSequentialVfx<
+                    Wizard.Battle.View.Vfx.VfxBase>(vfx);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogError(
+                    "[P2P] Authority TurnStart replay failed: " + ex);
+                return true;
+            }
         }
 
         private static void RemovePrivateTwoPickDraftData(
@@ -1707,6 +6573,8 @@ namespace Shadowbus
             if (guestMulliganHand == null) guestMulliganHand = new List<int> { 1, 2, 3 };
             List<int> self = toHost ? hostMulliganHand : guestMulliganHand;
             List<int> oppo = toHost ? guestMulliganHand : hostMulliganHand;
+            P2PAuthoritativeServer.ObserveDeal(
+                hostMulliganHand, guestMulliganHand);
             Deliver(toHost, new Dictionary<string, object>
             {
                 ["uri"] = NetworkBattleDefine.NetworkBattleURI.Deal.ToString(),
@@ -1743,6 +6611,8 @@ namespace Shadowbus
                 guestMulliganHand = hand;
                 guestSwapped = true;
             }
+            P2PAuthoritativeServer.ObserveMulligan(
+                sourceIsHost, selected, hand);
             Plugin.Logger.LogInfo(
                 $"[P2P] {SideName(sourceIsHost)} completed mulligan selection.");
             Deliver(sourceIsHost, new Dictionary<string, object>
@@ -1785,11 +6655,11 @@ namespace Shadowbus
             if (retiringHost.HasValue)
             {
                 authoritativeSideIsHost = retiringHost.Value;
-                authoritativeLocalResult =
-                    (int)NetworkBattleReceiver.RESULT_CODE.RetireLose;
+                authoritativeLocalResult = P2PBattleResult.RetireLose;
                 authority = "retirement";
             }
-            else if (TryReadReportedLocalResult(request, out int reportedLocalResult))
+            else if ((!IsHostAuthorityMode || sourceIsHost) &&
+                TryReadReportedLocalResult(request, out int reportedLocalResult))
             {
                 authoritativeSideIsHost = sourceIsHost;
                 authoritativeLocalResult = reportedLocalResult;
@@ -1799,10 +6669,20 @@ namespace Shadowbus
             {
                 authoritativeSideIsHost = true;
                 authoritativeLocalResult = GetLocalFinishResult();
-                authority = "Host fallback";
+                authority = IsHostAuthorityMode && !sourceIsHost
+                    ? "Host authority"
+                    : "Host fallback";
             }
 
-            if (!P2PBattleResult.IsPairedResult(authoritativeLocalResult))
+            if (retiringHost.HasValue)
+            {
+                results = P2PBattleResult.FromRetirement(
+                    retiringHost.Value);
+            }
+            else if (!P2PBattleResult.TryCreateResultPair(
+                         authoritativeSideIsHost,
+                         authoritativeLocalResult,
+                         out results))
             {
                 Deliver(sourceIsHost, new Dictionary<string, object>
                 {
@@ -1815,20 +6695,32 @@ namespace Shadowbus
                 return;
             }
 
-            results = P2PBattleResult.FromLocalResult(
-                authoritativeSideIsHost,
-                authoritativeLocalResult);
             finishResultSent = true;
-            Deliver(true, new Dictionary<string, object>
+            Dictionary<string, object> hostResult = new Dictionary<string, object>
             {
                 ["uri"] = NetworkBattleDefine.NetworkBattleURI.JudgeResult.ToString(),
                 ["result"] = results.Host
-            }, 0);
-            Deliver(false, new Dictionary<string, object>
+            };
+            Dictionary<string, object> guestResult = new Dictionary<string, object>
             {
                 ["uri"] = NetworkBattleDefine.NetworkBattleURI.JudgeResult.ToString(),
                 ["result"] = results.Guest
-            }, 0);
+            };
+            if (request != null && request.TryGetValue(
+                    P2PBattleProtocol.AuthorityResultRequestIdKey,
+                    out object rawRequestId) && rawRequestId != null)
+            {
+                string requestId = rawRequestId.ToString();
+                if (!string.IsNullOrEmpty(requestId))
+                {
+                    hostResult[P2PBattleProtocol.AuthorityResultRequestIdKey] =
+                        requestId;
+                    guestResult[P2PBattleProtocol.AuthorityResultRequestIdKey] =
+                        requestId;
+                }
+            }
+            Deliver(true, hostResult, 0);
+            Deliver(false, guestResult, 0);
             Plugin.Logger.LogInfo(
                 $"[P2P] Battle result delivered from {authority} " +
                 $"({authoritativeLocalResult}): host receives local result " +
@@ -1908,6 +6800,9 @@ namespace Shadowbus
             {
                 if (!GuestDeliverySequence.TryNext(out playSequence))
                 {
+                    Plugin.Logger.LogError(
+                        "[P2P] Dropped Host->Guest delivery because the guest " +
+                        "battle stream is not open: uri=" + GetUri(data) + ".");
                     return;
                 }
                 guestPlaySequence = playSequence;
@@ -1924,13 +6819,18 @@ namespace Shadowbus
             }
             else
             {
-                SendWire(new P2PWireMessage
+                if (!SendWire(new P2PWireMessage
                 {
                     Type = "deliver",
                     ViewerId = viewerId,
                     BattleId = BattleId,
                     Data = data
-                });
+                }))
+                {
+                    Plugin.Logger.LogError(
+                        "[P2P] Failed to deliver Host->Guest message: uri=" +
+                        GetUri(data) + ", playSeq=" + playSequence + ".");
+                }
             }
         }
 
@@ -2006,6 +6906,26 @@ namespace Shadowbus
                 : "?";
         }
 
+        private static string GetAuthorityActionId(
+            Dictionary<string, object> data)
+        {
+            if (data != null && data.TryGetValue(
+                    P2PBattleProtocol.AuthorityResultActionIdKey,
+                    out object rawActionId) && rawActionId != null)
+            {
+                return rawActionId.ToString();
+            }
+
+            string requestId = data != null && data.TryGetValue(
+                    P2PBattleProtocol.AuthorityResultRequestIdKey,
+                    out object rawRequestId)
+                ? rawRequestId?.ToString()
+                : null;
+            return string.IsNullOrEmpty(requestId)
+                ? "<missing>"
+                : requestId + "|" + GetUri(data);
+        }
+
         private static void Inject(Dictionary<string, object> data)
         {
             string incomingUri = GetUri(data);
@@ -2072,6 +6992,13 @@ namespace Shadowbus
                 expectedBattleState = rawState as Dictionary<string, object>;
                 data.Remove(P2PBattleStateDiagnostics.StateKey);
             }
+            if (UseNativeClientActionTiming)
+            {
+                // A native v3 response is already the Host-authoritative
+                // boundary. Any legacy full-state checkpoint is stale by
+                // definition and must not create a second diagnostic path.
+                expectedBattleState = null;
+            }
             bool isOrderedReceivedBattleMessage =
                 IsOrderedReceivedBattleMessage(uri);
             if (!isOrderedReceivedBattleMessage)
@@ -2090,7 +7017,8 @@ namespace Shadowbus
             {
                 try
                 {
-                    if (P2PBattleResult.IsPairedResult(Convert.ToInt32(resultValue)))
+                    if (P2PBattleResult.IsTerminalResult(
+                            Convert.ToInt32(resultValue)))
                     {
                         finishResultSent = true;
                     }
@@ -2132,15 +7060,16 @@ namespace Shadowbus
             PendingBattleStateCheck pendingStateCheck = null;
             if (expectedBattleState != null)
             {
-                // Boundary messages can be injected before the previous message's VFX
-                // has drained. Only the newest checkpoint describes the state that will
-                // exist when the shared queue next becomes idle.
-                PendingBattleStateChecks.Clear();
                 pendingStateCheck = new PendingBattleStateCheck(
                     uri,
                     P2PJson.CloneDictionary(expectedBattleState),
-                    DateTime.UtcNow.AddSeconds(BattleStateCheckTimeoutSeconds));
+                    DateTime.UtcNow.AddSeconds(BattleStateCheckTimeoutSeconds),
+                    GetAuthorityActionId(data));
                 PendingBattleStateChecks.Enqueue(pendingStateCheck);
+            }
+            if (isOrderedReceivedBattleMessage)
+            {
+                BeginReceivedBattleActionInjection(uri, data);
             }
             try
             {
@@ -2181,6 +7110,44 @@ namespace Shadowbus
             }
         }
 
+        private static void BeginReceivedBattleActionInjection(
+            string uri,
+            Dictionary<string, object> data)
+        {
+            if (receivedBattleActionInjectionPending ||
+                receivedBattleActionPendingUntilVfx ||
+                processingReceivedBattleAction)
+            {
+                ReportBattleDiagnostic(
+                    "Ordered battle action was injected while another receive " +
+                    "boundary was still active: uri=" + uri + ", actionId=" +
+                    GetAuthorityActionId(data) + ".");
+                return;
+            }
+
+            receivedBattleActionInjectionPending = true;
+            receivedBattleActionStartedUtc = DateTime.UtcNow;
+            receivedBattleActionStallReported = false;
+            activeReceivedBattleActionUri = uri;
+        }
+
+        private static void ReleaseReservedReceivedBattleActionInjection(
+            Dictionary<string, object> data)
+        {
+            if (!receivedBattleActionInjectionPending ||
+                processingReceivedBattleAction ||
+                !string.Equals(activeReceivedBattleActionUri, GetUri(data),
+                    StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            receivedBattleActionInjectionPending = false;
+            receivedBattleActionStartedUtc = DateTime.MinValue;
+            receivedBattleActionStallReported = false;
+            activeReceivedBattleActionUri = null;
+        }
+
         private static bool ShouldDeferReceivedPlayAction()
         {
             if (!IsActive)
@@ -2188,7 +7155,8 @@ namespace Shadowbus
                 return false;
             }
 
-            if (receivedBattleActionPendingUntilVfx ||
+            if (receivedBattleActionInjectionPending ||
+                receivedBattleActionPendingUntilVfx ||
                 processingReceivedBattleAction)
             {
                 return true;
@@ -2202,8 +7170,14 @@ namespace Shadowbus
         private static void TryInjectPendingReceivedPlayAction()
         {
             if (!IsActive || PendingReceivedBattleMessages.Count == 0 ||
+                receivedBattleActionInjectionPending ||
                 receivedBattleActionPendingUntilVfx ||
                 processingReceivedBattleAction)
+            {
+                return;
+            }
+
+            if (HasPendingAuthorityReplayBeforeReceivedBattleMessage())
             {
                 return;
             }
@@ -2216,6 +7190,82 @@ namespace Shadowbus
             }
 
             Inject(PendingReceivedBattleMessages.Dequeue());
+        }
+
+        private static void TryInjectPendingAuthorityReplayAction()
+        {
+            if (!IsActive || Role != P2PRole.Guest ||
+                PendingAuthorityReplayActions.Count == 0 ||
+                authorityReplayDispatchActive ||
+                receivedBattleActionInjectionPending ||
+                receivedBattleActionPendingUntilVfx ||
+                processingReceivedBattleAction)
+            {
+                return;
+            }
+
+            if (PendingReceivedBattleMessages.Count > 0 &&
+                !HasPendingAuthorityReplayBeforeReceivedBattleMessage())
+            {
+                return;
+            }
+
+            NetworkBattleManagerBase manager =
+                BattleManagerBase.GetIns() as NetworkBattleManagerBase;
+            if (manager?.VfxMgr == null || !manager.VfxMgr.IsEnd)
+            {
+                return;
+            }
+
+            PendingAuthorityReplayAction pending =
+                PendingAuthorityReplayActions.Dequeue();
+            authorityReplayDispatchActive = true;
+            try
+            {
+                if (!TryProcessAuthorityLocalReplay(
+                        pending.Agent, pending.Data, out bool consumed) ||
+                    !consumed)
+                {
+                    ReportBattleDiagnostic(
+                        "Authority replay dispatcher could not consume actionId=" +
+                        GetAuthorityActionId(pending.Data) + ", uri=" +
+                        GetUri(pending.Data) + ".");
+                }
+            }
+            finally
+            {
+                authorityReplayDispatchActive = false;
+            }
+        }
+
+        private static bool HasPendingAuthorityReplayBeforeReceivedBattleMessage()
+        {
+            if (PendingAuthorityReplayActions.Count == 0)
+            {
+                return false;
+            }
+            if (PendingReceivedBattleMessages.Count == 0)
+            {
+                return true;
+            }
+
+            Dictionary<string, object> authority =
+                PendingAuthorityReplayActions.Peek().Data;
+            Dictionary<string, object> received =
+                PendingReceivedBattleMessages.Peek();
+            bool hasAuthoritySequence = TryGetStateInt(
+                authority, "playSeq", out int authoritySequence);
+            bool hasReceivedSequence = TryGetStateInt(
+                received, "playSeq", out int receivedSequence);
+            if (hasAuthoritySequence && hasReceivedSequence)
+            {
+                return authoritySequence <= receivedSequence;
+            }
+
+            // Packets without a play sequence are lifecycle packets. Preserve
+            // the native receive queue's existing order by letting its head go
+            // first instead of guessing that an authority result is newer.
+            return false;
         }
 
         private static bool IsOrderedReceivedBattleMessage(string uri)
@@ -2246,8 +7296,27 @@ namespace Shadowbus
 
         private static void TryCompleteReceivedBattleAction()
         {
-            if (!receivedBattleActionPendingUntilVfx)
+            if (!receivedBattleActionInjectionPending &&
+                !receivedBattleActionPendingUntilVfx)
             {
+                return;
+            }
+
+            if (receivedBattleActionInjectionPending)
+            {
+                bool injectionTimedOut = receivedBattleActionStartedUtc !=
+                    DateTime.MinValue &&
+                    DateTime.UtcNow - receivedBattleActionStartedUtc >=
+                    TimeSpan.FromSeconds(BattleStateCheckTimeoutSeconds);
+                if (injectionTimedOut && !receivedBattleActionStallReported)
+                {
+                    receivedBattleActionStallReported = true;
+                    ReportBattleDiagnostic(
+                        "RECEIVE ACTION DISPATCH STALL: uri=" +
+                        (activeReceivedBattleActionUri ?? "?") +
+                        " did not reach NetworkBattleReceiver within " +
+                        BattleStateCheckTimeoutSeconds + " seconds.");
+                }
                 return;
             }
 
@@ -2255,7 +7324,21 @@ namespace Shadowbus
                 BattleManagerBase.GetIns() as NetworkBattleManagerBase;
             bool timedOut = receivedBattleActionStartedUtc != DateTime.MinValue &&
                 DateTime.UtcNow - receivedBattleActionStartedUtc >=
-                    TimeSpan.FromSeconds(BattleStateCheckTimeoutSeconds);
+                TimeSpan.FromSeconds(BattleStateCheckTimeoutSeconds);
+            if (!receivedBattleActionOperationStarted)
+            {
+                if (timedOut && !receivedBattleActionStallReported)
+                {
+                    receivedBattleActionStallReported = true;
+                    ReportBattleDiagnostic(
+                        "RECEIVE OPERATION START STALL: uri=" +
+                        (activeReceivedBattleActionUri ?? "?") +
+                        " reached NetworkBattleReceiver but did not reach " +
+                        "OperateReceive within " +
+                        BattleStateCheckTimeoutSeconds + " seconds.");
+                }
+                return;
+            }
             if (manager?.VfxMgr == null || !manager.VfxMgr.IsEnd)
             {
                 if (timedOut && !receivedBattleActionStallReported)
@@ -2265,7 +7348,8 @@ namespace Shadowbus
                         $"RECEIVE ACTION STALL: the effect queue did not finish " +
                         $"within {BattleStateCheckTimeoutSeconds} seconds; " +
                         DescribeEffectQueue(manager) + ". Pending remote messages=" +
-                        PendingReceivedBattleMessages.Count + ".");
+                        (PendingReceivedBattleMessages.Count +
+                            PendingAuthorityReplayActions.Count) + ".");
                 }
                 return;
             }
@@ -2286,7 +7370,10 @@ namespace Shadowbus
                         $"{BattleStateCheckTimeoutSeconds} seconds. " +
                         DescribePendingReceivedPostActionState() + ".");
                 }
-                DiscardUnresolvedReceivedPostActionState();
+                // Do not discard a post-action private/history snapshot and
+                // then admit the next action. That turns a recoverable delayed
+                // state application into a real simulation divergence.
+                return;
             }
 
             // Promote post-action hidden-zone state only after all effects from
@@ -2294,10 +7381,42 @@ namespace Shadowbus
             // hand/deck modifiers as the source client.
             ApplyPendingReceivedHiddenCardStates();
 
+            string completedUri = activeReceivedBattleActionUri;
             processingReceivedBattleAction = false;
+            receivedBattleActionInjectionPending = false;
             receivedBattleActionPendingUntilVfx = false;
+            receivedBattleActionOperationStarted = false;
             receivedBattleActionStartedUtc = DateTime.MinValue;
             receivedBattleActionStallReported = false;
+            authorityLocalReplayActive = false;
+            localActionCaptureActive = false;
+            PendingLocalConditionResults.Clear();
+            localActionPreHistoryState = null;
+            localActionPreHistoryRevision = 0;
+            activeReceivedBattleActionUri = null;
+            currentAuthorityReplayData = null;
+            TryEnableGuestMenuAfterReceivedTurnStart(manager, completedUri);
+            CompleteGuestAuthorityRequestIfMatching(completedUri);
+        }
+
+        private static void TryEnableGuestMenuAfterReceivedTurnStart(
+            NetworkBattleManagerBase manager,
+            string completedUri)
+        {
+            if (Role != P2PRole.Guest || manager == null ||
+                manager.IsBattleEnd || !string.Equals(completedUri,
+                    NetworkBattleDefine.NetworkBattleURI.TurnStart.ToString(),
+                    StringComparison.Ordinal) ||
+                manager.BattlePlayer == null ||
+                !manager.BattlePlayer.IsSelfTurn)
+            {
+                return;
+            }
+
+            // A Host-originated Guest TurnStart has no pending Guest request,
+            // so CompleteGuestAuthorityRequestIfMatching cannot re-enable the
+            // local menu. Do it at the same committed native boundary.
+            TryEnableLocalBattleMenu();
         }
 
         private static bool HasPendingReceivedPostActionState()
@@ -2384,6 +7503,17 @@ namespace Shadowbus
                 return;
             }
 
+            // Protocol v3 restores the native sender/receiver contract. The
+            // source's RegisterUnapproved data contains randomTargetIdx in
+            // uList; NetworkBattleReceiver converts it to CardDataModel and
+            // NetworkExecutionInfoCreator consumes it through
+            // GetUnapprovedCardObj. Do not capture/replay a second random
+            // target list on top of that original path.
+            if (UseNativeClientActionTiming)
+            {
+                return;
+            }
+
             // A local action can also activate a random skill owned by the
             // opponent (last words, reactions, etc.). Authority belongs to the
             // action source, not to skill.ownerCard.IsPlayer. The presence of a
@@ -2449,7 +7579,7 @@ namespace Shadowbus
                 : !localOwnerIsHost;
             List<object> targetReferences = (targets ??
                     Enumerable.Empty<BattleCardBase>())
-                .Where(card => card != null && card.Index > 0)
+                .Where(IsValidAuthorityActor)
                 .Select(card => (object)CapturePlayerCardReference(
                     card, localOwnerIsHost))
                 .ToList();
@@ -2471,7 +7601,7 @@ namespace Shadowbus
             if (independentTargets != null && independentTargets.Count > 0)
             {
                 capture["independent"] = independentTargets
-                    .Where(item => item.Value != null && item.Value.Index > 0)
+                    .Where(item => IsValidAuthorityActor(item.Value))
                     .Select(item => (object)new Dictionary<string, object>
                     {
                         ["slot"] = item.Key,
@@ -2529,7 +7659,7 @@ namespace Shadowbus
                 {
                     ["version"] = P2PBattleProtocol.ActionManifestVersion,
                     ["uri"] = uri,
-                    ["source"] = Role == P2PRole.Host ? 1 : 0
+                    ["source"] = ResolveActionManifestSource(data)
                 };
             int playIndex = GetMessagePlayIndex(data);
             int actionSequence;
@@ -2573,6 +7703,19 @@ namespace Shadowbus
                 $"[P2P] Attached action manifest seq={manifest["seq"]} " +
                 $"to {uri}: evaluations={LocalAuthoritativeSkillEvaluations.Count}, " +
                 $"targets={LocalAuthoritativeSkillTargets.Count}.");
+        }
+
+        private static int ResolveActionManifestSource(
+            Dictionary<string, object> data)
+        {
+            if (data != null &&
+                TryGetStateInt(data, P2PBattleProtocol.AuthoritySourceKey,
+                    out int explicitSource) &&
+                (explicitSource == 0 || explicitSource == 1))
+            {
+                return explicitSource;
+            }
+            return Role == P2PRole.Host ? 1 : 0;
         }
 
         private static void DrainPendingLocalConditionResults()
@@ -3125,6 +8268,7 @@ namespace Shadowbus
             Dictionary<string, object> data)
         {
             if (data == null ||
+                !ReadAuthorityBool(data, "p2pAuthorityLocalReplay") ||
                 !data.TryGetValue(AuthoritativeSkillEvaluationsKey,
                     out object rawEvaluations) ||
                 rawEvaluations is string ||
@@ -3148,7 +8292,8 @@ namespace Shadowbus
             }
 
             AuthoritativeSkillEvaluationBatch batch =
-                new AuthoritativeSkillEvaluationBatch(entries);
+                new AuthoritativeSkillEvaluationBatch(
+                    entries, GetAuthorityActionId(data), GetUri(data));
             PendingAuthoritativeSkillEvaluationBatches.Enqueue(batch);
             currentInjectedAuthoritativeSkillEvaluationBatch = batch;
             ActivateNextAuthoritativeSkillEvaluationBatch();
@@ -3158,6 +8303,7 @@ namespace Shadowbus
             Dictionary<string, object> data)
         {
             if (data == null ||
+                !ReadAuthorityBool(data, "p2pAuthorityLocalReplay") ||
                 !data.TryGetValue(AuthoritativeSkillTargetsKey, out object rawTargets) ||
                 rawTargets is string || !(rawTargets is IEnumerable targetEntries))
             {
@@ -3178,7 +8324,8 @@ namespace Shadowbus
                 return;
             }
             AuthoritativeSkillTargetBatch batch =
-                new AuthoritativeSkillTargetBatch(entries);
+                new AuthoritativeSkillTargetBatch(
+                    entries, GetAuthorityActionId(data), GetUri(data));
             PendingAuthoritativeSkillTargetBatches.Enqueue(batch);
             currentInjectedAuthoritativeSkillTargetBatch = batch;
             ActivateNextAuthoritativeSkillTargetBatch();
@@ -3208,11 +8355,24 @@ namespace Shadowbus
                 return;
             }
 
-            // New peers send one action manifest. Expand it before the existing
-            // consumers run so the migration remains compatible with older
-            // side-channel handlers and with messages that contain only the
-            // canonical manifest.
-            ExpandActionManifestToLegacy(data);
+            // Protocol v3 does not use the migration manifest.  Keep decoding
+            // only for the retired replay compatibility path; normal native
+            // messages must enter the receiver unchanged so there is one
+            // condition/random-result source.
+            if (!UseNativeClientActionTiming)
+            {
+                ExpandActionManifestToLegacy(data);
+            }
+            // Apply the same pre-action identity normalization on both
+            // receivers. Host receives Guest-originated emits into its local
+            // BattleEnemy mirror; it must have the same canonical knownList
+            // identities before NetworkBattleData builds the operation.
+            // Guest uses the same path for Host-originated results. This keeps
+            // compact idxList entries from leaving duplicate identities and
+            // lets generated/drawn private cards enter the native receiver at
+            // the original server boundary.
+            PrepareAuthorityFusionMetamorphoseReplayData(data);
+            PromoteReceivedHiddenCardStatesIntoNativeKnownList(data);
 
             // ProcessingRecivedData can stock an ordered packet and invoke the
             // native receiver later. Bind metadata here, at the actual receiver
@@ -3221,13 +8381,20 @@ namespace Shadowbus
             bool ordered = IsOrderedReceivedBattleMessage(uri.ToString());
             if (ordered)
             {
+                bool matchesReservedInjection =
+                    receivedBattleActionInjectionPending &&
+                    string.Equals(activeReceivedBattleActionUri, uri.ToString(),
+                        StringComparison.Ordinal);
                 // Unity may run the native network-agent Update before the mod's
                 // Update on the first idle frame. Finish the preceding operation's
                 // post-state here before staging metadata for the next operation.
                 TryApplyPendingPlayerHistoryStates();
                 TryApplyPendingFusionActions();
                 TryCompleteReceivedBattleAction();
-                if (receivedBattleActionPendingUntilVfx)
+                if ((receivedBattleActionInjectionPending ||
+                        receivedBattleActionPendingUntilVfx ||
+                        processingReceivedBattleAction) &&
+                    !matchesReservedInjection)
                 {
                     ReportBattleDiagnostic(
                         "A new native battle action started before the previous " +
@@ -3237,7 +8404,9 @@ namespace Shadowbus
                     DiscardUnresolvedReceivedPostActionState();
                     ApplyPendingReceivedHiddenCardStates();
                     processingReceivedBattleAction = false;
+                    receivedBattleActionInjectionPending = false;
                     receivedBattleActionPendingUntilVfx = false;
+                    receivedBattleActionOperationStarted = false;
                     receivedBattleActionStartedUtc = DateTime.MinValue;
                     receivedBattleActionStallReported = false;
                 }
@@ -3245,12 +8414,18 @@ namespace Shadowbus
                 TryClearConsumedAuthoritativeSkillEvaluations();
 
                 processingReceivedBattleAction = true;
+                receivedBattleActionInjectionPending = false;
                 receivedBattleActionPendingUntilVfx = true;
+                receivedBattleActionOperationStarted = false;
                 receivedBattleActionStartedUtc = DateTime.UtcNow;
                 receivedBattleActionStallReported = false;
+                activeReceivedBattleActionUri = uri.ToString();
             }
 
             nativeReceivedMetadataActive = true;
+            currentAuthorityReplayData = data != null
+                ? P2PJson.CloneDictionary(data)
+                : null;
             currentInjectedAuthoritativeSkillTargetBatch = null;
             currentInjectedAuthoritativeSkillEvaluationBatch = null;
             RememberReceivedHiddenCardStates(data, ordered);
@@ -3260,6 +8435,18 @@ namespace Shadowbus
             RememberReceivedAuthoritativeSkillTargets(data);
             RememberReceivedAuthoritativeSkillEvaluations(data);
             ApplyReceivedFusionAction(data, false);
+            if (Role == P2PRole.Guest && data.TryGetValue(
+                    P2PBattleProtocol.AuthorityResultRequestIdKey,
+                    out object rawAuthorityRequestId))
+            {
+                receivedAuthorityRequestId = rawAuthorityRequestId?.ToString();
+            }
+            else if (ordered)
+            {
+                // A Host-originated action has no Guest request ID. Do not
+                // leave an older authority ID attached to this boundary.
+                receivedAuthorityRequestId = null;
+            }
         }
 
         internal static void CompleteNativeReceivedActionMetadata(
@@ -3280,10 +8467,21 @@ namespace Shadowbus
                 RejectReceivedAuthoritativeSkillTargets();
                 DiscardReceivedPlayerHistoryState(data);
                 PendingReceivedHiddenCardStates.Clear();
+                NativePromotedReceivedHiddenCardStateSignatures.Clear();
+                NativeReplacedReceivedHiddenCardStateSignatures.Clear();
                 processingReceivedBattleAction = false;
+                receivedBattleActionInjectionPending = false;
                 receivedBattleActionPendingUntilVfx = false;
+                receivedBattleActionOperationStarted = false;
                 receivedBattleActionStartedUtc = DateTime.MinValue;
                 receivedBattleActionStallReported = false;
+                authorityLocalReplayActive = false;
+                localActionCaptureActive = false;
+                PendingLocalConditionResults.Clear();
+                localActionPreHistoryState = null;
+                localActionPreHistoryRevision = 0;
+                activeReceivedBattleActionUri = null;
+                CompleteGuestAuthorityRequestIfMatching(GetUri(data), true);
             }
 
             // Every safe pre-native hook has run by the time ReceivedMessage
@@ -3301,6 +8499,767 @@ namespace Shadowbus
             currentInjectedAuthoritativeSkillTargetBatch = null;
             currentInjectedAuthoritativeSkillEvaluationBatch = null;
             nativeReceivedMetadataActive = false;
+            if (!accepted || !IsOrderedReceivedBattleMessage(GetUri(data)))
+            {
+                currentAuthorityReplayData = null;
+            }
+
+            // A non-ordered message cannot have deferred native VFX that own
+            // the replay context. Ordered battle messages are finalized by
+            // TryCompleteReceivedBattleAction after their VFX queue drains.
+            if (accepted && !IsOrderedReceivedBattleMessage(GetUri(data)))
+            {
+                // A JudgeResult/diagnostic can arrive while an earlier
+                // authority PlayActions VFX is still draining. Do not clear
+                // its suppression flag merely because this newer packet is
+                // non-ordered: late native callbacks from that VFX would then
+                // emit a duplicate action while the battle is closing.
+                if (!receivedBattleActionPendingUntilVfx &&
+                    !processingReceivedBattleAction)
+                {
+                    authorityLocalReplayActive = false;
+                }
+                CompleteGuestAuthorityRequestIfMatching(GetUri(data));
+            }
+        }
+
+        private static void CompleteGuestAuthorityRequestIfMatching(
+            string completedUri = null,
+            bool force = false)
+        {
+            if (Role != P2PRole.Guest || !guestAuthorityBusy ||
+                string.IsNullOrEmpty(guestAuthorityRequestId))
+            {
+                return;
+            }
+
+            bool isTurnEndRequest = string.Equals(
+                guestAuthorityRequestAction, "turn_end",
+                StringComparison.Ordinal);
+            bool matchesRequest = !string.IsNullOrEmpty(
+                    receivedAuthorityRequestId) &&
+                string.Equals(receivedAuthorityRequestId,
+                    guestAuthorityRequestId, StringComparison.Ordinal);
+            // When a Guest turn ends and the Host becomes the next owner, the
+            // following TurnStart is emitted by the Host's normal local path,
+            // so it has no authority request ID. It is still the terminal
+            // boundary for the Guest's turn-end request.
+            bool untaggedHostTurnStart = isTurnEndRequest &&
+                string.Equals(completedUri,
+                    NetworkBattleDefine.NetworkBattleURI.TurnStart.ToString(),
+                    StringComparison.Ordinal) &&
+                string.IsNullOrEmpty(receivedAuthorityRequestId);
+            if (!matchesRequest && !untaggedHostTurnStart)
+            {
+                return;
+            }
+            if (!force && isTurnEndRequest &&
+                !string.Equals(completedUri,
+                    NetworkBattleDefine.NetworkBattleURI.TurnStart.ToString(),
+                    StringComparison.Ordinal) &&
+                !string.Equals(completedUri,
+                    NetworkBattleDefine.NetworkBattleURI.TurnEndFinal.ToString(),
+                    StringComparison.Ordinal) &&
+                !string.Equals(completedUri,
+                    NetworkBattleDefine.NetworkBattleURI.JudgeResult.ToString(),
+                    StringComparison.Ordinal))
+            {
+                // A native turn-end is a three-message transition:
+                // TurnEndActions -> TurnEnd -> TurnStart (or a final result).
+                // Keep the Guest input gate closed until the transition has
+                // reached its terminal boundary.
+                return;
+            }
+
+            guestAuthorityBusy = false;
+            completedAuthorityRequestIds.Add(guestAuthorityRequestId);
+            TrimAuthorityResultHistory();
+            guestAuthorityRequestId = null;
+            guestAuthorityRequestAction = null;
+            guestAuthorityRequestSentUtc = DateTime.MinValue;
+            receivedAuthorityRequestId = null;
+            localAuthorityChoiceCardIndexes.Clear();
+            TryEnableLocalBattleMenu();
+        }
+
+        private static void QueueAuthorityNextTurnStart(
+            NetworkBattleManagerBase manager,
+            string requestId)
+        {
+            if (manager?.VfxMgr == null || manager.IsBattleEnd)
+            {
+                return;
+            }
+
+            manager.VfxMgr.RegisterSequentialVfx<Wizard.Battle.View.Vfx.VfxBase>(
+                Wizard.Battle.View.Vfx.InstantVfx.Create(() =>
+                    StartAuthorityNextTurn(manager, requestId)));
+        }
+
+        private static void QueueHostTurnEndNextTurnStart(
+            NetworkBattleManagerBase manager)
+        {
+            if (manager?.VfxMgr == null || manager.IsBattleEnd)
+            {
+                return;
+            }
+
+            manager.VfxMgr.RegisterSequentialVfx<Wizard.Battle.View.Vfx.VfxBase>(
+                Wizard.Battle.View.Vfx.InstantVfx.Create(() =>
+                    StartHostTurnEndNextTurn(manager)));
+        }
+
+        private static void StartHostTurnEndNextTurn(
+            NetworkBattleManagerBase manager)
+        {
+            if (Role != P2PRole.Host || manager == null ||
+                manager.IsBattleEnd || manager.BattlePlayer == null ||
+                manager.BattleEnemy == null)
+            {
+                return;
+            }
+            if (IsBattleFinished(manager))
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Skipping Host next-turn transition because the " +
+                    "turn-end boundary is already final.");
+                return;
+            }
+
+            manager.ClearRegisterCardList();
+
+            bool hostExtraTurn = manager.BattlePlayer.IsExtraTurn;
+            bool guestExtraTurn = manager.BattleEnemy.IsExtraTurn;
+            Wizard.Battle.View.Vfx.VfxBase turnStartVfx = null;
+
+            if (hostExtraTurn)
+            {
+                // ControlTurnStartOpponent selects BattlePlayer when it has an
+                // extra turn, matching the native transition after a Host turn.
+                turnStartVfx = manager.ControlTurnStartOpponent();
+                if (turnStartVfx != null)
+                {
+                    manager.VfxMgr.RegisterSequentialVfx<
+                        Wizard.Battle.View.Vfx.VfxBase>(turnStartVfx);
+                }
+            }
+            else if (guestExtraTurn)
+            {
+                // The Guest is BattleEnemy on the Host.  Its extra turn is
+                // started by ControlTurnStartPlayer and must be replayed as a
+                // local authoritative TurnStart on the Guest.  Keep the
+                // capture context alive until the VFX has completed so draw,
+                // turn-start skills, and private-state changes are included in
+                // the result snapshot.
+                QueueGuestAuthorityTurnStart(
+                    manager,
+                    null,
+                    true,
+                    () => manager.ControlTurnStartPlayer());
+            }
+            else
+            {
+                // A normal Guest turn is selected by ControlTurnStartOpponent
+                // when neither side has an extra turn.  BattleEnemy does not
+                // emit TurnStart locally, so send an explicit replay packet.
+                QueueGuestAuthorityTurnStart(
+                    manager,
+                    null,
+                    false,
+                    () => manager.ControlTurnStartOpponent());
+            }
+        }
+
+        private static string BuildAuthorityTransitionRequestId(
+            NetworkBattleManagerBase manager)
+        {
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "{0}-host-turn-{1}-{2}",
+                BattleId ?? "battle",
+                manager?.CurrentTurn ?? 0,
+                ++authorityTransitionSequence);
+        }
+
+        private sealed class PendingGuestTurnStart
+        {
+            internal NetworkBattleManagerBase Manager;
+            internal string ResultRequestId;
+            internal string TransitionId;
+            internal bool ExtraTurn;
+            internal VfxBase TurnStartVfx;
+        }
+
+        private static void QueueGuestAuthorityTurnStart(
+            NetworkBattleManagerBase manager,
+            string resultRequestId,
+            bool extraTurn,
+            Func<VfxBase> createTurnStartVfx)
+        {
+            if (manager?.VfxMgr == null || manager.IsBattleEnd ||
+                createTurnStartVfx == null)
+            {
+                return;
+            }
+
+            string transitionId = BuildAuthorityTransitionRequestId(manager);
+            BeginAuthorityActionCapture(manager.BattleEnemy);
+            activeAuthorityExecutionRequestId = transitionId;
+            activeAuthorityExecutionStartedUtc = DateTime.UtcNow;
+            bool scheduled = false;
+            try
+            {
+                VfxBase turnStartVfx = createTurnStartVfx() ??
+                    NullVfx.GetInstance();
+                PendingGuestTurnStart pending = new PendingGuestTurnStart
+                {
+                    Manager = manager,
+                    ResultRequestId = resultRequestId,
+                    TransitionId = transitionId,
+                    ExtraTurn = extraTurn,
+                    TurnStartVfx = turnStartVfx
+                };
+                VfxBase completionVfx = InstantVfx.Create(() =>
+                    CompleteGuestAuthorityTurnStart(pending));
+                manager.VfxMgr.RegisterSequentialVfx<SequentialVfxPlayer>(
+                    SequentialVfxPlayer.Create(new VfxBase[]
+                    {
+                        turnStartVfx,
+                        completionVfx
+                    }));
+                scheduled = true;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogError(
+                    "[P2P] Could not schedule authoritative Guest TurnStart: " +
+                    ex);
+            }
+            finally
+            {
+                if (!scheduled)
+                {
+                    activeAuthorityExecutionRequestId = null;
+                    activeAuthorityExecutionStartedUtc = DateTime.MinValue;
+                    EndAuthorityActionCapture();
+                }
+            }
+        }
+
+        private static void CompleteGuestAuthorityTurnStart(
+            PendingGuestTurnStart pending)
+        {
+            if (pending == null)
+            {
+                return;
+            }
+
+            try
+            {
+                if (peerDisconnected)
+                {
+                    Plugin.Logger.LogDebug(
+                        "[P2P] Dropped authoritative Guest TurnStart after the " +
+                        "peer disconnected: " +
+                        (pending.TransitionId ?? "?") + ".");
+                    return;
+                }
+                Dictionary<string, object> turnStart =
+                    BuildAuthorityTurnStartData(
+                        pending.Manager,
+                        pending.ResultRequestId ?? pending.TransitionId,
+                        0,
+                        pending.ExtraTurn);
+                if (turnStart == null)
+                {
+                    throw new InvalidOperationException(
+                        "the native turn-start produced no replay data");
+                }
+                EnsureAuthorityRandomResultsAreValid(
+                    turnStart,
+                    pending.ResultRequestId ?? pending.TransitionId);
+                DeliverAuthorityResult(turnStart);
+                TrySendHostAuthoritativeFinishResult(
+                    pending.Manager,
+                    pending.ResultRequestId ?? pending.TransitionId);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogError(
+                    "[P2P] Host authority TurnStart completion failed for " +
+                    (pending.TransitionId ?? "?") + ": " + ex);
+                SendAuthorityReject(
+                    pending.ResultRequestId ?? pending.TransitionId,
+                    ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                try
+                {
+                    pending.Manager?.ClearRegisterCardList();
+                }
+                catch (Exception)
+                {
+                }
+                activeAuthorityExecutionRequestId = null;
+                activeAuthorityExecutionStartedUtc = DateTime.MinValue;
+                EndAuthorityActionCapture();
+            }
+        }
+
+        private static void StartAuthorityNextTurn(
+            NetworkBattleManagerBase manager,
+            string requestId)
+        {
+            if (Role != P2PRole.Host || manager == null ||
+                manager.IsBattleEnd || manager.BattlePlayer == null ||
+                manager.BattleEnemy == null)
+            {
+                return;
+            }
+            if (IsBattleFinished(manager))
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Skipping authoritative next-turn transition because " +
+                    "the turn-end boundary is already final.");
+                return;
+            }
+
+            manager.ClearRegisterCardList();
+
+            bool guestExtraTurn = manager.BattleEnemy.IsExtraTurn;
+            bool hostExtraTurn = manager.BattlePlayer.IsExtraTurn;
+            // Match BattleManagerBase.ControlTurnStart exactly: the player
+            // whose turn just ended is represented as the first argument, so
+            // its ExtraTurn flag has priority even if the other side also has
+            // a queued extra turn.  The previous && !hostExtraTurn test sent
+            // the transition to Host whenever both sides had ExtraTurn,
+            // leaving the Guest one turn behind.
+            bool guestNextTurn = guestExtraTurn;
+            Wizard.Battle.View.Vfx.VfxBase turnStartVfx = null;
+            if (guestNextTurn)
+            {
+                QueueGuestAuthorityTurnStart(
+                    manager,
+                    requestId,
+                    true,
+                    () => manager.ControlTurnStartPlayer());
+            }
+            else
+            {
+                turnStartVfx = hostExtraTurn
+                    ? manager.ControlTurnStartOpponent()
+                    : manager.ControlTurnStartPlayer();
+            }
+
+            if (turnStartVfx != null)
+            {
+                manager.VfxMgr.RegisterSequentialVfx<
+                    Wizard.Battle.View.Vfx.VfxBase>(turnStartVfx);
+            }
+        }
+
+        internal static void RouteAuthorityReceivedCard(
+            ReplaceReceivedCard receiver,
+            ref BattlePlayerBase battlePlayer)
+        {
+            if (!IsActive || Role != P2PRole.Guest || receiver == null)
+            {
+                return;
+            }
+
+            bool hasOwnerHint = AuthorityReceivedCardOwnerHints.TryGetValue(
+                receiver, out AuthorityReceivedCardOwnerHint ownerHint);
+            if (!IsAuthorityLocalReplayActive && !hasOwnerHint)
+            {
+                // Ordinary opponent packets retain the original client route
+                // (BattleEnemy). Only the scalar knownList entries promoted
+                // from an authoritative private snapshot may target the
+                // Guest's own hand/deck in that path.
+                return;
+            }
+
+            NetworkBattleManagerBase manager = null;
+            try
+            {
+                if (TryFindInstanceField(
+                        receiver.GetType(), "_networkBattleMgr",
+                        out FieldInfo managerField))
+                {
+                    manager = managerField.GetValue(receiver) as
+                        NetworkBattleManagerBase;
+                }
+                if (manager == null)
+                {
+                    manager = BattleManagerBase.GetIns() as
+                        NetworkBattleManagerBase;
+                }
+            }
+            catch (Exception)
+            {
+                // Keep the native argument when the reflection fallback is
+                // unavailable; an incorrect owner is worse than no reroute.
+            }
+
+            if (manager == null)
+            {
+                return;
+            }
+
+            if (hasOwnerHint)
+            {
+                BattlePlayerBase hintedPlayer = ownerHint.GuestOwnsCard
+                    ? manager.BattlePlayer
+                    : manager.BattleEnemy;
+                if (hintedPlayer != null)
+                {
+                    battlePlayer = hintedPlayer;
+                    return;
+                }
+            }
+
+            int cardIndex = ReadPrivateIntField(receiver, "CardIdx", -1);
+            int cardId = ReadPrivateIntField(receiver, "CardId", -1);
+            if (cardIndex <= 0 ||
+                !TryResolveAuthorityReceivedCardOwner(
+                    manager, cardIndex, cardId, out bool guestOwnsCard))
+            {
+                return;
+            }
+
+            BattlePlayerBase resolved = guestOwnsCard
+                ? manager.BattlePlayer
+                : manager.BattleEnemy;
+            if (resolved == null)
+            {
+                return;
+            }
+
+            if (!ReferenceEquals(battlePlayer, resolved))
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Authority replay routed received card: " +
+                    "idx=" + cardIndex + ", cardId=" + cardId + ", owner=" +
+                    (guestOwnsCard ? "Guest/BattlePlayer" : "Host/BattleEnemy") +
+                    ".");
+                battlePlayer = resolved;
+            }
+        }
+
+        internal static void RememberAuthorityReceivedCardOwner(
+            ReplaceReceivedCard receiver,
+            CardDataModel cardData)
+        {
+            if (!IsActive || Role != P2PRole.Guest || receiver == null ||
+                cardData == null ||
+                (!IsAuthorityLocalReplayActive &&
+                 !IsCurrentNativePromotedReceivedCard(cardData)))
+            {
+                return;
+            }
+
+            try
+            {
+                AuthorityReceivedCardOwnerHints.Remove(receiver);
+                AuthorityReceivedCardOwnerHints.Add(
+                    receiver,
+                    new AuthorityReceivedCardOwnerHint
+                    {
+                        GuestOwnsCard = !cardData.isOpponent
+                    });
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        private static bool IsCurrentNativePromotedReceivedCard(
+            CardDataModel cardData)
+        {
+            if (cardData == null || cardData.Index <= 0 ||
+                currentAuthorityReplayData == null ||
+                !currentAuthorityReplayData.TryGetValue(
+                    "knownList", out object rawKnownList) ||
+                rawKnownList is string ||
+                !(rawKnownList is IEnumerable entries))
+            {
+                return false;
+            }
+
+            bool expectedSelf = !cardData.isOpponent;
+            foreach (object rawEntry in entries)
+            {
+                if (!(rawEntry is Dictionary<string, object> entry) ||
+                    !ReadAuthorityBool(entry, "p2pNativeHiddenState") ||
+                    IsSelfKnownCard(entry) != expectedSelf ||
+                    !KnownCardContainsIndex(entry, cardData.Index))
+                {
+                    continue;
+                }
+
+                // Accelerate/crystallize temporarily rewrites CardDataModel's
+                // CardId to the original card before replacement. Index plus
+                // owner is therefore the stable native identity here.
+                return true;
+            }
+            return false;
+        }
+
+        private static bool TryResolveAuthorityReceivedCardOwner(
+            NetworkBattleManagerBase manager,
+            int cardIndex,
+            int cardId,
+            out bool guestOwnsCard)
+        {
+            guestOwnsCard = false;
+            int bestScore = int.MinValue;
+
+            if (currentAuthorityReplayData != null)
+            {
+                // knownList is the normal replacement source; uList carries
+                // private/unapproved entries such as hidden draw cards.  A
+                // scalar idx+cardId match outranks a grouped idxList match so
+                // an index collision between the two players is deterministic.
+                foreach (string listName in new[] { "knownList", "uList" })
+                {
+                    if (!currentAuthorityReplayData.TryGetValue(
+                            listName, out object rawList) ||
+                        rawList is string || !(rawList is IEnumerable entries))
+                    {
+                        continue;
+                    }
+
+                    foreach (object rawEntry in entries)
+                    {
+                        if (!(rawEntry is Dictionary<string, object> entry) ||
+                            !TryGetAuthorityEntryOwner(
+                                entry, cardIndex, cardId,
+                                out bool entryGuestOwnsCard,
+                                out int score))
+                        {
+                            continue;
+                        }
+
+                        // Prefer knownList over uList only when all other
+                        // fields are equal.  The list order is otherwise part
+                        // of the native packet semantics and should not cause
+                        // a random owner choice.
+                        if (string.Equals(listName, "knownList",
+                                StringComparison.Ordinal))
+                        {
+                            score += 1;
+                        }
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            guestOwnsCard = entryGuestOwnsCard;
+                        }
+                    }
+                }
+            }
+
+            if (bestScore != int.MinValue)
+            {
+                return true;
+            }
+
+            // The native conversion has already produced CardDataModel
+            // entries by the time ReplaceReceivedCard runs.  Use that as a
+            // fallback for packets whose raw list was compacted or omitted by
+            // a compatibility path.
+            try
+            {
+                NetworkBattleReceiver.ReceiveData receiveData =
+                    manager.networkBattleData?.GetReceiveData();
+                if (receiveData == null)
+                {
+                    return false;
+                }
+
+                IEnumerable<CardDataModel> candidates =
+                    (receiveData.knownCardList ?? new List<CardDataModel>())
+                        .Concat(receiveData.unapprovedList ??
+                            new List<CardDataModel>());
+                CardDataModel exact = candidates.FirstOrDefault(card =>
+                    card != null && card.Index == cardIndex &&
+                    cardId > 0 && card.CardId == cardId);
+                CardDataModel fallback = exact ?? candidates.FirstOrDefault(card =>
+                    card != null && card.Index == cardIndex);
+                if (fallback == null)
+                {
+                    return false;
+                }
+
+                guestOwnsCard = !fallback.isOpponent;
+                return true;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        private static bool TryGetAuthorityEntryOwner(
+            Dictionary<string, object> entry,
+            int cardIndex,
+            int cardId,
+            out bool guestOwnsCard,
+            out int score)
+        {
+            guestOwnsCard = false;
+            score = int.MinValue;
+            if (entry == null ||
+                !entry.TryGetValue("isSelf", out object rawSelf) ||
+                !TryConvertAuthorityInt(rawSelf, out int isSelf) ||
+                (isSelf != 0 && isSelf != 1))
+            {
+                return false;
+            }
+
+            bool containsIndex = false;
+            bool scalarIndex = false;
+            if (entry.TryGetValue("idx", out object rawIndex) &&
+                TryConvertAuthorityInt(rawIndex, out int scalar) &&
+                scalar == cardIndex)
+            {
+                containsIndex = true;
+                scalarIndex = true;
+            }
+            if (!containsIndex && entry.TryGetValue(
+                    "idxList", out object rawIndices) &&
+                rawIndices is IEnumerable indices && !(rawIndices is string))
+            {
+                foreach (object rawGroupedIndex in indices)
+                {
+                    if (TryConvertAuthorityInt(rawGroupedIndex,
+                            out int groupedIndex) && groupedIndex == cardIndex)
+                    {
+                        containsIndex = true;
+                        break;
+                    }
+                }
+            }
+            if (!containsIndex)
+            {
+                return false;
+            }
+
+            score = scalarIndex ? 2 : 1;
+            if (entry.TryGetValue("cardId", out object rawCardId) &&
+                TryConvertAuthorityInt(rawCardId, out int entryCardId) &&
+                entryCardId > 0 && cardId > 0)
+            {
+                if (entryCardId == cardId)
+                {
+                    score += 8;
+                }
+                else
+                {
+                    // A known card with a different identity is still a
+                    // possible grouped entry, but it must not beat an exact
+                    // identity match from the other owner.
+                    score -= 4;
+                }
+            }
+
+            guestOwnsCard = isSelf == 1;
+            return true;
+        }
+
+        private static void TryCheckAuthorityRequestTimeout()
+        {
+            if (Role != P2PRole.Guest || !guestAuthorityBusy ||
+                guestAuthorityRequestSentUtc == DateTime.MinValue ||
+                DateTime.UtcNow - guestAuthorityRequestSentUtc <
+                    TimeSpan.FromSeconds(BattleStateCheckTimeoutSeconds * 2))
+            {
+                return;
+            }
+
+            string requestId = guestAuthorityRequestId ?? "?";
+            if (!string.IsNullOrEmpty(guestAuthorityRequestId))
+            {
+                completedAuthorityRequestIds.Add(guestAuthorityRequestId);
+                TrimAuthorityResultHistory();
+            }
+            guestAuthorityBusy = false;
+            guestAuthorityRequestId = null;
+            guestAuthorityRequestAction = null;
+            guestAuthorityRequestSentUtc = DateTime.MinValue;
+            receivedAuthorityRequestId = null;
+            localAuthorityChoiceCardIndexes.Clear();
+            LastError = "The Host did not finish the authoritative action in time.";
+            Plugin.Logger.LogError(
+                "[P2P] Authority request timed out: requestId=" + requestId +
+                "; terminating the P2P battle to avoid executing a later action " +
+                "against an unknown Host state.");
+
+            // The Host may still be inside the native VFX graph. Unlocking the
+            // Guest here would allow a second request to race that graph and
+            // permanently diverge the two simulations. Close the session and
+            // resolve the disconnect locally instead; the Host receives the
+            // close frame and follows the same disconnect-result path.
+            try
+            {
+                SendWire(new P2PWireMessage
+                {
+                    Type = "close",
+                    BattleId = BattleId,
+                    Error = LastError
+                });
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not send the authority-timeout close frame: " +
+                    ex.Message);
+            }
+            transport?.Stop(false);
+            HandlePeerDisconnected(LastError);
+        }
+
+        private static void TryCheckAuthorityExecutionTimeout()
+        {
+            if (Role != P2PRole.Host || peerDisconnected ||
+                string.IsNullOrEmpty(activeAuthorityExecutionRequestId) ||
+                activeAuthorityExecutionStartedUtc == DateTime.MinValue ||
+                DateTime.UtcNow - activeAuthorityExecutionStartedUtc <
+                    TimeSpan.FromSeconds(AuthorityExecutionTimeoutSeconds))
+            {
+                return;
+            }
+
+            string requestId = activeAuthorityExecutionRequestId;
+            string error =
+                "The Host did not finish the authoritative operation in time " +
+                "(requestId=" + requestId + ").";
+            Plugin.Logger.LogError(
+                "[P2P] AUTHORITY EXECUTION STALL: " + error +
+                " Closing the battle rather than accepting a later input " +
+                "against a partially executed Host state.");
+
+            // Do not clear activeAuthorityExecutionRequestId here. Native VFX
+            // callbacks can still emit after this point; keeping the authority
+            // marker set suppresses those late packets until the completion
+            // callback restores the original receive context. The disconnect
+            // path resolves the local result immediately instead.
+            try
+            {
+                SendWire(new P2PWireMessage
+                {
+                    Type = "close",
+                    BattleId = BattleId,
+                    Error = error
+                });
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not send the Host authority-stall close frame: " +
+                    ex.Message);
+            }
+            transport?.Stop(false);
+            HandlePeerDisconnected(error);
         }
 
         private static void DiscardReceivedPlayerHistoryState(
@@ -3367,6 +9326,7 @@ namespace Shadowbus
                 activeAuthoritativeSkillTargetBatch == null ||
                 !activeAuthoritativeSkillTargetBatch.ReadyForCleanup ||
                 processingReceivedBattleAction ||
+                receivedBattleActionInjectionPending ||
                 receivedBattleActionPendingUntilVfx ||
                 !(BattleManagerBase.GetIns() is NetworkBattleManagerBase manager) ||
                 manager.VfxMgr == null || !manager.VfxMgr.IsEnd)
@@ -3378,14 +9338,17 @@ namespace Shadowbus
             {
                 Plugin.Logger.LogWarning(
                     "[P2P] Discarded authoritative random target results for a " +
-                    "native action that was rejected by the receiver.");
+                    "native action that was rejected by the receiver: actionId=" +
+                    activeAuthoritativeSkillTargetBatch.ActionId + ", uri=" +
+                    activeAuthoritativeSkillTargetBatch.Uri + ".");
             }
             else if (activeAuthoritativeSkillTargetBatch.Entries.Count > 0)
             {
                 Plugin.Logger.LogWarning(
-                    $"[P2P] {activeAuthoritativeSkillTargetBatch.Entries.Count} authoritative " +
-                    "random target result(s) were not consumed by the matching " +
-                    "native action; discarded them at the completed action boundary.");
+                    $"[P2P] Unconsumed authoritative random targets: actionId=" +
+                    $"{activeAuthoritativeSkillTargetBatch.ActionId}, uri=" +
+                    $"{activeAuthoritativeSkillTargetBatch.Uri}, count=" +
+                    activeAuthoritativeSkillTargetBatch.Entries.Count + ".");
             }
             activeAuthoritativeSkillTargetBatch = null;
             receivedAuthoritativeActionActive = false;
@@ -3398,6 +9361,7 @@ namespace Shadowbus
                 activeAuthoritativeSkillEvaluationBatch == null ||
                 !activeAuthoritativeSkillEvaluationBatch.ReadyForCleanup ||
                 processingReceivedBattleAction ||
+                receivedBattleActionInjectionPending ||
                 receivedBattleActionPendingUntilVfx ||
                 !(BattleManagerBase.GetIns() is NetworkBattleManagerBase manager) ||
                 manager.VfxMgr == null || !manager.VfxMgr.IsEnd)
@@ -3409,15 +9373,17 @@ namespace Shadowbus
             {
                 Plugin.Logger.LogWarning(
                     "[P2P] Discarded authoritative private skill evaluations for " +
-                    "a native action that was rejected by the receiver.");
+                    "a native action that was rejected by the receiver: actionId=" +
+                    activeAuthoritativeSkillEvaluationBatch.ActionId + ", uri=" +
+                    activeAuthoritativeSkillEvaluationBatch.Uri + ".");
             }
             else if (activeAuthoritativeSkillEvaluationBatch.Entries.Count > 0)
             {
                 Plugin.Logger.LogWarning(
-                    $"[P2P] {activeAuthoritativeSkillEvaluationBatch.Entries.Count} " +
-                    "authoritative private skill evaluation(s) were not consumed " +
-                    "by the matching native action; discarded them at the " +
-                    "completed action boundary.");
+                    $"[P2P] Unconsumed authoritative private skill evaluations: " +
+                    $"actionId={activeAuthoritativeSkillEvaluationBatch.ActionId}, " +
+                    $"uri={activeAuthoritativeSkillEvaluationBatch.Uri}, count=" +
+                    activeAuthoritativeSkillEvaluationBatch.Entries.Count + ".");
             }
             activeAuthoritativeSkillEvaluationBatch = null;
             receivedAuthoritativeSkillEvaluationActive = false;
@@ -3748,6 +9714,7 @@ namespace Shadowbus
 
             List<Dictionary<string, object>> cards = new List<Dictionary<string, object>>();
             HashSet<int> initializedDeckIndices = new HashSet<int>();
+            HashSet<int> capturedIndices = new HashSet<int>();
             try
             {
                 if (manager.BattlePlayer.AllCards != null)
@@ -3758,16 +9725,18 @@ namespace Shadowbus
                         {
                             initializedDeckIndices.Add(card.Index);
                         }
+
+                        // AllCards is the stable deck identity table.  During
+                        // the opening deal/mulligan animation some cards may
+                        // temporarily be in a staging list instead of
+                        // HandCardList/DeckCardList; scanning only those two
+                        // zones can permanently publish an incomplete baseline.
+                        if (card != null && card.Index > 0 && card.CardId > 0 &&
+                            capturedIndices.Add(card.Index))
+                        {
+                            cards.Add(CreateHiddenCardState(card));
+                        }
                     }
-                }
-                foreach (BattleCardBase card in EnumeratePrivateCards(
-                    manager.BattlePlayer))
-                {
-                    if (card == null || card.Index <= 0 || card.CardId <= 0)
-                    {
-                        continue;
-                    }
-                    cards.Add(CreateHiddenCardState(card));
                 }
             }
             catch (Exception ex)
@@ -3793,6 +9762,13 @@ namespace Shadowbus
                 ["owner"] = Role == P2PRole.Host ? 1 : 0,
                 ["cards"] = cards.Select(card => (object)card).ToList()
             };
+            if (Role == P2PRole.Host)
+            {
+                // The Host's own baseline does not traverse the wire before it
+                // is needed for the first server response. Record it in the
+                // same authoritative cache used for the Guest baseline.
+                P2PAuthoritativeServer.RememberPrivateStateSnapshot(payload);
+            }
             if (!SendWire(new P2PWireMessage
             {
                 Type = "private_state",
@@ -3814,6 +9790,19 @@ namespace Shadowbus
                 LocalHiddenCardStates[index] = P2PJson.CloneDictionary(card);
                 LocalHiddenCardStateSignatures[index] =
                     JsonConvert.SerializeObject(card, P2PJson.Settings);
+                int owner = Role == P2PRole.Host ? 1 : 0;
+                if (!authorityKnownPrivateIndicesByOwner.TryGetValue(
+                        owner, out HashSet<int> knownIndices))
+                {
+                    knownIndices = new HashSet<int>();
+                    authorityKnownPrivateIndicesByOwner[owner] = knownIndices;
+                }
+                knownIndices.Add(index);
+                authorityPrivateStateSignatures[HiddenStateKey(
+                        owner == 1, index)] =
+                    JsonConvert.SerializeObject(card, P2PJson.Settings);
+                authorityPrivateStates[HiddenStateKey(owner == 1, index)] =
+                    P2PJson.CloneDictionary(card);
             }
             Plugin.Logger.LogInfo(
                 $"[P2P] Sent initial private state ({cards.Count} cards, " +
@@ -3844,6 +9833,20 @@ namespace Shadowbus
                         continue;
                     }
                     StoreReceivedHiddenCardState(ownerIsHost, card);
+                    NativeBaselineHiddenCardStateKeys.Add(
+                        HiddenStateKey(ownerIsHost, index));
+                    if (!authorityKnownPrivateIndicesByOwner.TryGetValue(
+                            owner, out HashSet<int> knownIndices))
+                    {
+                        knownIndices = new HashSet<int>();
+                        authorityKnownPrivateIndicesByOwner[owner] = knownIndices;
+                    }
+                    knownIndices.Add(index);
+                    authorityPrivateStateSignatures[HiddenStateKey(
+                            ownerIsHost, index)] =
+                        JsonConvert.SerializeObject(card, P2PJson.Settings);
+                    authorityPrivateStates[HiddenStateKey(ownerIsHost, index)] =
+                        P2PJson.CloneDictionary(card);
                 }
             }
 
@@ -3853,12 +9856,249 @@ namespace Shadowbus
                 $"incremental snapshots active={IsPrivateStateSyncActive}.");
         }
 
+        // The official server places the identity of cards that will be moved
+        // by an operation in knownList. NetworkBattleData consumes that list
+        // before OperateReceive.StartOperate; this lets ReplaceReceivedCard
+        // replace a dummy while it is still in DeckCardList, rather than after
+        // its hand view has retained the dummy object. Authority snapshots are
+        // absolute-owner data, so convert them to the current receiver's
+        // native relative isSelf representation at this boundary only.
+        private static void PromoteReceivedHiddenCardStatesIntoNativeKnownList(
+            Dictionary<string, object> data)
+        {
+            if (!IsActive || data == null)
+            {
+                return;
+            }
+
+            List<object> knownList = GetOrCreateKnownList(data);
+            HashSet<string> promoted = new HashSet<string>(
+                StringComparer.Ordinal);
+            int promotedCount = 0;
+
+            Action<int, IEnumerable> promoteCards = (owner, cards) =>
+            {
+                if ((owner != 0 && owner != 1) || cards == null)
+                {
+                    return;
+                }
+
+                foreach (object rawCard in cards)
+                {
+                    if (!(rawCard is Dictionary<string, object> card) ||
+                        !TryGetStateInt(card, "idx", out int index) ||
+                        index <= 0 ||
+                        !TryGetStateInt(card, "cardId", out int cardId) ||
+                        cardId <= 0)
+                    {
+                        continue;
+                    }
+
+                    // A delta is merged against the receiver's last complete
+                    // state before it reaches the native knownList boundary.
+                    // This keeps the original CardDataModel construction
+                    // unchanged while allowing the wire payload to omit
+                    // untouched P2P-only fields.
+                    Dictionary<string, object> effectiveCard =
+                        MergeIncomingHiddenCardState(owner == 1, index, card);
+                    if (!TryGetStateInt(effectiveCard, "cardId",
+                            out int effectiveCardId) || effectiveCardId <= 0)
+                    {
+                        continue;
+                    }
+
+                    string key = HiddenStateKey(owner == 1, index);
+                    if (!promoted.Add(key))
+                    {
+                        continue;
+                    }
+
+                    if (PromoteReceivedHiddenCardStateToNativeKnownList(
+                            knownList, owner, effectiveCard))
+                    {
+                        NativePromotedReceivedHiddenCardStateSignatures[key] =
+                            JsonConvert.SerializeObject(effectiveCard,
+                                P2PJson.Settings);
+                        promotedCount++;
+                    }
+                }
+            };
+
+            bool hasAuthoritySnapshots = false;
+            if (data.TryGetValue(P2PBattleProtocol.AuthorityHiddenStatesKey,
+                    out object rawSnapshots) && rawSnapshots is IEnumerable snapshots &&
+                !(rawSnapshots is string))
+            {
+                hasAuthoritySnapshots = true;
+                foreach (object rawSnapshot in snapshots)
+                {
+                    if (!(rawSnapshot is Dictionary<string, object> snapshot) ||
+                        !TryGetStateInt(snapshot, "owner", out int owner) ||
+                        !snapshot.TryGetValue("cards", out object rawCards) ||
+                        rawCards is string || !(rawCards is IEnumerable cards))
+                    {
+                        continue;
+                    }
+
+                    promoteCards(owner, cards);
+                }
+            }
+
+            // Current peers include this legacy field together with the
+            // two-owner extension. Do not process it twice, but keep support
+            // for a peer that only knows the original single-owner form.
+            if (!hasAuthoritySnapshots &&
+                data.TryGetValue("p2pHiddenOwner", out object rawOwner) &&
+                TryConvertAuthorityInt(rawOwner, out int legacyOwner) &&
+                data.TryGetValue("p2pHiddenCards", out object rawLegacyCards) &&
+                rawLegacyCards is IEnumerable legacyCards &&
+                !(rawLegacyCards is string))
+            {
+                promoteCards(legacyOwner, legacyCards);
+            }
+
+            if (promotedCount > 0)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Promoted " + promotedCount +
+                    " authoritative hidden card identity/state entry(s) into " +
+                    "native knownList before receive operation construction.");
+            }
+        }
+
+        private static bool PromoteReceivedHiddenCardStateToNativeKnownList(
+            List<object> knownList,
+            int absoluteOwner,
+            Dictionary<string, object> state)
+        {
+            if (knownList == null || state == null ||
+                !TryGetStateInt(state, "idx", out int index) || index <= 0 ||
+                !TryGetStateInt(state, "cardId", out int cardId) || cardId <= 0)
+            {
+                return false;
+            }
+
+            // Convert absolute ownership (Host=1, Guest=0) to the current
+            // receiver's native isSelf convention. This is the same
+            // perspective conversion used by NetworkBattleReceiver for the
+            // original server response.
+            int localOwner = Role == P2PRole.Host ? 1 : 0;
+            bool isSelf = absoluteOwner == localOwner;
+            Dictionary<string, object> canonical = null;
+            List<Dictionary<string, object>> matches = knownList
+                .OfType<Dictionary<string, object>>()
+                .Where(entry => IsSelfKnownCard(entry) == isSelf &&
+                    KnownCardContainsIndex(entry, index))
+                .ToList();
+
+            foreach (Dictionary<string, object> entry in matches)
+            {
+                if (TryGetStateInt(entry, "idx", out int scalarIndex) &&
+                    scalarIndex == index)
+                {
+                    if (canonical == null)
+                    {
+                        canonical = entry;
+                    }
+                    else
+                    {
+                        knownList.Remove(entry);
+                    }
+                    continue;
+                }
+
+                if (!entry.TryGetValue("idxList", out object rawIndexes) ||
+                    rawIndexes is string || !(rawIndexes is IEnumerable indexes))
+                {
+                    continue;
+                }
+
+                List<object> remaining = new List<object>();
+                foreach (object rawIndex in indexes)
+                {
+                    if (!TryConvertAuthorityInt(rawIndex, out int groupedIndex) ||
+                        groupedIndex != index)
+                    {
+                        remaining.Add(rawIndex);
+                    }
+                }
+                if (remaining.Count == 0)
+                {
+                    knownList.Remove(entry);
+                }
+                else
+                {
+                    entry["idxList"] = remaining;
+                }
+            }
+
+            if (canonical == null)
+            {
+                // A post-action snapshot may describe a modifier on an
+                // existing private card. It is not permission to create a new
+                // native identity entry after the action has started. Every
+                // movement/creation identity must already be present in the
+                // original knownList/orderList/uList data produced by Host.
+                return false;
+            }
+
+            // A scalar entry is required: ReplaceReceivedCard searches a
+            // single index. Leaving idxList on the canonical object would
+            // recreate the duplicate-index SingleOrDefault failure.
+            canonical.Remove("idxList");
+            canonical["idx"] = index;
+            canonical["cardId"] = cardId;
+            canonical["isSelf"] = isSelf ? 1 : 0;
+            canonical["is_open"] = 1;
+            canonical["p2pNativeHiddenState"] = 1;
+
+            // Copy only fields understood by CardDataModel. Everything else is
+            // intentionally kept in the deferred P2P snapshot so the native
+            // action cannot observe its post-action generic state early.
+            foreach (string field in NativeKnownCardStateFields)
+            {
+                if (state.TryGetValue(field, out object value))
+                {
+                    canonical[field] = P2PJson.CloneValue(value);
+                }
+                else
+                {
+                    canonical.Remove(field);
+                }
+            }
+            return true;
+        }
+
+        private static readonly string[] NativeKnownCardStateFields =
+        {
+            "cost",
+            "spellboost",
+            "setAtk",
+            "setLife",
+            "setChantCount",
+            "unionburst",
+            "skyboundArt",
+            "clan",
+            "tribe",
+            "attachTarget",
+            "fusion"
+        };
+
         private static void RememberReceivedHiddenCardStates(
             Dictionary<string, object> data,
             bool deferForCurrentAction)
         {
-            if (data == null ||
-                !data.TryGetValue("p2pHiddenOwner", out object rawOwner))
+            if (data == null)
+            {
+                return;
+            }
+
+            // Authority results can contain changed private cards for both
+            // absolute owners.  Process this extension first; the legacy
+            // single-owner fields below are still accepted for older messages.
+            RememberReceivedAuthorityHiddenStates(data, deferForCurrentAction);
+
+            if (!data.TryGetValue("p2pHiddenOwner", out object rawOwner))
             {
                 return;
             }
@@ -3909,6 +10149,62 @@ namespace Shadowbus
             }
         }
 
+        private static void RememberReceivedAuthorityHiddenStates(
+            Dictionary<string, object> data,
+            bool deferForCurrentAction)
+        {
+            if (!data.TryGetValue(
+                    P2PBattleProtocol.AuthorityHiddenStatesKey,
+                    out object rawSnapshots) ||
+                rawSnapshots is string || !(rawSnapshots is IEnumerable snapshots))
+            {
+                return;
+            }
+
+            foreach (object rawSnapshot in snapshots)
+            {
+                if (!(rawSnapshot is Dictionary<string, object> snapshot) ||
+                    !TryGetStateInt(snapshot, "owner", out int owner) ||
+                    (owner != 0 && owner != 1))
+                {
+                    continue;
+                }
+
+                HashSet<int> removed = new HashSet<int>();
+                if (snapshot.TryGetValue("removed", out object rawRemoved) &&
+                    rawRemoved is IEnumerable removedValues &&
+                    !(rawRemoved is string))
+                {
+                    foreach (object rawIndex in removedValues)
+                    {
+                        if (TryConvertAuthorityInt(rawIndex, out int index) &&
+                            index > 0)
+                        {
+                            removed.Add(index);
+                        }
+                    }
+                }
+
+                if (snapshot.TryGetValue("cards", out object rawCards) &&
+                    rawCards is IEnumerable cards && !(rawCards is string))
+                {
+                    foreach (object rawCard in cards)
+                    {
+                        if (!(rawCard is Dictionary<string, object> card) ||
+                            !TryGetStateInt(card, "idx", out int index) ||
+                            index <= 0)
+                        {
+                            continue;
+                        }
+                        StoreReceivedHiddenCardState(
+                            owner == 1,
+                            card,
+                            deferForCurrentAction && !removed.Contains(index));
+                    }
+                }
+            }
+        }
+
         private static bool ContainsReceivedHiddenRemoval(
             Dictionary<string, object> data,
             int index)
@@ -3944,24 +10240,210 @@ namespace Shadowbus
                 return;
             }
             string key = HiddenStateKey(ownerIsHost, index);
-            Dictionary<string, object> clone = P2PJson.CloneDictionary(card);
+            Dictionary<string, object> clone = MergeIncomingHiddenCardState(
+                ownerIsHost, index, card);
             if (deferForCurrentAction)
             {
+                // This is action-scoped post-state, not the initial baseline.
+                // It must never become eligible for a later compatibility
+                // replacement of the native card object.
+                NativeBaselineHiddenCardStateKeys.Remove(key);
                 PendingReceivedHiddenCardStates[key] = clone;
+                PostActionHiddenCardStateKeys.Add(key);
                 return;
             }
 
             PendingReceivedHiddenCardStates.Remove(key);
+            PostActionHiddenCardStateKeys.Remove(key);
             ReceivedHiddenCardStates[key] = clone;
             ReceivedHiddenCardStateSignatures[key] =
                 JsonConvert.SerializeObject(clone, P2PJson.Settings);
         }
 
+        private static bool IsHiddenCardStateDelta(
+            Dictionary<string, object> state)
+        {
+            return state != null &&
+                TryGetStateInt(state, HiddenCardStateDeltaKey,
+                    out int delta) && delta != 0;
+        }
+
+        private static Dictionary<string, object> MergeIncomingHiddenCardState(
+            bool ownerIsHost,
+            int index,
+            Dictionary<string, object> source)
+        {
+            if (source == null)
+            {
+                return new Dictionary<string, object>();
+            }
+
+            Dictionary<string, object> previous = null;
+            string key = HiddenStateKey(ownerIsHost, index);
+            if (IsHiddenCardStateDelta(source))
+            {
+                if (!PendingReceivedHiddenCardStates.TryGetValue(key,
+                        out previous))
+                {
+                    ReceivedHiddenCardStates.TryGetValue(key, out previous);
+                }
+                if (previous == null)
+                {
+                    Plugin.Logger.LogWarning(
+                        $"[P2P] Received a hidden-card delta without a " +
+                        $"baseline: owner={SideName(ownerIsHost)}, idx={index}.");
+                }
+            }
+
+            Dictionary<string, object> merged = previous == null
+                ? new Dictionary<string, object>()
+                : P2PJson.CloneDictionary(previous);
+            foreach (KeyValuePair<string, object> pair in source)
+            {
+                if (string.Equals(pair.Key, HiddenCardStateDeltaKey,
+                        StringComparison.Ordinal) ||
+                    string.Equals(pair.Key, HiddenCardStateRemovedFieldsKey,
+                        StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                merged[pair.Key] = P2PJson.CloneValue(pair.Value);
+            }
+
+            if (source.TryGetValue(HiddenCardStateRemovedFieldsKey,
+                    out object rawRemoved) && rawRemoved is IEnumerable removed &&
+                !(rawRemoved is string))
+            {
+                foreach (object rawField in removed)
+                {
+                    string field = rawField?.ToString();
+                    if (string.IsNullOrEmpty(field) ||
+                        string.Equals(field, "idx", StringComparison.Ordinal) ||
+                        string.Equals(field, "cardId", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+                    merged.Remove(field);
+                }
+            }
+
+            merged["idx"] = index;
+            if (!merged.ContainsKey("cardId") &&
+                source.TryGetValue("cardId", out object rawCardId))
+            {
+                merged["cardId"] = P2PJson.CloneValue(rawCardId);
+            }
+            return merged;
+        }
+
+        private static Dictionary<string, object> CreateHiddenCardDelta(
+            Dictionary<string, object> previous,
+            Dictionary<string, object> current)
+        {
+            if (current == null)
+            {
+                return null;
+            }
+            if (previous == null)
+            {
+                return P2PJson.CloneDictionary(current);
+            }
+
+            Dictionary<string, object> delta = new Dictionary<string, object>
+            {
+                ["idx"] = current.TryGetValue("idx", out object rawIndex)
+                    ? P2PJson.CloneValue(rawIndex)
+                    : 0,
+                ["cardId"] = current.TryGetValue("cardId", out object rawCardId)
+                    ? P2PJson.CloneValue(rawCardId)
+                    : 0,
+                [HiddenCardStateDeltaKey] = 1
+            };
+            bool changed = false;
+            foreach (KeyValuePair<string, object> pair in current)
+            {
+                if (string.Equals(pair.Key, "idx", StringComparison.Ordinal) ||
+                    string.Equals(pair.Key, HiddenCardStateDeltaKey,
+                        StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                if (!previous.TryGetValue(pair.Key, out object oldValue) ||
+                    !StateValuesEqual(oldValue, pair.Value))
+                {
+                    delta[pair.Key] = P2PJson.CloneValue(pair.Value);
+                    changed = true;
+                }
+            }
+
+            List<object> removed = previous.Keys
+                .Where(key => !current.ContainsKey(key) &&
+                    !string.Equals(key, "idx", StringComparison.Ordinal))
+                .OrderBy(key => key, StringComparer.Ordinal)
+                .Select(key => (object)key)
+                .ToList();
+            if (removed.Count > 0)
+            {
+                delta[HiddenCardStateRemovedFieldsKey] = removed;
+            }
+
+            // cardId is mandatory for the native identity boundary even when
+            // every P2P-only field stayed unchanged.
+            return changed || removed.Count > 0 ? delta : null;
+        }
+
+        private static bool StateValuesEqual(object left, object right)
+        {
+            if (ReferenceEquals(left, right))
+            {
+                return true;
+            }
+            if (left == null || right == null)
+            {
+                return false;
+            }
+            try
+            {
+                return string.Equals(
+                    JsonConvert.SerializeObject(left, P2PJson.Settings),
+                    JsonConvert.SerializeObject(right, P2PJson.Settings),
+                    StringComparison.Ordinal);
+            }
+            catch (Exception)
+            {
+                return Equals(left, right);
+            }
+        }
+
         internal static void FinalizeReceivedHiddenCardRemovals(
             Dictionary<string, object> data)
         {
-            if (!IsActive || data == null ||
-                !data.TryGetValue("p2pHiddenOwner", out object rawOwner) ||
+            if (!IsActive || data == null)
+            {
+                return;
+            }
+
+            if (data.TryGetValue(
+                    P2PBattleProtocol.AuthorityHiddenStatesKey,
+                    out object rawSnapshots) &&
+                rawSnapshots is IEnumerable snapshots && !(rawSnapshots is string))
+            {
+                foreach (object rawSnapshot in snapshots)
+                {
+                    if (!(rawSnapshot is Dictionary<string, object> snapshot) ||
+                        !TryGetStateInt(snapshot, "owner", out int snapshotOwner) ||
+                        (snapshotOwner != 0 && snapshotOwner != 1) ||
+                        !snapshot.TryGetValue("removed", out object rawSnapshotRemoved) ||
+                        rawSnapshotRemoved is string ||
+                        !(rawSnapshotRemoved is IEnumerable snapshotRemoved))
+                    {
+                        continue;
+                    }
+                    RemoveReceivedHiddenStates(snapshotOwner == 1, snapshotRemoved);
+                }
+            }
+
+            if (!data.TryGetValue("p2pHiddenOwner", out object rawOwner) ||
                 !data.TryGetValue("p2pHiddenRemoved", out object rawRemoved) ||
                 rawRemoved is string || !(rawRemoved is IEnumerable removed))
             {
@@ -3982,16 +10464,21 @@ namespace Shadowbus
                 return;
             }
 
-            bool ownerIsHost = owner == 1;
+            RemoveReceivedHiddenStates(owner == 1, removed);
+        }
+
+        private static void RemoveReceivedHiddenStates(
+            bool ownerIsHost,
+            IEnumerable removed)
+        {
+            if (removed == null)
+            {
+                return;
+            }
+
             foreach (object rawIndex in removed)
             {
-                int index;
-                try
-                {
-                    index = Convert.ToInt32(rawIndex,
-                        CultureInfo.InvariantCulture);
-                }
-                catch (Exception)
+                if (!TryConvertAuthorityInt(rawIndex, out int index))
                 {
                     continue;
                 }
@@ -4004,6 +10491,10 @@ namespace Shadowbus
                 ReceivedHiddenCardStates.Remove(key);
                 ReceivedHiddenCardStateSignatures.Remove(key);
                 AppliedReceivedHiddenCardStates.Remove(key);
+                NativePromotedReceivedHiddenCardStateSignatures.Remove(key);
+                NativeReplacedReceivedHiddenCardStateSignatures.Remove(key);
+                PostActionHiddenCardStateKeys.Remove(key);
+                ReportedMissingNativePrivateIdentities.Remove(key);
             }
         }
 
@@ -4017,9 +10508,38 @@ namespace Shadowbus
             Dictionary<string, object> data,
             bool readyToApply)
         {
-            if (data == null ||
-                !data.TryGetValue(PlayerHistoryStateKey, out object rawState) ||
-                !(rawState is Dictionary<string, object> state) ||
+            if (data == null)
+            {
+                return;
+            }
+
+            if (data.TryGetValue(
+                    P2PBattleProtocol.AuthorityPlayerHistoryStatesKey,
+                    out object rawSnapshots) &&
+                rawSnapshots is IEnumerable snapshots && !(rawSnapshots is string))
+            {
+                foreach (object rawSnapshot in snapshots)
+                {
+                    if (rawSnapshot is Dictionary<string, object> snapshot)
+                    {
+                        RememberReceivedPlayerHistorySnapshot(
+                            snapshot, readyToApply);
+                    }
+                }
+            }
+
+            if (data.TryGetValue(PlayerHistoryStateKey, out object rawState) &&
+                rawState is Dictionary<string, object> state)
+            {
+                RememberReceivedPlayerHistorySnapshot(state, readyToApply);
+            }
+        }
+
+        private static void RememberReceivedPlayerHistorySnapshot(
+            Dictionary<string, object> state,
+            bool readyToApply)
+        {
+            if (state == null ||
                 !TryGetStateInt(state, "owner", out int owner) ||
                 (owner != 0 && owner != 1) ||
                 !TryGetStateInt(state, "revision", out int revision) ||
@@ -4089,7 +10609,6 @@ namespace Shadowbus
                 List<PendingPlayerHistoryState> candidates =
                     ReceivedPlayerHistoryStates.Values
                         .Where(state => state.ReadyToApply &&
-                            state.Owner != localOwner &&
                             state.NextAttemptUtc <= now)
                         .GroupBy(state => state.Owner)
                         .Select(group => group.OrderByDescending(
@@ -4131,8 +10650,8 @@ namespace Shadowbus
                     RemovePlayerHistoryStatesThrough(
                         pending.Owner, pending.Revision);
                     Plugin.Logger.LogDebug(
-                        $"[P2P] Applied remote player history revision " +
-                        $"{pending.Revision}.");
+                        $"[P2P] Applied player history revision " +
+                        $"{pending.Revision} for owner={pending.Owner}.");
                 }
             }
             catch (Exception ex)
@@ -4564,6 +11083,35 @@ namespace Shadowbus
                     ? rawIndex?.ToString() ?? "?"
                     : "?";
             return $"entry {position} owner={owner} idx={index}";
+        }
+
+        internal static void ApplyReceivedHiddenCardStateAfterNativeReplacement(
+            BattleCardBase card)
+        {
+            if (!IsActive || card == null || card.Index <= 0)
+            {
+                return;
+            }
+
+            // The current packet's snapshot describes the state after its
+            // operation. It was intentionally promoted only for the stock
+            // CardDataModel replacement pass. Applying its generic values now
+            // would let a condition in that very operation inspect the future
+            // state. TryApplyPendingHiddenCardStates applies it after VFX.
+            bool localOwnerIsHost = Role == P2PRole.Host;
+            bool ownerIsHost = card.IsPlayer
+                ? localOwnerIsHost
+                : !localOwnerIsHost;
+            string key = HiddenStateKey(ownerIsHost, card.Index);
+            if (NativePromotedReceivedHiddenCardStateSignatures.TryGetValue(
+                    key, out string promotedSignature))
+            {
+                NativeReplacedReceivedHiddenCardStateSignatures[key] =
+                    promotedSignature;
+                return;
+            }
+
+            ApplyReceivedHiddenCardState(card, true);
         }
 
         internal static void ApplyReceivedHiddenCardState(
@@ -5886,7 +12434,7 @@ namespace Shadowbus
             Dictionary<string, object> reference)
         {
             if (reference == null ||
-                !TryGetStateInt(reference, "idx", out int index) || index <= 0 ||
+                !TryGetStateInt(reference, "idx", out int index) || index < 0 ||
                 !TryGetStateInt(reference, "owner", out int owner) ||
                 (owner != 0 && owner != 1) ||
                 !(BattleManagerBase.GetIns() is NetworkBattleManagerBase manager))
@@ -5904,11 +12452,17 @@ namespace Shadowbus
                 return null;
             }
 
-            BattleCardBase resolved = player.AllCardsWithSkillIngredient?
-                .FirstOrDefault(candidate => candidate != null &&
-                    candidate.Index == index) ??
-                player.AllCards?.FirstOrDefault(candidate => candidate != null &&
-                    candidate.Index == index);
+            // Leader/class cards use the reserved index 0 and are not always
+            // exposed through AllCardsWithSkillIngredient. Resolve that index
+            // directly so random effects and targeted actions can carry leader
+            // references through the authority protocol.
+            BattleCardBase resolved = index == 0
+                ? player.Class
+                : player.AllCardsWithSkillIngredient?
+                    .FirstOrDefault(candidate => candidate != null &&
+                        candidate.Index == index) ??
+                    player.AllCards?.FirstOrDefault(candidate => candidate != null &&
+                        candidate.Index == index);
             return resolved ?? FindCardInPlayerReferences(player, index);
         }
 
@@ -6197,17 +12751,7 @@ namespace Shadowbus
         {
             if (!IsActive || ReceivedHiddenCardStates.Count == 0 ||
                 !(BattleManagerBase.GetIns() is NetworkBattleManagerBase manager) ||
-                manager.BattleEnemy == null)
-            {
-                return;
-            }
-
-            List<BattleCardBase> privateCards;
-            try
-            {
-                privateCards = EnumeratePrivateCards(manager.BattleEnemy).ToList();
-            }
-            catch (Exception)
+                manager.BattlePlayer == null || manager.BattleEnemy == null)
             {
                 return;
             }
@@ -6216,49 +12760,145 @@ namespace Shadowbus
             DateTime now = DateTime.UtcNow;
             List<BattleCardBase> replacementsToLoad =
                 new List<BattleCardBase>();
-            foreach (BattleCardBase card in privateCards)
+            BattlePlayerBase[] owners = { manager.BattlePlayer, manager.BattleEnemy };
+            foreach (BattlePlayerBase player in owners)
             {
-                if (card == null || card.Index <= 0)
+                if (player == null)
                 {
                     continue;
                 }
 
-                bool remoteOwnerIsHost = Role != P2PRole.Host;
-                string key = HiddenStateKey(remoteOwnerIsHost, card.Index);
-                if (!ReceivedHiddenCardStates.TryGetValue(
-                        key, out Dictionary<string, object> state) ||
-                    !ReceivedHiddenCardStateSignatures.TryGetValue(
-                        key, out string signature))
+                bool ownerIsHost = player.IsPlayer == (Role == P2PRole.Host);
+                List<BattleCardBase> privateCards;
+                try
+                {
+                    privateCards = EnumeratePrivateCards(player).ToList();
+                }
+                catch (Exception)
                 {
                     continue;
                 }
 
-                AppliedReceivedHiddenCardStates.TryGetValue(
-                    key, out AppliedHiddenCardState applied);
-                bool sameApplication = applied != null &&
-                    ReferenceEquals(applied.Card, card) &&
-                    string.Equals(applied.Signature, signature,
-                        StringComparison.Ordinal);
-                bool retryDue = applied == null ||
-                    applied.NextRetryUtc <= now;
-                if (!sameApplication || (!applied.StateComplete && retryDue))
+                foreach (BattleCardBase card in privateCards)
                 {
-                    ApplyReceivedHiddenCardState(card, false);
-                    AppliedReceivedHiddenCardStates.TryGetValue(key, out applied);
-                }
+                    if (card == null || card.Index <= 0)
+                    {
+                        continue;
+                    }
 
-                if (!canReplace || applied == null ||
-                    applied.NativeStateInherited ||
-                    !CanReplacePrivateCard(manager.BattleEnemy, card))
-                {
-                    continue;
-                }
+                    string key = HiddenStateKey(ownerIsHost, card.Index);
+                    if (!ReceivedHiddenCardStates.TryGetValue(
+                            key, out Dictionary<string, object> state) ||
+                        !ReceivedHiddenCardStateSignatures.TryGetValue(
+                            key, out string signature))
+                    {
+                        continue;
+                    }
 
-                BattleCardBase replacement = TryReplacePendingHiddenCard(
-                    manager, state, key, card);
-                if (replacement != null)
-                {
-                    replacementsToLoad.Add(replacement);
+                    AppliedReceivedHiddenCardStates.TryGetValue(
+                        key, out AppliedHiddenCardState applied);
+                    bool identityMismatch =
+                        NeedsPrivateCardIdentityReplacement(card, state);
+                    bool nativeActionState = UseNativeClientActionTiming &&
+                        !NativeBaselineHiddenCardStateKeys.Contains(key);
+                    if (nativeActionState && identityMismatch)
+                    {
+                        // A native action snapshot is not allowed to repair a
+                        // card object after the original receiver boundary. If
+                        // knownList/uList omitted the identity, preserve the
+                        // native object and report the protocol defect once.
+                        if (ReportedMissingNativePrivateIdentities.Add(key))
+                        {
+                            Plugin.Logger.LogError(
+                                "[P2P] Native action omitted the identity for a " +
+                                "private-zone card; refusing post-action replacement: owner=" +
+                                SideName(ownerIsHost) + ", idx=" + card.Index +
+                                ", expectedCardId=" +
+                                (TryGetStateInt(state, "cardId", out int expectedId)
+                                    ? expectedId.ToString(CultureInfo.InvariantCulture)
+                                    : "?") + ", actualCardId=" + card.CardId + ".");
+                        }
+                        continue;
+                    }
+                    bool sameApplication = applied != null &&
+                        ReferenceEquals(applied.Card, card) &&
+                        string.Equals(applied.Signature, signature,
+                            StringComparison.Ordinal);
+                    bool retryDue = applied == null ||
+                        applied.NextRetryUtc <= now;
+                    if (!sameApplication || (!applied.StateComplete && retryDue))
+                    {
+                        bool wasReplacedByNativeReceive =
+                            NativeReplacedReceivedHiddenCardStateSignatures.TryGetValue(
+                                key, out string replacedSignature) &&
+                            string.Equals(replacedSignature, signature,
+                                StringComparison.Ordinal);
+                        ApplyReceivedHiddenCardState(
+                            card, wasReplacedByNativeReceive);
+                        AppliedReceivedHiddenCardStates.TryGetValue(
+                            key, out applied);
+                        if (applied != null &&
+                            ReferenceEquals(applied.Card, card) &&
+                            string.Equals(applied.Signature, signature,
+                                StringComparison.Ordinal))
+                        {
+                            // This promoted snapshot has crossed its action
+                            // boundary. Retain the native-inherited bit in
+                            // AppliedHiddenCardState, but do not let it affect
+                            // a later snapshot for the same card index.
+                            NativePromotedReceivedHiddenCardStateSignatures.Remove(
+                                key);
+                            NativeReplacedReceivedHiddenCardStateSignatures.Remove(
+                                key);
+                        }
+                    }
+
+                    if (!canReplace || applied == null ||
+                        applied.NativeStateInherited ||
+                        !CanReplacePrivateCard(player, card) ||
+                        !identityMismatch)
+                    {
+                        continue;
+                    }
+
+                    if (UseNativeClientActionTiming &&
+                        !NativeBaselineHiddenCardStateKeys.Contains(key))
+                    {
+                        // Native v3 never performs deferred object replacement.
+                        // The only exception is the one-time private_state
+                        // baseline, which is established before any ordered
+                        // native action is committed.
+                        continue;
+                    }
+
+                    if (PostActionHiddenCardStateKeys.Contains(key))
+                    {
+                        // This state was attached to a completed native action.
+                        // Replacing it here would detach the card object from a
+                        // hand view/touch processor created by that action.
+                        // Treat a missing native identity as a protocol error,
+                        // not as permission for the P2P side channel to repair
+                        // the action after the fact.
+                        if (ReportedMissingNativePrivateIdentities.Add(key))
+                        {
+                            Plugin.Logger.LogError(
+                                "[P2P] Native action omitted the identity for a " +
+                                "private-zone card; refusing late replacement: owner=" +
+                                SideName(ownerIsHost) + ", idx=" + card.Index +
+                                ", expectedCardId=" +
+                                (TryGetStateInt(state, "cardId", out int expectedId)
+                                    ? expectedId.ToString(CultureInfo.InvariantCulture)
+                                    : "?") + ", actualCardId=" + card.CardId + ".");
+                        }
+                        continue;
+                    }
+
+                    BattleCardBase replacement = TryReplacePendingHiddenCard(
+                        manager, player, state, key, card);
+                    if (replacement != null)
+                    {
+                        replacementsToLoad.Add(replacement);
+                    }
                 }
             }
 
@@ -6284,15 +12924,36 @@ namespace Shadowbus
                 player.NecromanceZoneList.Contains(card);
         }
 
+        private static bool NeedsPrivateCardIdentityReplacement(
+            BattleCardBase card,
+            Dictionary<string, object> state)
+        {
+            if (card == null || state == null ||
+                !TryGetStateInt(state, "cardId", out int expectedCardId) ||
+                expectedCardId <= 0)
+            {
+                return false;
+            }
+
+            // State synchronization is not a reason to replace a real hand
+            // object. The old adapter did so for every changed snapshot, which
+            // left HandCardView/TouchControl holding an orphaned object until
+            // the next turn. Fallback replacement is now only for a genuine
+            // dummy/identity mismatch (initial baseline or an older peer).
+            return card is NullBattleCard || card.CardId <= 0 ||
+                card.CardId != expectedCardId;
+        }
+
         private static BattleCardBase TryReplacePendingHiddenCard(
             NetworkBattleManagerBase manager,
+            BattlePlayerBase player,
             Dictionary<string, object> state,
             string key,
             BattleCardBase oldCard)
         {
             try
             {
-                CardDataModel model = CreateHiddenCardDataModel(state);
+                CardDataModel model = CreateHiddenCardDataModel(state, player);
                 if (model == null)
                 {
                     return null;
@@ -6300,7 +12961,7 @@ namespace Shadowbus
 
                 BattleCardBase replacement =
                     new ReplaceReceivedCard(manager, model)
-                        .ReplaceCard(manager.BattleEnemy);
+                        .ReplaceCard(player);
                 if (replacement == null)
                 {
                     return null;
@@ -6323,7 +12984,8 @@ namespace Shadowbus
         }
 
         private static CardDataModel CreateHiddenCardDataModel(
-            Dictionary<string, object> state)
+            Dictionary<string, object> state,
+            BattlePlayerBase owner)
         {
             if (!TryGetStateInt(state, "idx", out int index) || index <= 0 ||
                 !TryGetStateInt(state, "cardId", out int cardId) || cardId <= 0)
@@ -6335,7 +12997,19 @@ namespace Shadowbus
             {
                 Index = index,
                 CardId = cardId,
-                isOpponent = true
+                // ReplaceReceivedCard uses isOpponent to choose its default
+                // search zone. Authority snapshots cover both absolute owners,
+                // so this must be derived from the target player instead of
+                // assuming every deferred replacement belongs to the opponent.
+                // A wrong value routes a local hand/deck card into the other
+                // side and can create duplicate indexes or a stalled replay.
+                // BattlePlayerBase.IsPlayer is already relative to the current
+                // process (true for BattlePlayer, false for BattleEnemy).  Do
+                // not fold the P2P role into this test: on the Guest process
+                // the Guest is still BattlePlayer, so comparing IsPlayer with
+                // (Role == Host) reverses both owners and routes every deferred
+                // snapshot into the wrong hand/deck.
+                isOpponent = owner == null || !owner.IsPlayer
             };
             if (TryGetStateInt(state, "cost", out int cost))
             {
@@ -6576,6 +13250,40 @@ namespace Shadowbus
             }
         }
 
+        private static BattleCardBase FindLocalPrivateCard(
+            BattlePlayerBase player,
+            int index)
+        {
+            if (player == null || index <= 0)
+            {
+                return null;
+            }
+
+            // Resolve only the indexes named by the native action.  This keeps
+            // the extension on the same bounded-card path as knownList/uList
+            // instead of walking every private card once per action.
+            IEnumerable<IEnumerable<BattleCardBase>> zones =
+                new IEnumerable<BattleCardBase>[]
+                {
+                    player.HandCardList,
+                    player.DeckCardList,
+                    player.DeckSkillCardList,
+                    player.ReservedCardList,
+                    player.NecromanceZoneList,
+                    player.FusionIngredientList
+                };
+            foreach (IEnumerable<BattleCardBase> zone in zones)
+            {
+                BattleCardBase card = zone?.FirstOrDefault(
+                    candidate => candidate != null && candidate.Index == index);
+                if (card != null)
+                {
+                    return card;
+                }
+            }
+            return null;
+        }
+
         private static void AppendLocalHiddenCardState(
             string uri,
             Dictionary<string, object> data)
@@ -6588,20 +13296,17 @@ namespace Shadowbus
                 return;
             }
 
-            // The initial private_state message establishes the complete baseline.
-            // Scan every private card at ordered action boundaries. Many native
-            // effects mutate all hand/deck cards (cost, generic values, attached
-            // skills, tribe/affiliation, etc.) without putting those card indices
-            // in orderList. Restricting the scan to referenced indices therefore
-            // misses precisely the hidden mutations that later conditions read.
-            // We still send only changed signatures, so this broad scan does not
-            // duplicate the complete private-state payload on the wire.
-            bool sendCompleteSnapshot = LocalHiddenCardStateSignatures.Count == 0;
-            bool scanAllCards = sendCompleteSnapshot ||
-                IsOrderedLocalBattleMessage(uri);
-            HashSet<int> candidateIndices = scanAllCards
-                ? null
-                : CollectLocalCardIndices(data);
+            // The initial private_state message establishes the complete
+            // baseline.  Subsequent native actions must not scan every hand or
+            // deck card: the official server only serializes cards registered
+            // by the current operation in knownList/uList/orderList.  Restrict
+            // the P2P extension to those same native references and use it only
+            // for fields that CardDataModel cannot carry.
+            HashSet<int> candidateIndices = CollectLocalCardIndices(data);
+            if (candidateIndices.Count == 0)
+            {
+                return;
+            }
             Dictionary<int, BattleCardBase> presentCards =
                 new Dictionary<int, BattleCardBase>();
             List<Dictionary<string, object>> changedCards =
@@ -6612,19 +13317,16 @@ namespace Shadowbus
 
             try
             {
-                foreach (BattleCardBase card in EnumeratePrivateCards(
-                    manager.BattlePlayer))
+                foreach (int candidateIndex in candidateIndices)
                 {
+                    BattleCardBase card =
+                        FindLocalPrivateCard(manager.BattlePlayer, candidateIndex);
                     if (card == null || card.Index <= 0 || card.CardId <= 0)
                     {
                         continue;
                     }
 
                     presentCards[card.Index] = card;
-                    if (!scanAllCards && !candidateIndices.Contains(card.Index))
-                    {
-                        continue;
-                    }
                     Dictionary<string, object> state;
                     string signature;
                     try
@@ -6648,7 +13350,8 @@ namespace Shadowbus
                     // post-action snapshot below.
                     if (P2PBattleProtocol.IsFusionMetamorphoseTarget(
                             data, card.Index) &&
-                        LocalHiddenCardStates.TryGetValue(
+                        TryGetActionPreHiddenCardState(
+                            Role == P2PRole.Host,
                             card.Index,
                             out Dictionary<string, object> originalState) &&
                         TryGetStateInt(originalState, "cardId",
@@ -6661,19 +13364,24 @@ namespace Shadowbus
                         AttachFusionMetamorphoseOriginal(
                             data, card.Index, originalClone);
                     }
-                    LocalHiddenCardStates[card.Index] =
-                        P2PJson.CloneDictionary(state);
-                    if (!sendCompleteSnapshot &&
-                        LocalHiddenCardStateSignatures.TryGetValue(
+                    LocalHiddenCardStates.TryGetValue(
+                        card.Index,
+                        out Dictionary<string, object> previousState);
+                    if (LocalHiddenCardStateSignatures.TryGetValue(
                             card.Index, out string previousSignature) &&
                         string.Equals(previousSignature, signature,
                             StringComparison.Ordinal))
                     {
+                        LocalHiddenCardStates[card.Index] =
+                            P2PJson.CloneDictionary(state);
                         continue;
                     }
 
                     LocalHiddenCardStateSignatures[card.Index] = signature;
-                    changedCards.Add(state);
+                    LocalHiddenCardStates[card.Index] =
+                        P2PJson.CloneDictionary(state);
+                    changedCards.Add(CreateHiddenCardDelta(previousState, state)
+                        ?? P2PJson.CloneDictionary(state));
                 }
             }
             catch (Exception ex)
@@ -6683,9 +13391,7 @@ namespace Shadowbus
                 return;
             }
 
-            IEnumerable<int> removalCandidates = scanAllCards
-                ? LocalHiddenCardStateSignatures.Keys.ToList()
-                : candidateIndices;
+            IEnumerable<int> removalCandidates = candidateIndices;
             List<int> removedIndices = removalCandidates
                 .Where(index => LocalHiddenCardStateSignatures.ContainsKey(index) &&
                     !presentCards.ContainsKey(index))
@@ -6743,11 +13449,21 @@ namespace Shadowbus
             Plugin.Logger.LogDebug(
                 $"[P2P] Attached {changedCards.Count} hidden hand/deck state " +
                 $"snapshot(s) and {removedIndices.Count} tombstone(s) to {uri}" +
-                $"{(scanAllCards ? " (full scan)" : string.Empty)}.");
+                ".");
         }
 
         private static void AttachFusionMetamorphoseOriginal(
             Dictionary<string, object> data,
+            int index,
+            Dictionary<string, object> state)
+        {
+            AttachFusionMetamorphoseOriginal(
+                data, Role == P2PRole.Host, index, state);
+        }
+
+        private static void AttachFusionMetamorphoseOriginal(
+            Dictionary<string, object> data,
+            bool ownerIsHost,
             int index,
             Dictionary<string, object> state)
         {
@@ -6770,7 +13486,7 @@ namespace Shadowbus
                 data[P2PBattleProtocol.FusionMetamorphoseOriginalsKey] = entries;
             }
 
-            int owner = Role == P2PRole.Host ? 1 : 0;
+            int owner = ownerIsHost ? 1 : 0;
             Dictionary<string, object> entry = entries
                 .OfType<Dictionary<string, object>>()
                 .FirstOrDefault(candidate =>
@@ -6789,6 +13505,128 @@ namespace Shadowbus
             if (TryGetStateInt(state, "cost", out int cost) && cost >= 0)
             {
                 entry["cost"] = cost;
+            }
+        }
+
+        private static void AttachActionPreHiddenMetamorphoseOriginals(
+            Dictionary<string, object> data)
+        {
+            if (data == null ||
+                !data.TryGetValue("orderList", out object rawOrders) ||
+                rawOrders is string || !(rawOrders is IEnumerable orders))
+            {
+                return;
+            }
+
+            foreach (object rawOrder in orders)
+            {
+                if (!(rawOrder is Dictionary<string, object> order) ||
+                    !order.TryGetValue("metamorphose", out object rawMetamorphose) ||
+                    !(rawMetamorphose is Dictionary<string, object> metamorphose) ||
+                    !TryGetStateInt(metamorphose, "isFusion", out int isFusion) ||
+                    isFusion == 0)
+                {
+                    continue;
+                }
+
+                bool ownerIsHost = TryGetStateInt(
+                        metamorphose, "isSelf", out int isSelf) && isSelf != 0
+                    ? Role == P2PRole.Host
+                    : Role != P2PRole.Host;
+                foreach (int index in ReadStateIndices(metamorphose))
+                {
+                    if (!TryGetActionPreHiddenCardState(
+                            ownerIsHost, index,
+                            out Dictionary<string, object> originalState))
+                    {
+                        continue;
+                    }
+                    AttachFusionMetamorphoseOriginal(
+                        data, ownerIsHost, index, originalState);
+                }
+            }
+        }
+
+        private static void AttachAuthorityFusionMetamorphoseOriginals(
+            Dictionary<string, object> data,
+            IEnumerable<object> orderList,
+            BattleCardBase actor,
+            int originalActorCardId,
+            int originalActorCost)
+        {
+            if (data == null || orderList == null)
+            {
+                return;
+            }
+
+            foreach (object rawOrder in orderList)
+            {
+                if (!(rawOrder is Dictionary<string, object> order) ||
+                    !order.TryGetValue("metamorphose", out object rawMetamorphose) ||
+                    !(rawMetamorphose is Dictionary<string, object> metamorphose) ||
+                    !TryGetStateInt(metamorphose, "isFusion", out int isFusion) ||
+                    isFusion == 0)
+                {
+                    continue;
+                }
+
+                bool ownerIsHost = TryGetStateInt(
+                        metamorphose, "isSelf", out int isSelf) && isSelf != 0
+                    ? true
+                    : false;
+                foreach (int index in ReadStateIndices(metamorphose))
+                {
+                    Dictionary<string, object> originalState = null;
+                    if (!TryGetActionPreHiddenCardState(
+                            ownerIsHost, index, out originalState) &&
+                        actor != null && index == actor.Index &&
+                        originalActorCardId > 0)
+                    {
+                        originalState = new Dictionary<string, object>
+                        {
+                            ["idx"] = index,
+                            ["cardId"] = originalActorCardId,
+                            ["isSelf"] = 1,
+                            ["cost"] = originalActorCost
+                        };
+                    }
+
+                    if (originalState == null)
+                    {
+                        continue;
+                    }
+                    AttachFusionMetamorphoseOriginal(
+                        data, ownerIsHost, index, originalState);
+                }
+            }
+        }
+
+        private static IEnumerable<int> ReadStateIndices(
+            Dictionary<string, object> state)
+        {
+            if (state == null)
+            {
+                yield break;
+            }
+
+            if (state.TryGetValue("idx", out object rawIndex) &&
+                TryConvertAuthorityInt(rawIndex, out int index) && index > 0)
+            {
+                yield return index;
+                yield break;
+            }
+
+            if (!state.TryGetValue("idxList", out object rawIndices) ||
+                rawIndices is string || !(rawIndices is IEnumerable indices))
+            {
+                yield break;
+            }
+            foreach (object rawValue in indices)
+            {
+                if (TryConvertAuthorityInt(rawValue, out int value) && value > 0)
+                {
+                    yield return value;
+                }
             }
         }
 
@@ -7008,6 +13846,12 @@ namespace Shadowbus
 
         internal static void CaptureLocalActionStart(BattleCardBase sourceCard)
         {
+            if (UseNativeClientActionTiming)
+            {
+                CaptureLocalPreActionPlayerHistoryState();
+                CaptureLocalSourceCardPreActionState(sourceCard);
+                return;
+            }
             if (!IsActive || sourceCard == null || !sourceCard.IsPlayer ||
                 !(BattleManagerBase.GetIns() is NetworkBattleManagerBase manager) ||
                 manager.BattlePlayer == null)
@@ -7019,6 +13863,7 @@ namespace Shadowbus
 
             try
             {
+                CaptureActionPreHiddenCardStates(manager);
                 bool ownerIsHost = Role == P2PRole.Host;
                 Dictionary<string, object> state = CapturePlayerHistoryState(
                     manager.BattlePlayer, ownerIsHost);
@@ -7043,6 +13888,12 @@ namespace Shadowbus
 
         internal static void CaptureLocalActionStart()
         {
+            if (UseNativeClientActionTiming)
+            {
+                CaptureLocalPreActionPlayerHistoryState();
+                actionPreHiddenCardStates.Clear();
+                return;
+            }
             if (!IsActive ||
                 !(BattleManagerBase.GetIns() is NetworkBattleManagerBase manager) ||
                 manager.BattlePlayer == null || !manager.BattlePlayer.IsSelfTurn)
@@ -7054,6 +13905,7 @@ namespace Shadowbus
 
             try
             {
+                CaptureActionPreHiddenCardStates(manager);
                 bool ownerIsHost = Role == P2PRole.Host;
                 Dictionary<string, object> state = CapturePlayerHistoryState(
                     manager.BattlePlayer, ownerIsHost);
@@ -7080,6 +13932,12 @@ namespace Shadowbus
             BattlePlayerBase player,
             string boundary)
         {
+            if (UseNativeClientActionTiming)
+            {
+                CaptureLocalPreActionPlayerHistoryState();
+                actionPreHiddenCardStates.Clear();
+                return;
+            }
             if (!IsActive || player == null || !player.IsPlayer ||
                 !(BattleManagerBase.GetIns() is NetworkBattleManagerBase manager) ||
                 !ReferenceEquals(player, manager.BattlePlayer))
@@ -7091,6 +13949,7 @@ namespace Shadowbus
 
             try
             {
+                CaptureActionPreHiddenCardStates(manager);
                 bool ownerIsHost = Role == P2PRole.Host;
                 Dictionary<string, object> state = CapturePlayerHistoryState(
                     manager.BattlePlayer, ownerIsHost);
@@ -7111,6 +13970,148 @@ namespace Shadowbus
                     $"[P2P] Could not capture {boundary ?? "automatic"} " +
                     "action-start player history: " + ex.Message);
             }
+        }
+
+        private static void CaptureActionPreHiddenCardStates(
+            NetworkBattleManagerBase manager)
+        {
+            actionPreHiddenCardStates.Clear();
+            if (!IsActive || manager == null || manager.BattlePlayer == null ||
+                manager.BattleEnemy == null)
+            {
+                return;
+            }
+
+            try
+            {
+                CaptureActionPreHiddenCardStatesForPlayer(
+                    manager.BattlePlayer, Role == P2PRole.Host);
+                CaptureActionPreHiddenCardStatesForPlayer(
+                    manager.BattleEnemy, Role != P2PRole.Host);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not capture action-start hidden card states: " +
+                    ex.Message);
+            }
+        }
+
+        private static void CaptureLocalSourceCardPreActionState(
+            BattleCardBase sourceCard)
+        {
+            actionPreHiddenCardStates.Clear();
+            if (!IsActive || sourceCard == null || !sourceCard.IsPlayer ||
+                sourceCard.Index <= 0 || sourceCard.CardId <= 0)
+            {
+                return;
+            }
+
+            try
+            {
+                actionPreHiddenCardStates[
+                    HiddenStateKey(Role == P2PRole.Host, sourceCard.Index)] =
+                    P2PJson.CloneDictionary(CreateHiddenCardState(sourceCard));
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not capture the source card's pre-action " +
+                    "identity: " + ex.Message);
+            }
+        }
+
+        private static void CaptureLocalPreActionPlayerHistoryState()
+        {
+            if (!IsActive ||
+                !(BattleManagerBase.GetIns() is NetworkBattleManagerBase manager) ||
+                manager.BattlePlayer == null)
+            {
+                return;
+            }
+
+            try
+            {
+                bool ownerIsHost = Role == P2PRole.Host;
+                Dictionary<string, object> state = CapturePlayerHistoryState(
+                    manager.BattlePlayer, ownerIsHost);
+                localPlayerHistoryBaselineState = state;
+                localPlayerHistoryBaselineSignature = JsonConvert.SerializeObject(
+                    state, P2PJson.Settings);
+                localPlayerHistoryBaselineRevision = Math.Max(1,
+                    localPlayerHistoryRevision);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not capture native pre-action player history: " +
+                    ex.Message);
+            }
+        }
+
+        private static void CaptureActionPreHiddenCardStatesForPlayer(
+            BattlePlayerBase player,
+            bool ownerIsHost)
+        {
+            if (player == null)
+            {
+                return;
+            }
+
+            foreach (BattleCardBase card in EnumeratePrivateCards(player))
+            {
+                // Only cards that can be replaced by the native hidden-card
+                // path need a full pre-action snapshot. Public cards are
+                // already represented by orderList/uList and capturing them
+                // would add unnecessary per-action work.
+                if (card == null || card.Index <= 0 || card.CardId <= 0 ||
+                    !CanReplacePrivateCard(player, card))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    actionPreHiddenCardStates[
+                        HiddenStateKey(ownerIsHost, card.Index)] =
+                        P2PJson.CloneDictionary(CreateHiddenCardState(card));
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Logger.LogDebug(
+                        $"[P2P] Could not capture action-start hidden card " +
+                        $"idx={card.Index}: {ex.Message}");
+                }
+            }
+        }
+
+        private static bool TryGetActionPreHiddenCardState(
+            bool ownerIsHost,
+            int index,
+            out Dictionary<string, object> state)
+        {
+            state = null;
+            if (index <= 0)
+            {
+                return false;
+            }
+
+            if (actionPreHiddenCardStates.TryGetValue(
+                    HiddenStateKey(ownerIsHost, index), out state))
+            {
+                return true;
+            }
+
+            // The local observation cache predates the transient action-start
+            // capture and remains a useful fallback when a card was created
+            // between the input hook and the native action callback.
+            if (ownerIsHost == (Role == P2PRole.Host) &&
+                LocalHiddenCardStates.TryGetValue(index, out state))
+            {
+                state = P2PJson.CloneDictionary(state);
+                return true;
+            }
+            return false;
         }
 
         private static void RememberReceivedPlayerHistoryBeforeState(
@@ -7398,11 +14399,26 @@ namespace Shadowbus
                 {
                     player.HandCardList,
                     player.DeckCardList,
+                    // Deck-skill cards are created outside DeckCardList but
+                    // participate in turn-start/turn-end and private-count
+                    // conditions (for example, cards generated by a deck
+                    // effect).  They must share the same authoritative state
+                    // channel as ordinary hand/deck cards.
+                    player.DeckSkillCardList,
                     player.ClassAndInPlayCardList,
                     player.CemeteryList,
                     player.BanishList,
                     player.FusionIngredientList,
+                    player.TurnFusionCards,
                     player.ReservedCardList,
+                    player.DiscardedCardList,
+                    player.FusionIngredientAndDiscardedCardList,
+                    player.GetOnList,
+                    player.UniteList,
+                    player.BlackHole,
+                    player.ChoiceBraveCardList,
+                    player.ChoiceBraveCards,
+                    player.InHandCards,
                     // Necromance cards are not always public in the local
                     // network representation, but the original replacement
                     // path can resolve this zone by index as well.
@@ -8169,16 +15185,40 @@ namespace Shadowbus
                     continue;
                 }
 
-                foreach (string stateKey in HiddenCardStateKeys)
+                bool isDelta = IsHiddenCardStateDelta(state);
+                if (!isDelta)
                 {
-                    if (!state.ContainsKey(stateKey))
+                    foreach (string stateKey in HiddenCardStateKeys)
                     {
-                        known.Remove(stateKey);
+                        if (!state.ContainsKey(stateKey))
+                        {
+                            known.Remove(stateKey);
+                        }
                     }
                 }
                 foreach (KeyValuePair<string, object> field in state)
                 {
+                    if (string.Equals(field.Key, HiddenCardStateDeltaKey,
+                            StringComparison.Ordinal) ||
+                        string.Equals(field.Key, HiddenCardStateRemovedFieldsKey,
+                            StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
                     known[field.Key] = field.Value;
+                }
+                if (state.TryGetValue(HiddenCardStateRemovedFieldsKey,
+                        out object rawRemoved) && rawRemoved is IEnumerable removed &&
+                    !(rawRemoved is string))
+                {
+                    foreach (object rawField in removed)
+                    {
+                        string removedField = rawField?.ToString();
+                        if (!string.IsNullOrEmpty(removedField))
+                        {
+                            known.Remove(removedField);
+                        }
+                    }
                 }
                 return;
             }
@@ -8229,35 +15269,7 @@ namespace Shadowbus
                 StringComparer.Ordinal);
 
         private static readonly string[] PlayerHistoryScalarNames =
-        {
-            "Pp",
-            "PpTotal",
-            "Bp",
-            "EpTotal",
-            "CurrentEpCount",
-            "EvolveWaitTurnCount",
-            "NowTurnEvol",
-            "IsEpEvolveThisTurn",
-            "GameUsedEpCount",
-            "TurnUsedEpCount",
-            "IsAlreadyChoiceBraveInThisTurn",
-            "IsChoiceBraveEffectTiming",
-            "TurnNecromanceCount",
-            "GameNecromanceCount",
-            "GameUsedPpCount",
-            "RallyCount",
-            "DeckBanishCount",
-            "GameResonanceStartCount",
-            "TurnResonanceStartCount",
-            "GameUsedWhiteRitualCount",
-            "LastInplayWhiteRitualStack",
-            "GameSkillDiscardCount",
-            "IsShortageDeck",
-            "IsShortageDeckLose",
-            "extraTurnCount",
-            "cardTotalNum",
-            "_cumulativeEvolutionCount"
-        };
+            P2PPlayerHistoryPolicy.SynchronizedScalarNames.ToArray();
 
         private static readonly HashSet<string> PlayerHistoryScalarNameSet =
             new HashSet<string>(PlayerHistoryScalarNames, StringComparer.Ordinal);
@@ -8385,6 +15397,7 @@ namespace Shadowbus
                 ["ep"] = player.CurrentEpCount,
                 ["turn"] = player.Turn,
                 ["isTurn"] = player.IsSelfTurn,
+                ["extraTurn"] = player.extraTurnCount,
                 ["deckCount"] = player.DeckCardList?.Count ?? 0,
                 ["deck"] = FormatCardIndices(player.DeckCardList),
                 ["deckState"] = FormatPrivateCardStates(player.DeckCardList),
@@ -8607,6 +15620,17 @@ namespace Shadowbus
                 return;
             }
 
+            // A checkpoint is meaningful only after the exact ordered action
+            // that carried it has left the native receive pipeline. Comparing
+            // while that action is still queued or animating turns a valid
+            // following PlayActions result into a false TurnStart desync.
+            if (receivedBattleActionInjectionPending ||
+                receivedBattleActionPendingUntilVfx ||
+                processingReceivedBattleAction)
+            {
+                return;
+            }
+
             NetworkBattleManagerBase manager =
                 BattleManagerBase.GetIns() as NetworkBattleManagerBase;
             bool effectsComplete = manager?.VfxMgr != null && manager.VfxMgr.IsEnd;
@@ -8614,15 +15638,20 @@ namespace Shadowbus
             while (PendingBattleStateChecks.Count > 0)
             {
                 PendingBattleStateCheck pending = PendingBattleStateChecks.Peek();
-                if (HasQueuedNewerBattleStateCheckpoint())
-                {
-                    // A newer checkpoint is already waiting behind the current
-                    // VFX operation. The old snapshot can no longer be compared
-                    // to a stable boundary and must not generate a stale error.
-                    PendingBattleStateChecks.Dequeue();
-                    continue;
-                }
                 bool timedOut = now >= pending.DeadlineUtc;
+                if (!effectsComplete)
+                {
+                    if (timedOut && !pending.StallReported)
+                    {
+                        pending.StallReported = true;
+                        Plugin.Logger.LogWarning(
+                            "[P2P] State checkpoint is waiting for actionId=" +
+                            pending.ActionId + ", uri=" + pending.Uri + "; " +
+                            DescribeEffectQueue(manager) + ".");
+                    }
+                    return;
+                }
+
                 Dictionary<string, object> actual = CaptureBattleState();
                 if (actual == null)
                 {
@@ -8632,75 +15661,41 @@ namespace Shadowbus
                     }
                     PendingBattleStateChecks.Dequeue();
                     ReportBattleDiagnostic(
-                        $"State check after {pending.Uri} failed: " +
+                        $"State check after actionId={pending.ActionId}, " +
+                        $"uri={pending.Uri} failed: " +
                         "the network battle manager is unavailable.");
                     continue;
                 }
 
                 IReadOnlyList<string> differences =
                     P2PBattleStateDiagnostics.Compare(pending.Expected, actual);
-                P2PBattleStateCheckDecision decision =
-                    P2PBattleStateDiagnostics.DecideCheck(
-                        differences.Count == 0,
-                        effectsComplete,
-                        timedOut);
-                if (decision == P2PBattleStateCheckDecision.Wait)
-                {
-                    return;
-                }
-
                 PendingBattleStateChecks.Dequeue();
-                if (decision == P2PBattleStateCheckDecision.Synchronized)
+                if (differences.Count == 0)
                 {
                     if (!string.IsNullOrEmpty(pending.InjectionError))
                     {
                         ReportBattleDiagnostic(
-                            $"Message injection failed after {pending.Uri}, although the " +
+                            $"Message injection failed after actionId={pending.ActionId}, " +
+                            $"uri={pending.Uri}, although the " +
                             "state snapshot currently matches the peer: " +
                             pending.InjectionError);
                         continue;
                     }
                     Plugin.Logger.LogDebug(
-                        $"[P2P] State synchronized after {pending.Uri}.");
+                        $"[P2P] State synchronized after actionId={pending.ActionId}, " +
+                        $"uri={pending.Uri}.");
                     continue;
                 }
 
-                if (decision == P2PBattleStateCheckDecision.Stalled)
-                {
-                    ReportBattleDiagnostic(
-                        $"TURN-END STALL after {pending.Uri}: the effect queue did not " +
-                        $"finish within {BattleStateCheckTimeoutSeconds} seconds; " +
-                        DescribeEffectQueue(manager) +
-                        ". The state snapshot currently matches the peer.");
-                    continue;
-                }
-
-                string waitReason = timedOut && !effectsComplete
-                    ? $" The effect queue did not finish within " +
-                        $"{BattleStateCheckTimeoutSeconds} seconds; " +
-                        DescribeEffectQueue(manager) + "."
-                    : string.Empty;
                 string injectionReason = string.IsNullOrEmpty(pending.InjectionError)
                     ? string.Empty
                     : " Message injection failed: " + pending.InjectionError;
                 ReportBattleDiagnostic(
-                    $"DATA DESYNC after {pending.Uri}.{waitReason}" +
+                    $"DATA DESYNC after actionId={pending.ActionId}, " +
+                    $"uri={pending.Uri}." +
                     injectionReason + " " +
                     P2PBattleStateDiagnostics.DescribeDifferences(differences));
             }
-        }
-
-        private static bool HasQueuedNewerBattleStateCheckpoint()
-        {
-            foreach (Dictionary<string, object> queued in
-                PendingReceivedBattleMessages)
-            {
-                if (P2PBattleProtocol.CarriesBattleStateCheckpoint(GetUri(queued)))
-                {
-                    return true;
-                }
-            }
-            return false;
         }
 
         private static string DescribeEffectQueue(NetworkBattleManagerBase manager)
@@ -8727,16 +15722,36 @@ namespace Shadowbus
 
         private static void ReportBattleDiagnostic(string message)
         {
-            Plugin.Logger.LogError("[P2P] " + message);
+            bool isDesync = IsDesyncDiagnostic(message);
+            if (isDesync)
+            {
+                Plugin.Logger.LogError("[P2P] " + message);
+            }
+            else
+            {
+                Plugin.Logger.LogWarning("[P2P] " + message);
+            }
             if (Role == P2PRole.Guest && IsActive)
             {
                 SendWire(new P2PWireMessage
                 {
                     Type = "diagnostic",
                     BattleId = BattleId,
-                    Error = message
+                    Error = message,
+                    Data = new Dictionary<string, object>
+                    {
+                        ["severity"] = isDesync ? "error" : "warning"
+                    }
                 });
             }
+        }
+
+        private static bool IsDesyncDiagnostic(string message)
+        {
+            return !string.IsNullOrEmpty(message) &&
+                (message.StartsWith("DATA DESYNC", StringComparison.Ordinal) ||
+                 message.IndexOf("state mismatch", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 message.IndexOf("differing field", StringComparison.OrdinalIgnoreCase) >= 0);
         }
 
         private static void TrySynchronizeOpponentRoomState()
@@ -8814,6 +15829,15 @@ namespace Shadowbus
             }
             peerDisconnected = true;
             LastError = error;
+
+            if (!string.IsNullOrEmpty(activeAuthorityExecutionRequestId))
+            {
+                Plugin.Logger.LogWarning(
+                    "[P2P] Peer disconnected while Host authority execution " +
+                    "was still active (requestId=" +
+                    activeAuthorityExecutionRequestId + "). Late native emits " +
+                    "will remain suppressed until its VFX callback exits.");
+            }
 
             if (BattleManagerBase.GetIns() is NetworkBattleManagerBase)
             {
@@ -8999,6 +16023,7 @@ namespace Shadowbus
             ResolveLocalFusionIngredients(int index)
         {
             BattleCardBase card = ResolveLocalCard(index);
+            bool ownerIsHost = Role == P2PRole.Host;
             SkillApplyInformation information = card?
                 .SkillApplyInformation as SkillApplyInformation;
             List<P2PFusionIngredientState> current = information?.FusionIngredients == null
@@ -9012,7 +16037,7 @@ namespace Shadowbus
                     ingredient.FusionTurn))
                 .ToList();
 
-            int key = index;
+            string key = FusionIngredientSnapshotKey(ownerIsHost, index);
             if (current.Count > 0)
             {
                 LocalFusionIngredientSnapshots[key] = current
@@ -9031,8 +16056,7 @@ namespace Shadowbus
         internal static void RememberLocalFusionIngredientState(
             BattleCardBase fusionCard)
         {
-            if (!IsActive || fusionCard == null || fusionCard.Index <= 0 ||
-                !fusionCard.IsPlayer)
+            if (!IsActive || fusionCard == null || fusionCard.Index <= 0)
             {
                 return;
             }
@@ -9044,7 +16068,12 @@ namespace Shadowbus
                 return;
             }
 
-            int key = fusionCard.Index;
+            // IsPlayer is relative to this process. Keep the cache keyed by
+            // absolute owner as a Host can execute a Guest fusion against its
+            // BattleEnemy object, and both players may legitimately reuse the
+            // same card index.
+            bool ownerIsHost = fusionCard.IsPlayer == (Role == P2PRole.Host);
+            string key = FusionIngredientSnapshotKey(ownerIsHost, fusionCard.Index);
             LocalFusionIngredientSnapshots[key] = information.FusionIngredients
                 .Where(ingredient => ingredient?.Card != null &&
                     ingredient.Card.Index > 0)
@@ -9054,10 +16083,17 @@ namespace Shadowbus
                     ingredient.FusionTurn))
                 .ToList();
             Plugin.Logger.LogDebug(
-                $"[P2P] Captured cumulative fusion state for local card " +
+                $"[P2P] Captured cumulative fusion state for {SideName(ownerIsHost)} " +
                 $"idx={fusionCard.Index}: " +
                 $"[{string.Join(",", LocalFusionIngredientSnapshots[key].Select(
                     item => item.Index.ToString(CultureInfo.InvariantCulture)))}].");
+        }
+
+        private static string FusionIngredientSnapshotKey(
+            bool ownerIsHost,
+            int index)
+        {
+            return HiddenStateKey(ownerIsHost, index);
         }
 
         private static IEnumerable<int> ResolveLocalBurialRiteSkillIndexes(int index)
@@ -9131,6 +16167,32 @@ namespace Shadowbus
             pendingOpponentSync = false;
             hostDeckEntry = null;
             guestDeckEntry = null;
+            authorityRequestSequence = 0;
+            authorityTransitionSequence = 0;
+            authorityResultActionSequence = 0;
+            guestAuthorityBusy = false;
+            guestAuthorityRequestId = null;
+            guestAuthorityRequestSentUtc = DateTime.MinValue;
+            receivedAuthorityRequestId = null;
+            activeAuthorityExecutionRequestId = null;
+            activeAuthorityExecutionStartedUtc = DateTime.MinValue;
+            processedAuthorityRequests.Clear();
+            authorityRequestTimes.Clear();
+            completedAuthorityRequestIds.Clear();
+            appliedAuthorityResultBoundaries.Clear();
+            localAuthorityChoiceCardIndexes.Clear();
+            authorityGuestKnownIndices.Clear();
+            foreach (HashSet<int> indices in authorityKnownPrivateIndicesByOwner.Values)
+            {
+                indices.Clear();
+            }
+            authorityPrivateStateSignatures.Clear();
+            authorityPrivateStates.Clear();
+            actionPreHiddenCardStates.Clear();
+            authorityPlayerHistorySignatures.Clear();
+            authorityPlayerHistoryRevisions.Clear();
+            authorityLocalReplayActive = false;
+            authorityReplayDispatchActive = false;
         }
 
         private static void Enqueue(Action action)
@@ -9217,17 +16279,37 @@ namespace Shadowbus
             internal PendingBattleStateCheck(
                 string uri,
                 Dictionary<string, object> expected,
-                DateTime deadlineUtc)
+                DateTime deadlineUtc,
+                string actionId)
             {
                 Uri = uri;
                 Expected = expected;
                 DeadlineUtc = deadlineUtc;
+                ActionId = string.IsNullOrEmpty(actionId)
+                    ? "<missing>"
+                    : actionId;
             }
 
             internal string Uri { get; }
             internal Dictionary<string, object> Expected { get; }
             internal DateTime DeadlineUtc { get; }
+            internal string ActionId { get; }
             internal string InjectionError { get; set; }
+            internal bool StallReported { get; set; }
+        }
+
+        private sealed class PendingAuthorityReplayAction
+        {
+            internal PendingAuthorityReplayAction(
+                RealTimeNetworkBattleAgent agent,
+                Dictionary<string, object> data)
+            {
+                Agent = agent;
+                Data = data;
+            }
+
+            internal RealTimeNetworkBattleAgent Agent { get; }
+            internal Dictionary<string, object> Data { get; }
         }
 
         private sealed class AppliedHiddenCardState
@@ -9272,13 +16354,21 @@ namespace Shadowbus
         private sealed class AuthoritativeSkillTargetBatch
         {
             internal AuthoritativeSkillTargetBatch(
-                IEnumerable<Dictionary<string, object>> entries)
+                IEnumerable<Dictionary<string, object>> entries,
+                string actionId,
+                string uri)
             {
                 Entries = entries?.ToList() ??
                     new List<Dictionary<string, object>>();
+                ActionId = string.IsNullOrEmpty(actionId)
+                    ? "<missing>"
+                    : actionId;
+                Uri = uri ?? "?";
             }
 
             internal List<Dictionary<string, object>> Entries { get; }
+            internal string ActionId { get; }
+            internal string Uri { get; }
             internal bool ReadyForCleanup { get; set; }
             internal bool Rejected { get; set; }
         }
@@ -9399,13 +16489,21 @@ namespace Shadowbus
         private sealed class AuthoritativeSkillEvaluationBatch
         {
             internal AuthoritativeSkillEvaluationBatch(
-                IEnumerable<Dictionary<string, object>> entries)
+                IEnumerable<Dictionary<string, object>> entries,
+                string actionId,
+                string uri)
             {
                 Entries = entries?.ToList() ??
                     new List<Dictionary<string, object>>();
+                ActionId = string.IsNullOrEmpty(actionId)
+                    ? "<missing>"
+                    : actionId;
+                Uri = uri ?? "?";
             }
 
             internal List<Dictionary<string, object>> Entries { get; }
+            internal string ActionId { get; }
+            internal string Uri { get; }
             internal bool ReadyForCleanup { get; set; }
             internal bool Rejected { get; set; }
         }

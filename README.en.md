@@ -51,6 +51,14 @@ Shadowverse/
 
 P2P mode does not connect to the official servers and does not need a permanently hosted server of your own. While the game is running, the host temporarily listens on a TCP port and takes care of the room flow, message relaying and match adjudication.
 
+Battle execution is Host-authoritative. The guest sends only an input request
+(play, evolution, fusion, attack, turn end, and selections); the host executes
+that request with the stock battle manager and returns stock-shaped
+`PlayActions`, turn-transition, and result packets for the guest to replay.
+Both installations exchange the private card/state baseline needed by the host
+at battle setup, then send compact authoritative state changes with each
+result. This is intended for trusted friend matches, not anti-cheat.
+
 1. Both players install the same version of the game, of Shadowbus and of any card mod data.
 2. The host picks standard-constructed BO1 in the stock room screen and creates a room.
 3. The host clicks copy room number. The clipboard receives an encrypted connection code starting with `SVP1-`, not the short room number shown on screen.

@@ -8,12 +8,285 @@ using System.Linq;
 using System.Text.RegularExpressions;
 using Wizard;
 using Wizard.Battle;
+using Wizard.Battle.View.Vfx;
 using Wizard.RoomMatch;
 
 namespace Shadowbus
 {
     internal static class P2PPatches
     {
+        [HarmonyPatch(typeof(OperateMgr), nameof(OperateMgr.PlayCard),
+            new[] { typeof(BattleCardBase), typeof(bool), typeof(List<BattleCardBase>),
+                typeof(bool), typeof(List<int>), typeof(bool) })]
+        [HarmonyPrefix]
+        private static bool OperateMgr_PlayCard_Authority_Prefix(
+            BattleCardBase card,
+            bool isPlayer,
+            List<BattleCardBase> selectCards,
+            bool isRecovery,
+            List<int> selectChoiceId,
+            bool isChoiceBrave,
+            ref VfxBase __result)
+        {
+            if (!P2PRuntime.TryInterceptGuestPlayCard(
+                    card, isPlayer, selectCards, isRecovery, selectChoiceId,
+                    isChoiceBrave, out VfxBase result))
+            {
+                return true;
+            }
+            __result = result;
+            return false;
+        }
+
+        [HarmonyPatch(typeof(OperateMgr), nameof(OperateMgr.InitSetCard),
+            new[]
+            {
+                typeof(BattleCardBase), typeof(bool), typeof(bool), typeof(bool),
+                typeof(bool), typeof(bool), typeof(bool), typeof(bool), typeof(bool)
+            })]
+        [HarmonyPrefix]
+        private static bool OperateMgr_InitSetCard_AuthorityReplay_Prefix(
+            BattleCardBase card,
+            bool isPlayer,
+            ref VfxBase __result)
+        {
+            if (!P2PRuntime.IsAuthorityLocalReplayActive ||
+                P2PRuntime.Role != P2PRole.Guest || card == null)
+            {
+                return true;
+            }
+
+            // The Guest has already run the normal SetCardProcessor and put
+            // its own card into the local play queue before the authority
+            // request was sent. Replaying the Host result through the stock
+            // PlayHandCardReflection would call InitSetCard a second time and
+            // can enqueue the same view twice (or leave the focus VFX waiting
+            // forever). Only suppress the duplicate; transformed/choice cards
+            // that are not in the queue still use the native setup path.
+            try
+            {
+                NetworkBattleManagerBase manager =
+                    BattleManagerBase.GetIns() as NetworkBattleManagerBase;
+                BattlePlayerBase owner = isPlayer
+                    ? manager?.BattlePlayer
+                    : manager?.BattleEnemy;
+                if (owner?.BattleView?.PlayQueueView != null &&
+                    card.BattleCardView != null &&
+                    owner.BattleView.PlayQueueView.IsCardInQueue(
+                        card.BattleCardView))
+                {
+                    __result = NullVfx.GetInstance();
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogDebug(
+                    "[P2P] Could not check duplicate authority InitSetCard: " +
+                    ex.Message);
+            }
+            return true;
+        }
+
+        [HarmonyPatch(typeof(OperateMgr), nameof(OperateMgr.EvolutionCard),
+            new[] { typeof(BattleCardBase), typeof(bool), typeof(List<BattleCardBase>),
+                typeof(List<int>) })]
+        [HarmonyPrefix]
+        private static bool OperateMgr_EvolutionCard_Authority_Prefix(
+            BattleCardBase card,
+            bool isPlayer,
+            List<BattleCardBase> selectCards,
+            List<int> selectChoiceId,
+            ref VfxBase __result)
+        {
+            if (!P2PRuntime.TryInterceptGuestEvolution(
+                    card, isPlayer, selectCards, selectChoiceId, out VfxBase result))
+            {
+                return true;
+            }
+            __result = result;
+            return false;
+        }
+
+        [HarmonyPatch(typeof(OperateMgr), nameof(OperateMgr.FusionCard),
+            new[] { typeof(BattleCardBase), typeof(bool), typeof(List<BattleCardBase>) })]
+        [HarmonyPrefix]
+        private static bool OperateMgr_FusionCard_Authority_Prefix(
+            BattleCardBase card,
+            bool isPlayer,
+            List<BattleCardBase> selectCards,
+            ref VfxBase __result)
+        {
+            if (!P2PRuntime.TryInterceptGuestFusion(
+                    card, isPlayer, selectCards, out VfxBase result))
+            {
+                return true;
+            }
+            __result = result;
+            return false;
+        }
+
+        [HarmonyPatch(typeof(OperateMgr), nameof(OperateMgr.Attack),
+            new[] { typeof(BattleCardBase), typeof(BattleCardBase), typeof(bool) })]
+        [HarmonyPrefix]
+        private static bool OperateMgr_Attack_Authority_Prefix(
+            [HarmonyArgument(0)] BattleCardBase attacker,
+            [HarmonyArgument(1)] BattleCardBase target,
+            bool isPlayer,
+            ref VfxBase __result)
+        {
+            if (!P2PRuntime.UsesNativeClientActionTiming)
+            {
+                P2PRuntime.PrepareAuthorityRandomAttackReplay(attacker, target);
+            }
+            if (!P2PRuntime.TryInterceptGuestAttack(
+                    attacker, target, isPlayer, out VfxBase result))
+            {
+                return true;
+            }
+            __result = result;
+            return false;
+        }
+
+        [HarmonyPatch(typeof(OperateMgr), nameof(OperateMgr.Attack),
+            new[] { typeof(BattleCardBase), typeof(BattleCardBase), typeof(bool) })]
+        [HarmonyPostfix]
+        private static void OperateMgr_Attack_Authority_Postfix()
+        {
+            if (!P2PRuntime.UsesNativeClientActionTiming)
+            {
+                P2PRuntime.ClearAuthorityRandomAttackReplay();
+            }
+        }
+
+        [HarmonyPatch(typeof(BattleManagerBase), nameof(BattleManagerBase.StableRandom),
+            new[] { typeof(int) })]
+        [HarmonyPostfix]
+        private static void BattleManagerBase_StableRandom_AuthorityAttack_Postfix(
+            int val,
+            ref int __result)
+        {
+            if (P2PRuntime.UsesNativeClientActionTiming)
+            {
+                return;
+            }
+            P2PRuntime.ObserveAuthorityRandomAttackRoll(val, __result);
+            P2PRuntime.OverrideAuthorityRandomAttackRoll(val, ref __result);
+        }
+
+        [HarmonyPatch(typeof(NetworkOperationCollection),
+            nameof(NetworkOperationCollection.TurnStartOperation))]
+        [HarmonyPrefix]
+        private static bool NetworkOperationCollection_TurnStartOperation_AuthorityReplay_Prefix(
+            NetworkOperationCollection __instance,
+            NetworkBattleDefine.NetworkBattleURI lastReceivedUri,
+            int lastReceivedTime)
+        {
+            if (!P2PRuntime.IsAuthorityLocalReplayActive)
+            {
+                return true;
+            }
+
+            return !P2PRuntime.TryProcessAuthorityTurnStart(__instance);
+        }
+
+        [HarmonyPatch(typeof(OperateReceive), nameof(OperateReceive.StartOperate))]
+        [HarmonyPrefix]
+        private static void OperateReceive_StartOperate_AuthorityReplay_Prefix()
+        {
+            P2PRuntime.MarkReceivedNativeBattleOperationStarted();
+        }
+
+        [HarmonyPatch(typeof(OperateMgr), nameof(OperateMgr.TurnEndOperation),
+            new[] { typeof(bool) })]
+        [HarmonyPrefix]
+        private static bool OperateMgr_TurnEndOperation_Authority_Prefix(
+            ref bool isPlayer,
+            ref VfxBase __result)
+        {
+            if (P2PRuntime.TryInterceptGuestTurnEnd(
+                    isPlayer, false, out VfxBase result))
+            {
+                __result = result;
+                return false;
+            }
+            if (P2PRuntime.IsAuthorityLocalReplayActive)
+            {
+                isPlayer = true;
+            }
+            return true;
+        }
+
+        // A Guest authority replay runs TurnEnd as the local BattlePlayer so
+        // the stock effect code updates the correct hand, UI, and history.
+        // NetworkStandardBattleMgr would then schedule its own
+        // TurnEndActions -> delayed TurnEnd transmission. The Host has already
+        // generated those two authoritative packets, so suppress only this
+        // sender-side continuation; do not suppress the actual TurnEnd logic.
+        [HarmonyPatch(typeof(NetworkStandardBattleMgr), "SendTurnEndAction")]
+        [HarmonyPrefix]
+        private static bool
+            NetworkStandardBattleMgr_SendTurnEndAction_AuthorityReplay_Prefix()
+        {
+            return !P2PRuntime.IsAuthorityLocalReplayActive;
+        }
+
+        [HarmonyPatch(typeof(NetworkStandardBattleMgr), "SendTurnEnd")]
+        [HarmonyPrefix]
+        private static bool
+            NetworkStandardBattleMgr_SendTurnEnd_AuthorityReplay_Prefix()
+        {
+            return !P2PRuntime.IsAuthorityLocalReplayActive;
+        }
+
+        // NetworkBattleManagerBase deliberately registers several action
+        // records only when the processor belongs to its local player.  In a
+        // Host-authoritative room the Host executes the Guest's operation on
+        // BattleEnemy, but still has to publish those records so the Guest can
+        // replay through the original NetworkBattleReceiver path.
+        [HarmonyPatch(typeof(NetworkBattleManagerBase),
+            nameof(NetworkBattleManagerBase.SetupActionProcessorEvent))]
+        [HarmonyPostfix]
+        private static void
+            NetworkBattleManagerBase_SetupActionProcessorEvent_Authority_Postfix(
+                NetworkBattleManagerBase __instance,
+                ActionProcessor processor,
+                bool isPlayer)
+        {
+            P2PRuntime.AttachAuthorityActionProcessorEvents(
+                __instance, processor);
+        }
+
+        [HarmonyPatch(typeof(PlayHandCardReflection), nameof(PlayHandCardReflection.Play),
+            new[] { typeof(BattlePlayerBase), typeof(bool), typeof(List<int>), typeof(bool) })]
+        [HarmonyPrefix]
+        private static void PlayHandCardReflection_Play_AuthorityReplay_Prefix(
+            ref BattlePlayerBase player,
+            ref bool isPlayer)
+        {
+            if (!P2PRuntime.IsAuthorityLocalReplayActive)
+            {
+                return;
+            }
+            NetworkBattleManagerBase manager = BattleManagerBase.GetIns() as NetworkBattleManagerBase;
+            if (manager != null)
+            {
+                player = manager.BattlePlayer;
+                isPlayer = true;
+            }
+        }
+
+        [HarmonyPatch(typeof(PlayHandCardReflection), nameof(PlayHandCardReflection.PlayAction),
+            new[] { typeof(bool), typeof(List<int>) })]
+        [HarmonyPrefix]
+        private static void PlayHandCardReflection_PlayAction_AuthorityReplay_Prefix(
+            ref bool isPlayer)
+        {
+            if (P2PRuntime.IsAuthorityLocalReplayActive)
+            {
+                isPlayer = true;
+            }
+        }
         [HarmonyPatch(
             typeof(PlayerControllerForOwn),
             MethodType.Constructor,
@@ -838,7 +1111,28 @@ namespace Shadowbus
         private static void PlayCardProcessor_End_Prefix(
             Wizard.Battle.Touch.PlayCardProcessor __instance)
         {
-            if (!P2PRuntime.IsActive || __instance == null)
+            RebindStalePlayCardTouchObject(__instance, "end");
+        }
+
+        [HarmonyPatch(
+            typeof(Wizard.Battle.Touch.PlayCardProcessor),
+            "CheckPlayCardInHand")]
+        [HarmonyPrefix]
+        private static void PlayCardProcessor_CheckPlayCardInHand_Prefix(
+            Wizard.Battle.Touch.PlayCardProcessor __instance)
+        {
+            // A newly drawn/generated card can be replaced by the post-action
+            // private-state adapter after its hand view has already captured
+            // the old object. The native method rejects that stale object
+            // before End() is reached, so repair it at the validation point.
+            RebindStalePlayCardTouchObject(__instance, "hand check");
+        }
+
+        private static void RebindStalePlayCardTouchObject(
+            Wizard.Battle.Touch.PlayCardProcessor processor,
+            string stage)
+        {
+            if (!P2PRuntime.IsActive || processor == null)
             {
                 return;
             }
@@ -848,7 +1142,7 @@ namespace Shadowbus
                 var actCardField = AccessTools.Field(
                     typeof(Wizard.Battle.Touch.PlayCardProcessor), "_actCard");
                 BattleCardBase staleCard =
-                    actCardField?.GetValue(__instance) as BattleCardBase;
+                    actCardField?.GetValue(processor) as BattleCardBase;
                 List<BattleCardBase> hand =
                     staleCard?.SelfBattlePlayer?.HandCardList;
                 if (staleCard == null || hand == null ||
@@ -872,9 +1166,9 @@ namespace Shadowbus
                     return;
                 }
 
-                actCardField.SetValue(__instance, currentCard);
-                Plugin.Logger.LogWarning(
-                    $"[P2P] Rebound stale fusion/metamorphose play-card object: " +
+                actCardField.SetValue(processor, currentCard);
+                Plugin.Logger.LogDebug(
+                    $"[P2P] Rebound stale play-card touch object during {stage}: " +
                     $"idx={staleCard.Index}, oldCardId={staleCard.CardId}, " +
                     $"currentCardId={currentCard.CardId}.");
             }
@@ -959,24 +1253,34 @@ namespace Shadowbus
         [HarmonyPrefix]
         private static void NetworkBattleReceiver_ReceivedMessage_Prefix(
             NetworkBattleDefine.NetworkBattleURI uri,
-            Dictionary<string, object> data)
+            Dictionary<string, object> data,
+            [HarmonyArgument(3)] ref bool isPlayer)
         {
             if (!P2PRuntime.IsActive)
             {
                 return;
             }
 
-            if (!TryRunReceiveMetadataStage(
+            bool prepared = TryRunReceiveMetadataStage(
                     "prepare metadata", uri, GetReceivePlayIndex(data),
                     () => P2PRuntime.PrepareNativeReceivedActionMetadata(
-                        uri, data)))
+                        uri, data));
+            if (!prepared)
             {
                 TryRunReceiveMetadataStage(
                     "cleanup after prepare failure", uri,
                     GetReceivePlayIndex(data),
                     () => P2PRuntime.CompleteNativeReceivedActionMetadata(
                         data, false));
+                return;
             }
+
+            // Let RealTimeNetworkBattleAgent perform its original
+            // SetNetworkInfo/sequence/receiver path. The only authority-specific
+            // adaptation is that a Host-approved Guest action is applied to the
+            // Guest's BattlePlayer instead of being interpreted as an opponent
+            // action by the stock client.
+            P2PRuntime.ApplyAuthorityReplayReceiverOwnership(data, ref isPlayer);
         }
 
         [HarmonyPatch(
@@ -1136,12 +1440,12 @@ namespace Shadowbus
                 return;
             }
 
-            // The native CardDataModel cannot carry generic skill values,
-            // fusion turns, or Super Skybound Art. Apply the P2P snapshot after
-            // the native replacement has copied all public fields and attached
-            // skills, so the resulting card is authoritative before it enters
-            // the hand/deck list.
-            P2PRuntime.ApplyReceivedHiddenCardState(receivedCard, true);
+            // A current action's snapshot is post-action state. Its identity
+            // was promoted into knownList before the stock replacement pass;
+            // apply the P2P-only fields only after that action has completed.
+            // Older/baseline snapshots still use the original immediate path.
+            P2PRuntime.ApplyReceivedHiddenCardStateAfterNativeReplacement(
+                receivedCard);
         }
 
         [HarmonyPatch(
@@ -1160,6 +1464,45 @@ namespace Shadowbus
 
             P2PRuntime.RepairDuplicateReceivedCardZoneIndices(
                 battlePlayer, __instance.CardIdx, __instance.CardId);
+        }
+
+        [HarmonyPatch(
+            typeof(ReplaceReceivedCard),
+            MethodType.Constructor,
+            new[] { typeof(NetworkBattleManagerBase), typeof(CardDataModel) })]
+        [HarmonyPostfix]
+        private static void ReplaceReceivedCard_Constructor_AuthorityReplay_Postfix(
+            ReplaceReceivedCard __instance,
+            CardDataModel cardData)
+        {
+            P2PRuntime.RememberAuthorityReceivedCardOwner(
+                __instance, cardData);
+        }
+
+        // NetworkBattleData.ReplaceReceivedCards is hard-coded by the native
+        // client to call ReplaceCard(BattleEnemy).  That is correct for a
+        // normal opponent packet, but an authority result is replayed through
+        // the local-player path on the Guest.  Its knownList contains both
+        // Guest-owned (isSelf=1) and Host-owned (isSelf=0) cards, so routing
+        // every replacement to BattleEnemy can replace the wrong card when
+        // both sides use the same card index.  Resolve the owner from the
+        // current authority payload before the native search runs.
+        [HarmonyPatch(typeof(ReplaceReceivedCard), nameof(ReplaceReceivedCard.ReplaceCard))]
+        [HarmonyPrefix]
+        private static void ReplaceReceivedCard_ReplaceCard_AuthorityReplay_Prefix(
+            ReplaceReceivedCard __instance,
+            ref BattlePlayerBase battlePlayer)
+        {
+            P2PRuntime.RouteAuthorityReceivedCard(__instance, ref battlePlayer);
+        }
+
+        [HarmonyPatch(typeof(ReplaceReceivedCard), nameof(ReplaceReceivedCard.SetPrivateCardSpellboost))]
+        [HarmonyPrefix]
+        private static void ReplaceReceivedCard_SetPrivateCardSpellboost_AuthorityReplay_Prefix(
+            ReplaceReceivedCard __instance,
+            ref BattlePlayerBase battlePlayer)
+        {
+            P2PRuntime.RouteAuthorityReceivedCard(__instance, ref battlePlayer);
         }
 
         [HarmonyPatch(
@@ -1189,6 +1532,90 @@ namespace Shadowbus
             {
                 Plugin.Logger.LogWarning(
                     "[P2P] Could not synchronize authoritative random targets: " +
+                    ex.Message);
+            }
+        }
+
+        [HarmonyPatch(
+            typeof(NetworkBattleGenericTool),
+            nameof(NetworkBattleGenericTool.LookForActionDataToTargetCard))]
+        [HarmonyPostfix]
+        private static void
+            NetworkBattleGenericTool_LookForActionDataToTargetCard_AuthorityReplay_Postfix(
+                BattleManagerBase battleManagerBase,
+                List<NetworkBattleReceiver.TargetData> actions,
+                ref List<BattleCardBase> __result)
+        {
+            if (!P2PRuntime.IsAuthorityLocalReplayActive ||
+                battleManagerBase == null || actions == null)
+            {
+                return;
+            }
+
+            try
+            {
+                // The native helper is intentionally hard-coded for an
+                // opponent action: isSelf resolves BattleEnemy and !isSelf
+                // resolves BattlePlayer. Authority replay runs the same
+                // operation as the local player, so invert that lookup while
+                // preserving the action-relative isSelf values in the packet.
+                __result = actions.Select(target => target == null
+                    ? null
+                    : target.IsSelf
+                        ? NetworkBattleGenericTool.GetIndexToCardBase(
+                            battleManagerBase,
+                            battleManagerBase.BattlePlayer,
+                            target.TargetIndex)
+                        : NetworkBattleGenericTool.GetIndexToCardBase(
+                            battleManagerBase,
+                            battleManagerBase.BattleEnemy,
+                            target.TargetIndex))
+                    .ToList();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning(
+                    "[P2P] Could not remap local authority action targets: " +
+                    ex.Message);
+            }
+        }
+
+        [HarmonyPatch(
+            typeof(NetworkBattleGenericTool),
+            nameof(NetworkBattleGenericTool.GetOpposingCardObjTarget))]
+        [HarmonyPostfix]
+        private static void
+            NetworkBattleGenericTool_GetOpposingCardObjTarget_AuthorityReplay_Postfix(
+                BattleManagerBase battleManagerBase,
+                List<NetworkBattleReceiver.TargetData> actions,
+                ref List<BattleCardBase> __result)
+        {
+            if (!P2PRuntime.IsAuthorityLocalReplayActive ||
+                battleManagerBase == null || actions == null)
+            {
+                return;
+            }
+
+            try
+            {
+                __result = actions
+                    .Where(target => target != null)
+                    .Select(target => target.IsSelf
+                        ? NetworkBattleGenericTool.GetIndexToCardBase(
+                            battleManagerBase,
+                            battleManagerBase.BattlePlayer,
+                            target.TargetIndex)
+                        : NetworkBattleGenericTool.GetIndexToCardBase(
+                            battleManagerBase,
+                            battleManagerBase.BattleEnemy,
+                            target.TargetIndex))
+                    .Where(card => card != null)
+                    .ToList();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning(
+                    "[P2P] Could not remap local authority opposing targets: " +
                     ex.Message);
             }
         }
@@ -1299,47 +1726,32 @@ namespace Shadowbus
                     return;
                 }
 
-                // Conditions are resolved by the action source. On the receiving
-                // peer consume the recorded boolean before any local hidden-zone
-                // reevaluation can change the execution path.
+                // Do not alter ordinary local/UI condition checks. In the
+                // restored native-timing model, the only remaining trusted
+                // private-zone fallback is for a concrete opponent action
+                // currently being processed by NetworkBattleReceiver.
+                if (!P2PRuntime.IsProcessingNativeReceivedBattleAction)
+                {
+                    return;
+                }
+
+                // A legacy authority result can carry the server-side boolean.
+                // New native-timing rounds do not emit that extension, but
+                // retain this narrow decoder so an already queued legacy frame
+                // is not reinterpreted as a fresh local condition.
                 if (P2PRuntime.TryGetAuthoritativeSkillConditionResult(
                         skill, isPrePlay, isSkipTarget, out bool authoritativeResult))
                 {
                     __result = authoritativeResult;
-                    return;
-                }
-                if (skill.SkillPrm.ownerCard.IsPlayer ||
-                    !UsesPrivateCardInformation(skill))
-                {
-                    P2PRuntime.ObserveAuthoritativeSkillConditionResult(
-                        skill, isPrePlay, isSkipTarget, __result);
-                    return;
                 }
 
-                // The official server supplies activate/count/highlander results
-                // for private zones. P2P deliberately shares those zones, so the
-                // peer can evaluate the original condition against the complete
-                // synchronized hand/deck instead of waiting for a server-only flag.
-                P2PRuntime.TryApplyPendingHiddenCardStates();
-                P2PRuntime.TryApplyPendingPlayerHistoryStates();
-                P2PRuntime.WarnIfPrivateConditionHasDummyCards(skill);
-                bool localResult = skill.ConditionFilterCollection.Filtering(
-                    playerInfoPair,
-                    skill.SkillPrm.ownerCard,
-                    option,
-                    skill.OptionValue,
-                    isPrePlay,
-                    skill,
-                    isSkipTarget);
-                if (__result != localResult)
-                {
-                    Plugin.Logger.LogDebug(
-                        $"[P2P] Replaced server-only private condition result for " +
-                        $"card idx={skill.SkillPrm.ownerCard.Index}, " +
-                        $"skill={skill.GetType().Name}: received={__result}, " +
-                        $"local={localResult}.");
-                }
-                __result = localResult;
+                // In the native protocol the sender has already recorded the
+                // condition result in RegisterActionManager. SendCardDataMaker
+                // serializes it into orderList/uList; NetworkBattleReceiver
+                // reconstructs SkillConditionCheckList before this method is
+                // called. Re-evaluating against the receiving client's hand,
+                // deck or history is a P2P-only semantic change and was the
+                // source of private-zone desync. Preserve the original result.
                 P2PRuntime.ObserveAuthoritativeSkillConditionResult(
                     skill, isPrePlay, isSkipTarget, __result);
             }
@@ -1349,20 +1761,6 @@ namespace Shadowbus
                     "[P2P] Could not evaluate a private hand/deck condition locally: " +
                     ex.Message);
             }
-        }
-
-        private static bool UsesPrivateCardInformation(SkillBase skill)
-        {
-            return RegisterSkillConditionCheck.IsSkillConditionCheck(skill) ||
-                RegisterSkillConditionCheck.IsPreprocessConditionCheck(skill) ||
-                RegisterSkillConditionCheck.DoesSkillUsePrivateCount(
-                    skill, false, false) ||
-                RegisterSkillConditionCheck.IsHighlander(
-                    skill.ConditionFilterCollection) ||
-                RegisterSkillConditionCheck.IsHighlanderPreprocessConditionCheck(
-                    skill) ||
-                skill.PreprocessList.Any(preprocess =>
-                    preprocess is NetworkSkillPreprocessConditionCheck);
         }
 
         [HarmonyPatch(typeof(ActionProcessor), "SetSkillConditionCheckeroptionSelectCards")]
@@ -1506,6 +1904,34 @@ namespace Shadowbus
                 return true;
             }
 
+            if (P2PRuntime.SuppressNativeBattleEmit(uri, onFinishedSend))
+            {
+                // Suppressed local replay still needs the stock OnAck timing.
+                // In particular, a terminal local PlayActions adds
+                // AckEmitBattleFinish after the native send returns. Queue an
+                // acknowledgement for the next main-thread update so that
+                // subscription is already installed, while no packet is sent
+                // to the peer. Turn-end sender continuations are separately
+                // skipped above because their delayed native TurnEnd would
+                // duplicate the Host-authored transition.
+                if (P2PRuntime.ShouldQueueSuppressedNativeBattleAcknowledgement)
+                {
+                    if (info == null)
+                    {
+                        info = new Dictionary<string, object>();
+                    }
+                    P2PRuntime.QueueAcknowledgement(
+                        __instance,
+                        uri,
+                        info,
+                        null,
+                        isGetableAck,
+                        isStockData,
+                        fixedSeqNumber);
+                }
+                return false;
+            }
+
             P2PRuntime.SetCurrentAgent(__instance, "EmitMsgPack");
             if (info == null)
             {
@@ -1534,6 +1960,11 @@ namespace Shadowbus
             if (!P2PRuntime.IsActive)
             {
                 return true;
+            }
+
+            if (P2PRuntime.SuppressNativeBattleInput())
+            {
+                return false;
             }
 
             P2PRuntime.SetCurrentAgent(__instance, "EmitHandData");

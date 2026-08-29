@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.IO;
@@ -17,6 +18,8 @@ namespace Shadowbus
                 TestConnectionCodes();
                 TestLocalDeckCodes();
                 TestJsonConversion();
+                TestAuthorityEnvelope();
+                TestAuthorityRequestValidation();
                 TestRoomRules();
                 TestTwoPickRuleFiles();
                 TestPerspectiveTransform();
@@ -24,6 +27,10 @@ namespace Shadowbus
                 TestHiddenSnapshotPerspectiveTransform();
                 TestBattleResults();
                 TestBattleProtocol();
+                TestHostAuthoritativeServer();
+                TestHostAuthoritativeRegisterState();
+                TestHostPrivateStateDeltaAndRandomCanonicalization();
+                TestPrivateStateFieldDeltaRoundTrip();
                 TestPlayerHistoryPolicy();
                 TestBattleStateDiagnostics();
                 TestDealState();
@@ -53,11 +60,34 @@ namespace Shadowbus
                 "TurnFusionCountInfo",
                 "EvolvedCards",
                 "GameTurnPlayCards",
-                "TurnDestroyCards"
+                "TurnDestroyCards",
+                "DestroyedWhenDestroyCards",
+                "ChoiceBraveCards",
+                "LastTargetCardsList"
             })
             {
                 Assert(synchronized.Contains(required),
                     "A persistent player-history list is no longer synchronized: " +
+                    required);
+            }
+
+            HashSet<string> synchronizedScalars = new HashSet<string>(
+                P2PPlayerHistoryPolicy.SynchronizedScalarNames,
+                StringComparer.Ordinal);
+            foreach (string required in new[]
+            {
+                "Turn",
+                "IsSelfTurn",
+                "Pp",
+                "PpTotal",
+                "CurrentEpCount",
+                "GameUsedPpCount",
+                "GameResonanceStartCount",
+                "_cumulativeEvolutionCount"
+            })
+            {
+                Assert(synchronizedScalars.Contains(required),
+                    "A native condition scalar is no longer synchronized: " +
                     required);
             }
 
@@ -68,15 +98,13 @@ namespace Shadowbus
                 "PredictionDamageRandomCards",
                 "PredictionBanishRandomCards",
                 "ReturnList",
-                "LastTargetCardsList",
                 "InHandCards",
                 "SkillDiscards",
                 "SelfDiscardList",
                 "SkillBanishCards",
                 "HealingCards",
                 "SkillSummonedCards",
-                "SummonedCards",
-                "DestroyedWhenDestroyCards"
+                "SummonedCards"
             })
             {
                 Assert(!synchronized.Contains(temporary),
@@ -338,6 +366,208 @@ namespace Shadowbus
                 "A JSON array was not converted to the expected list type.");
         }
 
+        private static void TestAuthorityEnvelope()
+        {
+            P2PWireMessage source = new P2PWireMessage
+            {
+                Type = P2PBattleProtocol.AuthorityRequestUri,
+                RequestId = "battle-guest-7",
+                ActionSeq = 7,
+                Protocol = P2PTransport.ProtocolVersion,
+                ModVersion = P2PTransport.ModVersion,
+                Authority = P2PTransport.AuthorityMode,
+                Data = new Dictionary<string, object>
+                {
+                    [P2PBattleProtocol.AuthorityActionKey] = "play",
+                    [P2PBattleProtocol.AuthorityCardIndexKey] = 12,
+                    [P2PBattleProtocol.AuthorityStateKey] =
+                        new Dictionary<string, object>
+                        {
+                            ["owner"] = 0,
+                            ["cards"] = new List<object>
+                            {
+                                new Dictionary<string, object>
+                                {
+                                    ["idx"] = 12,
+                                    ["cardId"] = 100001
+                                }
+                            }
+                        }
+                }
+            };
+
+            string json = Newtonsoft.Json.JsonConvert.SerializeObject(
+                source, P2PJson.Settings);
+            P2PWireMessage decoded = P2PJson.DeserializeMessage(json);
+            Assert(decoded.Type == P2PBattleProtocol.AuthorityRequestUri &&
+                decoded.RequestId == source.RequestId &&
+                decoded.ActionSeq == source.ActionSeq &&
+                decoded.Protocol == P2PTransport.ProtocolVersion &&
+                decoded.ModVersion == P2PTransport.ModVersion &&
+                decoded.Authority == P2PTransport.AuthorityMode,
+                "Authority envelope fields did not survive JSON round-trip.");
+            Assert(decoded.Data != null &&
+                decoded.Data[P2PBattleProtocol.AuthorityActionKey].ToString() == "play" &&
+                Convert.ToInt32(decoded.Data[
+                    P2PBattleProtocol.AuthorityCardIndexKey]) == 12,
+                "Authority request action fields did not survive JSON round-trip.");
+
+            Dictionary<string, object> result = new Dictionary<string, object>
+            {
+                [P2PBattleProtocol.AuthorityHiddenStatesKey] = new List<object>
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["owner"] = 0,
+                        ["cards"] = new List<object>(),
+                        ["removed"] = new List<object> { 12 }
+                    },
+                    new Dictionary<string, object>
+                    {
+                        ["owner"] = 1,
+                        ["cards"] = new List<object>(),
+                        ["removed"] = new List<object>()
+                    }
+                },
+                [P2PBattleProtocol.AuthorityPlayerHistoryStatesKey] =
+                    new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["owner"] = 0,
+                            ["revision"] = 3,
+                            ["scalars"] = new Dictionary<string, object>()
+                        }
+                    }
+            };
+            Dictionary<string, object> flipped =
+                P2PMessageTransform.FlipPerspective(result);
+            Assert(flipped.ContainsKey(P2PBattleProtocol.AuthorityHiddenStatesKey) &&
+                flipped.ContainsKey(P2PBattleProtocol.AuthorityPlayerHistoryStatesKey),
+                "Authority absolute-owner snapshots were lost during perspective conversion.");
+            Dictionary<string, object> hidden =
+                ((List<object>)flipped[P2PBattleProtocol.AuthorityHiddenStatesKey])[0]
+                    as Dictionary<string, object>;
+            Assert(Convert.ToInt32(hidden["owner"]) == 0,
+                "Authority hidden-state owner was incorrectly perspective-flipped.");
+        }
+
+        private static void TestAuthorityRequestValidation()
+        {
+            P2PWireMessage valid = new P2PWireMessage
+            {
+                Type = P2PBattleProtocol.AuthorityRequestUri,
+                RequestId = "battle-guest-1",
+                BattleId = "battle-1",
+                ViewerId = 24680,
+                Data = new Dictionary<string, object>
+                {
+                    [P2PBattleProtocol.AuthorityRequestIdKey] = "battle-guest-1",
+                    [P2PBattleProtocol.AuthoritySourceKey] = 0,
+                    [P2PBattleProtocol.AuthorityActionKey] = "play",
+                    ["bid"] = "battle-1"
+                }
+            };
+            Assert(P2PBattleProtocol.TryValidateAuthorityRequest(
+                    valid, "battle-1", 24680, out string validError) &&
+                string.IsNullOrEmpty(validError),
+                "A valid authority request envelope was rejected: " + validError);
+
+            P2PWireMessage staleBattle = new P2PWireMessage
+            {
+                Type = valid.Type,
+                RequestId = valid.RequestId,
+                BattleId = "battle-old",
+                ViewerId = valid.ViewerId,
+                Data = P2PJson.CloneDictionary(valid.Data)
+            };
+            Assert(!P2PBattleProtocol.TryValidateAuthorityRequest(
+                    staleBattle, "battle-1", 24680, out string staleError) &&
+                staleError.Contains("different battle"),
+                "A stale authority request was not rejected by BattleId.");
+
+            P2PWireMessage wrongViewer = new P2PWireMessage
+            {
+                Type = valid.Type,
+                RequestId = valid.RequestId,
+                BattleId = valid.BattleId,
+                ViewerId = 13579,
+                Data = P2PJson.CloneDictionary(valid.Data)
+            };
+            Assert(!P2PBattleProtocol.TryValidateAuthorityRequest(
+                    wrongViewer, "battle-1", 24680, out string viewerError) &&
+                viewerError.Contains("unknown Guest"),
+                "An authority request from an unknown Guest was accepted.");
+
+            Dictionary<string, object> wrongSourceData =
+                P2PJson.CloneDictionary(valid.Data);
+            wrongSourceData[P2PBattleProtocol.AuthoritySourceKey] = 1;
+            P2PWireMessage wrongSource = new P2PWireMessage
+            {
+                Type = valid.Type,
+                RequestId = valid.RequestId,
+                BattleId = valid.BattleId,
+                ViewerId = valid.ViewerId,
+                Data = wrongSourceData
+            };
+            Assert(!P2PBattleProtocol.TryValidateAuthorityRequest(
+                    wrongSource, "battle-1", 24680, out string sourceError) &&
+                sourceError.Contains("source=0"),
+                "An authority request with a Host source was accepted.");
+
+            Dictionary<string, object> mismatchedIdData =
+                P2PJson.CloneDictionary(valid.Data);
+            mismatchedIdData[P2PBattleProtocol.AuthorityRequestIdKey] =
+                "battle-guest-other";
+            P2PWireMessage mismatchedId = new P2PWireMessage
+            {
+                Type = valid.Type,
+                RequestId = valid.RequestId,
+                BattleId = valid.BattleId,
+                ViewerId = valid.ViewerId,
+                Data = mismatchedIdData
+            };
+            Assert(!P2PBattleProtocol.TryValidateAuthorityRequest(
+                    mismatchedId, "battle-1", 24680, out string idError) &&
+                idError.Contains("requestId"),
+                "A requestId mismatch between envelope and payload was accepted.");
+
+            Dictionary<string, object> stalePayloadData =
+                P2PJson.CloneDictionary(valid.Data);
+            stalePayloadData["bid"] = "battle-old";
+            P2PWireMessage stalePayload = new P2PWireMessage
+            {
+                Type = valid.Type,
+                RequestId = valid.RequestId,
+                BattleId = valid.BattleId,
+                ViewerId = valid.ViewerId,
+                Data = stalePayloadData
+            };
+            Assert(!P2PBattleProtocol.TryValidateAuthorityRequest(
+                    stalePayload, "battle-1", 24680,
+                    out string payloadBattleError) &&
+                payloadBattleError.Contains("payload targeted a different battle"),
+                "A stale payload battle ID was accepted.");
+
+            Dictionary<string, object> unsupportedActionData =
+                P2PJson.CloneDictionary(valid.Data);
+            unsupportedActionData[P2PBattleProtocol.AuthorityActionKey] =
+                "retire";
+            P2PWireMessage unsupportedAction = new P2PWireMessage
+            {
+                Type = valid.Type,
+                RequestId = valid.RequestId,
+                BattleId = valid.BattleId,
+                ViewerId = valid.ViewerId,
+                Data = unsupportedActionData
+            };
+            Assert(!P2PBattleProtocol.TryValidateAuthorityRequest(
+                    unsupportedAction, "battle-1", 24680,
+                    out string unsupportedActionError) &&
+                unsupportedActionError.Contains("unsupported action"),
+                "An unsupported authority action was accepted.");
+        }
+
         private static void TestRoomRules()
         {
             P2PRoomRules rules = new P2PRoomRules();
@@ -544,6 +774,34 @@ namespace Shadowbus
                 ((List<object>)opponentLeaderAttack["oppoTargetList"])[0];
             Assert(Convert.ToInt32(attackTarget["isSelf"]) == 0,
                 "An opponent leader attack was redirected to the acting side.");
+
+            Dictionary<string, object> authorityLocalAttack =
+                new Dictionary<string, object>
+                {
+                    ["targetList"] = new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["targetIdx"] = 35,
+                            ["isSelf"] = 0
+                        }
+                    }
+                };
+            P2PMessageTransform.NormalizeAuthorityLocalReplayMessage(
+                authorityLocalAttack);
+            Assert(!authorityLocalAttack.ContainsKey("targetList") &&
+                authorityLocalAttack.ContainsKey("oppoTargetList"),
+                "A local authority attack did not use the server-compatible opponent target field.");
+            List<object> authorityTargets =
+                authorityLocalAttack["oppoTargetList"] as List<object>;
+            Assert(authorityTargets != null && authorityTargets.Count == 1,
+                "The local authority attack target list was malformed.");
+            Dictionary<string, object> authorityAttackTarget =
+                authorityTargets[0] as Dictionary<string, object>;
+            Assert(authorityAttackTarget != null &&
+                Convert.ToInt32(authorityAttackTarget["targetIdx"]) == 35 &&
+                Convert.ToInt32(authorityAttackTarget["isSelf"]) == 0,
+                "Authority target data changed while converting it to the native server field.");
         }
 
         private static void TestSkillTargetPerspectiveTransform()
@@ -561,6 +819,26 @@ namespace Shadowbus
                         {
                             ["skillTarget"] = "10007"
                         }
+                    }
+                },
+                ["uList"] = new List<object>
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["idxList"] = new List<object> { 7 },
+                        ["from"] = 10,
+                        ["to"] = 30,
+                        ["isSelf"] = 1
+                    }
+                },
+                ["uList"] = new List<object>
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["idxList"] = new List<object> { 7 },
+                        ["from"] = 10,
+                        ["to"] = 30,
+                        ["isSelf"] = 1
                     }
                 }
             };
@@ -746,6 +1024,7 @@ namespace Shadowbus
                         ["preprocess"] = new List<object> { 1, 0 }
                     }
                 },
+                [P2PBattleProtocol.AuthorityResultActionIdKey] = 42,
                 [P2PBattleProtocol.ActionManifestKey] = new Dictionary<string, object>
                 {
                     ["version"] = P2PBattleProtocol.ActionManifestVersion,
@@ -885,6 +1164,9 @@ namespace Shadowbus
                 Convert.ToInt32(preprocessResults[0]) == 1 &&
                 Convert.ToInt32(preprocessResults[1]) == 0,
                 "Authoritative private skill evaluation was perspective-flipped.");
+            Assert(Convert.ToInt32(flipped[
+                    P2PBattleProtocol.AuthorityResultActionIdKey]) == 42,
+                "Authority replay action ID was perspective-flipped or lost.");
             Dictionary<string, object> manifest =
                 (Dictionary<string, object>)flipped[P2PBattleProtocol.ActionManifestKey];
             Dictionary<string, object> manifestEvaluation =
@@ -1028,13 +1310,19 @@ namespace Shadowbus
             P2PBattleResultPair hostRetired = P2PBattleResult.FromHostLocalResult(106);
             Assert(hostRetired.Host == 106 && hostRetired.Guest == 105,
                 "A host retirement produced the wrong winner.");
+            P2PBattleResultPair guestRetiredExplicit =
+                P2PBattleResult.FromRetirement(false);
+            Assert(guestRetiredExplicit.Host == P2PBattleResult.RetireWin &&
+                guestRetiredExplicit.Guest == P2PBattleResult.RetireLose,
+                "The explicit Host retirement result mapping is incorrect.");
 
             P2PBattleResultPair guestRetired =
                 P2PBattleResult.FromLocalResult(false, 106);
             Assert(guestRetired.Host == 105 && guestRetired.Guest == 106,
                 "A guest retirement produced the wrong winner.");
 
-            Assert(P2PBattleResult.Invert(201) == 202,
+            Assert(P2PBattleResult.Invert(P2PBattleResult.DisconnectWin) ==
+                    P2PBattleResult.DisconnectLose,
                 "A peer disconnect was not converted to a local victory result.");
             Assert(P2PBattleResult.Invert(1) == 1,
                 "A non-paired result code was unexpectedly changed.");
@@ -1042,10 +1330,19 @@ namespace Shadowbus
                 P2PBattleResult.IsPairedResult(208) &&
                 !P2PBattleResult.IsPairedResult(0),
                 "Final paired battle result validation is incorrect.");
+            Assert(P2PBattleResult.IsTerminalResult(210) &&
+                !P2PBattleResult.IsTerminalResult(209),
+                "Reserved max-turn and non-terminal result handling is incorrect.");
+            Assert(P2PBattleResult.TryCreateResultPair(true, 210,
+                    out P2PBattleResultPair maxTurnResult) &&
+                maxTurnResult.Host == 210 && maxTurnResult.Guest == 210,
+                "Max-turn result was incorrectly inverted between Host and Guest.");
             Assert(P2PBattleResult.ResolveLocalResultAfterDisconnect(true, 0) == 106,
                 "A locally retired player was awarded a disconnect victory.");
             Assert(P2PBattleResult.ResolveLocalResultAfterDisconnect(false, 102) == 102,
                 "A known local defeat was overwritten after disconnect.");
+            Assert(P2PBattleResult.ResolveLocalResultAfterDisconnect(false, 210) == 210,
+                "A known terminal max-turn result was overwritten after disconnect.");
             Assert(P2PBattleResult.ResolveLocalResultAfterDisconnect(false, 0) == 201,
                 "An unresolved peer disconnect did not award the connected player.");
         }
@@ -1059,6 +1356,7 @@ namespace Shadowbus
             Assert(P2PBattleProtocol.GetRoute("Echo") == P2PBattleRoute.Consume,
                 "A consistency echo was incorrectly delivered as a battle operation.");
             Assert(P2PBattleProtocol.RequiresActiveTurnState("TurnEnd") &&
+                P2PBattleProtocol.RequiresActiveTurnState("TurnEndFinal") &&
                 P2PBattleProtocol.RequiresActiveTurnState("TurnStart"),
                 "Turn transition messages did not activate the runtime turn state.");
             Assert(P2PBattleProtocol.CarriesBattleStateCheckpoint("TurnEndActions") &&
@@ -2347,6 +2645,624 @@ namespace Shadowbus
                     $"Fusion #{fusionNumber} did not preserve its N-1/N " +
                     "cumulative-state boundary.");
             }
+        }
+
+        private static void TestHostAuthoritativeServer()
+        {
+            P2PAuthoritativeServer.Reset();
+            int stored = P2PAuthoritativeServer.RememberPrivateStateSnapshot(
+                new Dictionary<string, object>
+                {
+                    ["owner"] = 0,
+                    ["cards"] = new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["idx"] = 7,
+                            ["cardId"] = 777001,
+                            ["cost"] = 3
+                        }
+                    }
+                });
+            Assert(stored == 1,
+                "The Host did not retain a Guest private-card baseline.");
+
+            Dictionary<string, object> request = new Dictionary<string, object>
+            {
+                ["uri"] = "PlayActions",
+                ["playIdx"] = 7,
+                ["type"] = 30,
+                ["targetList"] = new List<object>
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["targetIdx"] = 8,
+                        ["isSelf"] = 0
+                    }
+                },
+                ["orderList"] = new List<object>
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["move"] = new Dictionary<string, object>
+                        {
+                            ["idx"] = 7,
+                            ["isSelf"] = 1,
+                            ["from"] = 10,
+                            ["to"] = 20,
+                            ["setAtk"] = 4,
+                            ["spellboost"] = 2,
+                            ["attachTarget"] = "1,3",
+                            ["skill"] = "11|17|2"
+                        },
+                        ["activate"] = 1,
+                        ["count"] = 2,
+                        ["param"] = 9
+                    }
+                },
+                ["uList"] = new List<object>
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["idxList"] = new List<object> { 7 },
+                        ["from"] = 10,
+                        ["to"] = 30,
+                        ["isSelf"] = 1
+                    }
+                }
+            };
+
+            Assert(P2PAuthoritativeServer.TryCreateAction(
+                    false, 200, request, out P2PHostAuthoritativeAction action,
+                    out string error),
+                "The Host rejected a valid native PlayActions request: " + error);
+            Assert(action.ServerActionId == 1 &&
+                action.Request.Data.ContainsKey("targetList") &&
+                !action.Request.Data.ContainsKey("oppoTargetList"),
+                "The request object was mutated into a server response.");
+            Assert(action.ServerResponse.ContainsKey("oppoTargetList") &&
+                !action.ServerResponse.ContainsKey("targetList") &&
+                Convert.ToInt32(action.ServerResponse[
+                    P2PAuthoritativeServer.ServerActionIdKey]) == 1 &&
+                Convert.ToInt32(action.ServerResponse[
+                    P2PAuthoritativeServer.ServerStateRevisionKey]) == 1,
+                "The Host did not create the required opponent response envelope.");
+            int firstActionRevision = P2PAuthoritativeServer.StateRevision;
+
+            Dictionary<string, object> conditionRequest =
+                new Dictionary<string, object>
+                {
+                    ["uri"] = "PlayActions",
+                    ["playIdx"] = 7,
+                    ["type"] = 30,
+                    [P2PBattleProtocol.ActionManifestKey] =
+                        new Dictionary<string, object>
+                        {
+                            ["p2pAuthoritativeSkillEvaluations"] =
+                                new List<object> { new Dictionary<string, object>() }
+                        },
+                    ["p2pAuthoritativeSkillEvaluations"] =
+                        new List<object> { new Dictionary<string, object>() },
+                    ["p2pAuthoritativeSkillTargets"] =
+                        new List<object> { new Dictionary<string, object>() },
+                    ["orderList"] = new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["skillConditionCheck"] =
+                                new Dictionary<string, object>
+                                {
+                                    ["idx"] = 7,
+                                    ["isSelf"] = 1,
+                                    ["activate"] = 1,
+                                    ["count"] = 3
+                                }
+                        },
+                        new Dictionary<string, object>
+                        {
+                            ["move"] = new Dictionary<string, object>
+                            {
+                                ["idx"] = 7,
+                                ["isSelf"] = 1,
+                                ["from"] = 10,
+                                ["to"] = 20
+                            }
+                        }
+                    }
+                };
+            Assert(P2PAuthoritativeServer.TryCreateAction(
+                    false, 200, conditionRequest,
+                    out P2PHostAuthoritativeAction conditionAction,
+                    out error),
+                "The Host rejected a condition-bearing native request: " + error);
+            List<object> conditionResponseOrders =
+                conditionAction.ServerResponse["orderList"] as List<object>;
+            Assert(conditionResponseOrders != null &&
+                !conditionResponseOrders.OfType<Dictionary<string, object>>()
+                    .Any(entry => entry.ContainsKey("skillConditionCheck")) &&
+                conditionResponseOrders.OfType<Dictionary<string, object>>()
+                    .Any(entry => entry.ContainsKey("move")) &&
+                conditionRequest["orderList"] is List<object> originalConditionOrders &&
+                originalConditionOrders.OfType<Dictionary<string, object>>()
+                    .Any(entry => entry.ContainsKey("skillConditionCheck")),
+                "The Host did not isolate client private condition results while " +
+                "preserving the original request object and native movement data.");
+            Assert(!conditionAction.ServerResponse.ContainsKey(
+                        P2PBattleProtocol.ActionManifestKey) &&
+                    !conditionAction.ServerResponse.ContainsKey(
+                        "p2pAuthoritativeSkillEvaluations") &&
+                    !conditionAction.ServerResponse.ContainsKey(
+                        "p2pAuthoritativeSkillTargets") &&
+                conditionRequest.ContainsKey(P2PBattleProtocol.ActionManifestKey),
+                "The Host did not isolate compatibility evaluation manifests from " +
+                "the native request boundary.");
+
+            List<object> responseOrders = action.ServerResponse["orderList"]
+                as List<object>;
+            Dictionary<string, object> responseOrder = responseOrders?
+                .OfType<Dictionary<string, object>>().SingleOrDefault();
+            Assert(responseOrder != null &&
+                Convert.ToInt32(responseOrder["activate"]) == 1 &&
+                Convert.ToInt32(responseOrder["count"]) == 2 &&
+                Convert.ToInt32(responseOrder["param"]) == 9,
+                "The Host response lost native condition/validation fields.");
+
+            List<object> known = action.ServerResponse["knownList"] as List<object>;
+            Dictionary<string, object> knownCard = known?
+                .OfType<Dictionary<string, object>>()
+                .SingleOrDefault(card => Convert.ToInt32(card["idx"]) == 7);
+            Assert(knownCard != null &&
+                Convert.ToInt32(knownCard["cardId"]) == 777001 &&
+                Convert.ToInt32(knownCard["isSelf"]) == 0 &&
+                Convert.ToInt32(knownCard["cost"]) == 3 &&
+                Convert.ToInt32(knownCard["setAtk"]) == 4 &&
+                Convert.ToInt32(knownCard["spellboost"]) == 2 &&
+                knownCard["attachTarget"].ToString() == "1,3",
+                "The Host did not inject cached identity and native card state into knownList.");
+            Dictionary<string, object> responseUnapproved =
+                (action.ServerResponse["uList"] as List<object>)?
+                    .OfType<Dictionary<string, object>>()
+                    .SingleOrDefault();
+            Assert(responseUnapproved != null &&
+                responseUnapproved["cardId"].ToString() == "777001" &&
+                responseUnapproved["cost"].ToString() == "3" &&
+                responseUnapproved["skill"].ToString() == "11|17|2" &&
+                responseUnapproved["attachTarget"].ToString() == "1,3",
+                "The Host did not enrich missing RegisterUnapproved fields from its ledger.");
+            Assert(P2PAuthoritativeServer.TryGetCardZone(0, 7, out int zone) &&
+                    zone == 20 && Convert.ToInt32(action.ServerResponse[
+                        P2PAuthoritativeServer.ServerStateRevisionKey]) ==
+                        firstActionRevision,
+                "The Host did not update the authoritative card zone/revision: zone=" +
+                zone + ", revision=" + P2PAuthoritativeServer.StateRevision);
+            IReadOnlyList<Dictionary<string, object>> history =
+                P2PAuthoritativeServer.GetActionHistorySnapshot();
+            Assert(history.Any(entry => Convert.ToInt32(entry["owner"]) == 0 &&
+                    Convert.ToInt32(entry["idx"]) == 7 &&
+                    Convert.ToInt32(entry["to"]) == 20),
+                "The Host did not record the native card movement history.");
+            IReadOnlyDictionary<string, int> counters =
+                P2PAuthoritativeServer.GetHistoryCounters(0);
+            Assert(counters.ContainsKey("play") && counters["play"] >= 1,
+                "The Host did not update the native play history counter.");
+
+            Assert(P2PAuthoritativeServer.TryCreateAction(
+                    false, 200, new Dictionary<string, object>
+                    {
+                        ["uri"] = "PlayActions",
+                        ["playIdx"] = 7,
+                        ["type"] = 30
+                    }, out P2PHostAuthoritativeAction laterAction, out error),
+                "The Host rejected a later native action: " + error);
+            List<object> laterKnown = laterAction.ServerResponse["knownList"]
+                as List<object>;
+            Dictionary<string, object> laterCard = laterKnown?
+                .OfType<Dictionary<string, object>>()
+                .SingleOrDefault(card => Convert.ToInt32(card["idx"]) == 7);
+            Assert(laterCard != null &&
+                Convert.ToInt32(laterCard["setAtk"]) == 4 &&
+                Convert.ToInt32(laterCard["spellboost"]) == 2 &&
+                laterCard["attachTarget"].ToString() == "1,3",
+                "The Host did not retain native hand/deck mutation fields across actions.");
+
+            Assert(P2PAuthoritativeServer.TryCreateDelivery(action,
+                    out P2PServerBattleDelivery delivery) && delivery.ToHost &&
+                delivery.ServerActionId == action.ServerActionId,
+                "The Host did not route the server response to the opposing client.");
+        }
+
+        private static void TestHostAuthoritativeRegisterState()
+        {
+            P2PAuthoritativeServer.Reset();
+            int stored = P2PAuthoritativeServer.RememberPrivateStateSnapshot(
+                new Dictionary<string, object>
+                {
+                    ["owner"] = 0,
+                    ["cards"] = new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["idx"] = 1, ["cardId"] = 1001, ["cost"] = 4
+                        },
+                        new Dictionary<string, object>
+                        {
+                            ["idx"] = 2, ["cardId"] = 1002, ["cost"] = 2
+                        },
+                        new Dictionary<string, object>
+                        {
+                            ["idx"] = 3, ["cardId"] = 1003, ["cost"] = 1
+                        }
+                    }
+                });
+            Assert(stored == 3, "The register-state baseline was incomplete.");
+
+            Dictionary<string, object> request = new Dictionary<string, object>
+            {
+                ["uri"] = "PlayActions",
+                ["playIdx"] = 1,
+                ["type"] = 30,
+                ["knownList"] = new List<object>
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["idx"] = new List<object> { 1, 3 },
+                        ["isSelf"] = 1
+                    }
+                },
+                ["orderList"] = new List<object>
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["move"] = new Dictionary<string, object>
+                        {
+                            // RegisterActionBase.MakeSendData uses idx for a
+                            // list; this is the representation that previously
+                            // bypassed the Host zone ledger.
+                            ["idx"] = new List<object> { 1, 3 },
+                            ["isSelf"] = 1,
+                            ["from"] = 10,
+                            ["to"] = 20,
+                            ["skill"] = "11|17|2",
+                            ["skillKeyCardIdx"] = new List<object> { 7 },
+                            ["randomTargetIdx"] = new List<object> { 41, 42 },
+                            ["attachTarget"] = "3,5",
+                            ["isInvoke"] = 1
+                        }
+                    },
+                    new Dictionary<string, object>
+                    {
+                        ["fusion"] = new Dictionary<string, object>
+                        {
+                            ["idx"] = new List<object> { 1 },
+                            ["ingredients"] = new List<object> { 2 },
+                            ["isSelf"] = 1
+                        }
+                    }
+                }
+            };
+
+            Assert(P2PAuthoritativeServer.TryCreateAction(
+                    false, 200, request,
+                    out P2PHostAuthoritativeAction action,
+                    out string error),
+                "The Host rejected a list-based native register action: " +
+                error);
+            Assert(P2PAuthoritativeServer.TryGetCardZone(0, 1,
+                    out int targetZone) && targetZone == 20 &&
+                P2PAuthoritativeServer.TryGetCardZone(0, 3,
+                    out int secondZone) && secondZone == 20,
+                "The Host did not apply all idx-list movement entries.");
+            Assert(P2PAuthoritativeServer.TryGetCardZone(0, 2,
+                    out int ingredientZone) &&
+                ingredientZone == P2PAuthoritativeServer.ZoneFusionIngredient,
+                "The Host did not record the fusion ingredient zone.");
+            Assert(P2PAuthoritativeServer.GetFusionCount(0) == 1,
+                "The Host did not advance the native fusion counter.");
+            List<object> canonicalKnown = action.ServerResponse["knownList"] as List<object>;
+            Assert(canonicalKnown != null &&
+                canonicalKnown.OfType<Dictionary<string, object>>()
+                    .Any(entry => entry.TryGetValue("idx", out object idx) &&
+                        Convert.ToInt32(idx) == 1 &&
+                        Convert.ToInt32(entry["cardId"]) == 1001) &&
+                !canonicalKnown.OfType<Dictionary<string, object>>()
+                    .Any(entry => entry.TryGetValue("idxList", out object raw) &&
+                        raw is IEnumerable values && values.Cast<object>()
+                            .Any(value => Convert.ToInt32(value) == 1)),
+                "The Host did not split a grouped knownList placeholder into a " +
+                "unique scalar identity record.");
+
+            Assert(P2PAuthoritativeServer.TryGetCardState(0, 1,
+                    out Dictionary<string, object> state) &&
+                Convert.ToInt32(state["skillCardIdx"]) == 11 &&
+                Convert.ToInt32(state["publishedActiveSkillCount"]) == 17 &&
+                Convert.ToInt32(state["movement"]) == 2 &&
+                state["attachedSkillsPublishCount"] is List<object> attached &&
+                attached.Select(Convert.ToInt32).SequenceEqual(new[] { 3, 5 }) &&
+                ((List<object>)state["fusion"]).Count == 1,
+                "The complete RegisterUnapproved metadata was not retained.");
+
+            IReadOnlyList<Dictionary<string, object>> registers =
+                P2PAuthoritativeServer.GetRegisterHistorySnapshot();
+            Assert(registers.Any(entry =>
+                    entry.TryGetValue("kind", out object kind) &&
+                    kind.ToString() == "move") &&
+                registers.Any(entry =>
+                    entry.TryGetValue("kind", out object kind) &&
+                    kind.ToString() == "fusion"),
+                "Native register history did not retain move and fusion entries.");
+            Assert(action.ServerResponse.ContainsKey("knownList"),
+                "The Host response lost the native knownList boundary.");
+        }
+
+        private static void TestHostPrivateStateDeltaAndRandomCanonicalization()
+        {
+            P2PAuthoritativeServer.Reset();
+            Assert(P2PAuthoritativeServer.RememberPrivateStateSnapshot(
+                    new Dictionary<string, object>
+                    {
+                        ["owner"] = 0,
+                        ["cards"] = new List<object>
+                        {
+                            new Dictionary<string, object>
+                            {
+                                ["idx"] = 8,
+                                ["cardId"] = 8008,
+                                ["cost"] = 5
+                            }
+                        }
+                    }) == 1,
+                "The Host delta test baseline was not stored.");
+
+            Dictionary<string, object> deltaRequest =
+                new Dictionary<string, object>
+                {
+                    ["uri"] = "PlayActions",
+                    ["playIdx"] = 8,
+                    ["type"] = 30,
+                    ["p2pHiddenOwner"] = 0,
+                    ["p2pHiddenCards"] = new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["idx"] = 8,
+                            ["cardId"] = 8008,
+                            ["cost"] = 1,
+                            ["p2pGenericKeys"] = new Dictionary<string, object>
+                            {
+                                ["mechanical"] = 1
+                            },
+                            ["randomTargetIdx"] = new List<object> { 41, 42 }
+                        },
+                        new Dictionary<string, object>
+                        {
+                            ["idx"] = 9,
+                            ["cardId"] = 9009,
+                            ["cost"] = 2
+                        }
+                    },
+                    ["p2pPlayerHistory"] = new Dictionary<string, object>
+                    {
+                        ["owner"] = 0,
+                        ["revision"] = 3,
+                        ["scalars"] = new Dictionary<string, object>
+                        {
+                            ["GameResonanceStartCount"] = 2,
+                            ["_cumulativeEvolutionCount"] = 1
+                        },
+                        ["lists"] = new Dictionary<string, object>()
+                    },
+                    ["p2pPlayerHistoryBefore"] = new Dictionary<string, object>
+                    {
+                        ["owner"] = 0,
+                        ["revision"] = 2,
+                        ["scalars"] = new Dictionary<string, object>(),
+                        ["lists"] = new Dictionary<string, object>()
+                    },
+                    ["uList"] = new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["idx"] = 8,
+                            ["isSelf"] = 1,
+                            ["from"] = 10,
+                            ["to"] = 20
+                        }
+                    }
+                };
+
+            Assert(P2PAuthoritativeServer.TryCreateAction(
+                    false, 200, deltaRequest,
+                    out P2PHostAuthoritativeAction deltaAction,
+                    out string error),
+                "The Host rejected a private-state delta request: " + error);
+            Assert(P2PAuthoritativeServer.TryGetCardState(0, 8,
+                    out Dictionary<string, object> state) &&
+                Convert.ToInt32(state["cost"]) == 1 &&
+                state.ContainsKey("p2pGenericKeys"),
+                "The Host ledger did not absorb the incremental private-card state.");
+
+            List<object> deltaCards = deltaAction.ServerResponse
+                .TryGetValue("p2pHiddenCards", out object rawDeltaCards) &&
+                rawDeltaCards is IEnumerable deltaValues &&
+                !(rawDeltaCards is string)
+                ? deltaValues.Cast<object>().ToList()
+                : null;
+            Assert(deltaCards != null && deltaCards.Count > 0,
+                "The Host response did not retain the private-state delta.");
+            Assert(P2PAuthoritativeServer.TryGetPlayerHistoryState(0,
+                    out Dictionary<string, object> history) &&
+                Convert.ToInt32(history["revision"]) == 3,
+                "The Host did not retain the revisioned player-history state.");
+
+            Dictionary<string, object> responseUList =
+                (deltaAction.ServerResponse["uList"] as List<object>)?
+                    .OfType<Dictionary<string, object>>().SingleOrDefault();
+            Assert(responseUList != null &&
+                responseUList["randomTargetIdx"] is List<object> randomTargets &&
+                randomTargets.Select(Convert.ToInt32).SequenceEqual(new[] { 41, 42 }),
+                "The native randomTargetIdx result was not canonicalized in uList.");
+            Assert(P2PAuthoritativeServer.ValidateAndRecordNativeRandomResults(
+                    new Dictionary<string, object>
+                    {
+                        ["uList"] = new List<object>
+                        {
+                            new Dictionary<string, object>
+                            {
+                                ["randomTargetIdx"] = 9
+                            }
+                        }
+                    },
+                    77,
+                    false,
+                    out error),
+                "The Host rejected a valid scalar native random result: " + error);
+            IReadOnlyList<Dictionary<string, object>> randomHistory =
+                P2PAuthoritativeServer.GetRandomResultHistorySnapshot();
+            Assert(randomHistory.Count > 0 &&
+                randomHistory.Last()["values"] is List<object> recordedRandom &&
+                recordedRandom.Select(Convert.ToInt32).SequenceEqual(new[] { 9 }),
+                "The Host did not retain the native random result audit entry.");
+            Assert(!P2PAuthoritativeServer.ValidateAndRecordNativeRandomResults(
+                    new Dictionary<string, object>
+                    {
+                        ["uList"] = new List<object>
+                        {
+                            new Dictionary<string, object>
+                            {
+                                ["randomTargetIdx"] = new List<object> { -1 }
+                            }
+                        }
+                    },
+                    78,
+                    false,
+                    out error) &&
+                error.Contains("negative"),
+                "The Host accepted an invalid native random result.");
+            IReadOnlyDictionary<string, int> deltaCounters =
+                P2PAuthoritativeServer.GetHistoryCounters(0);
+            Assert(deltaCounters.ContainsKey("play") &&
+                    deltaCounters["play"] >= 1,
+                "The Host did not record the native play envelope event.");
+
+            Dictionary<string, object> laterRequest =
+                new Dictionary<string, object>
+                {
+                    ["uri"] = "PlayActions",
+                    ["playIdx"] = 8,
+                    ["type"] = 30
+                };
+            Assert(P2PAuthoritativeServer.TryCreateAction(
+                    false, 200, laterRequest,
+                    out P2PHostAuthoritativeAction laterAction,
+                    out error),
+                "The Host rejected a later action after a private-state delta: " +
+                error);
+            Dictionary<string, object> laterKnown =
+                (laterAction.ServerResponse["knownList"] as List<object>)?
+                    .OfType<Dictionary<string, object>>()
+                    .SingleOrDefault(card => Convert.ToInt32(card["idx"]) == 8);
+            Assert(laterKnown != null && Convert.ToInt32(laterKnown["cost"]) == 1,
+                "The Host did not reuse the updated private-card state in knownList.");
+        }
+
+        private static void TestPrivateStateFieldDeltaRoundTrip()
+        {
+            P2PAuthoritativeServer.Reset();
+            Assert(P2PAuthoritativeServer.RememberPrivateStateSnapshot(
+                    new Dictionary<string, object>
+                    {
+                        ["owner"] = 0,
+                        ["cards"] = new List<object>
+                        {
+                            new Dictionary<string, object>
+                            {
+                                ["idx"] = 8,
+                                ["cardId"] = 8008,
+                                ["cost"] = 5,
+                                ["attachTarget"] = "1,2",
+                                ["p2pGenericKeys"] = new Dictionary<string, object>
+                                {
+                                    ["old"] = 1
+                                }
+                            }
+                        }
+                    }) == 1,
+                "The field-delta baseline was not stored.");
+
+            Dictionary<string, object> request = new Dictionary<string, object>
+            {
+                ["uri"] = "PlayActions",
+                ["playIdx"] = 8,
+                ["type"] = 30,
+                ["p2pHiddenOwner"] = 0,
+                ["p2pHiddenCards"] = new List<object>
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["idx"] = 8,
+                        ["cardId"] = 8008,
+                        ["p2pStateDelta"] = 1,
+                        ["cost"] = 1,
+                        ["p2pRemovedFields"] = new List<object>
+                        {
+                            "attachTarget"
+                        }
+                    }
+                }
+            };
+
+            Assert(P2PAuthoritativeServer.TryCreateAction(
+                    false, 200, request,
+                    out P2PHostAuthoritativeAction action,
+                    out string error),
+                "The Host rejected a field-level private-state delta: " + error);
+            Assert(P2PAuthoritativeServer.TryGetCardState(0, 8,
+                    out Dictionary<string, object> merged) &&
+                Convert.ToInt32(merged["cost"]) == 1 &&
+                !merged.ContainsKey("attachTarget") &&
+                merged["p2pGenericKeys"] is Dictionary<string, object> keys &&
+                Convert.ToInt32(keys["old"]) == 1,
+                "The Host did not merge changed and removed private-state fields.");
+
+            List<object> responseCards = action.ServerResponse
+                .TryGetValue("p2pHiddenCards", out object rawCards) &&
+                rawCards is IEnumerable cards && !(rawCards is string)
+                ? cards.Cast<object>().ToList()
+                : null;
+            Dictionary<string, object> responseCard = responseCards?
+                .OfType<Dictionary<string, object>>()
+                .SingleOrDefault(card => Convert.ToInt32(card["idx"]) == 8);
+            Assert(responseCard != null &&
+                !responseCard.ContainsKey("p2pStateDelta") &&
+                Convert.ToInt32(responseCard["cost"]) == 1 &&
+                !responseCard.ContainsKey("attachTarget") &&
+                responseCard["p2pGenericKeys"] is Dictionary<string, object> responseKeys &&
+                Convert.ToInt32(responseKeys["old"]) == 1,
+                "The Host response was not rebuilt from the authoritative full state.");
+
+            Assert(P2PAuthoritativeServer.TryCreateDelivery(action,
+                    out P2PServerBattleDelivery delivery),
+                "The Host could not create a delivery for the field-delta action.");
+            List<object> deliverySnapshots = delivery.Data
+                .TryGetValue(P2PBattleProtocol.AuthorityHiddenStatesKey,
+                    out object rawSnapshots) && rawSnapshots is IEnumerable snapshots &&
+                !(rawSnapshots is string)
+                ? snapshots.Cast<object>().ToList()
+                : null;
+            Dictionary<string, object> deliveryCard = deliverySnapshots?
+                .OfType<Dictionary<string, object>>()
+                .SelectMany(snapshot => snapshot.TryGetValue("cards",
+                        out object snapshotCards) && snapshotCards is IEnumerable cards &&
+                    !(snapshotCards is string)
+                        ? cards.OfType<Dictionary<string, object>>()
+                        : Enumerable.Empty<Dictionary<string, object>>())
+                .SingleOrDefault(card => Convert.ToInt32(card["idx"]) == 8);
+            Assert(deliveryCard != null &&
+                Convert.ToInt32(deliveryCard["p2pStateDelta"]) == 1 &&
+                Convert.ToInt32(deliveryCard["cost"]) == 1 &&
+                deliveryCard["p2pRemovedFields"] is List<object> removed &&
+                removed.Any(value => value.ToString() == "attachTarget"),
+                "The ServerBattleDelivery did not reduce the ledger state to a field delta.");
         }
 
         private static void TestBattleStateDiagnostics()

@@ -319,6 +319,23 @@ namespace Shadowbus
 
         [JsonProperty("error", NullValueHandling = NullValueHandling.Ignore)]
         public string Error { get; set; }
+
+        // Authority protocol fields are deliberately optional so room and
+        // draft messages remain wire-compatible with the common envelope.
+        [JsonProperty("requestId", NullValueHandling = NullValueHandling.Ignore)]
+        public string RequestId { get; set; }
+
+        [JsonProperty("actionSeq", NullValueHandling = NullValueHandling.Ignore)]
+        public int ActionSeq { get; set; }
+
+        [JsonProperty("protocol", NullValueHandling = NullValueHandling.Ignore)]
+        public int Protocol { get; set; }
+
+        [JsonProperty("modVersion", NullValueHandling = NullValueHandling.Ignore)]
+        public string ModVersion { get; set; }
+
+        [JsonProperty("authority", NullValueHandling = NullValueHandling.Ignore)]
+        public string Authority { get; set; }
     }
 
     internal static class P2PJson
@@ -422,14 +439,42 @@ namespace Shadowbus
             Dictionary<string, object> result = FlipPerspective(source);
             NormalizeChatStamp(result);
             NormalizeOpponentKeyActions(result);
-            if (result.TryGetValue("targetList", out object targets))
-            {
-                // The client emits targetList, but live opponent messages use
-                // oppoTargetList so the receiver reads action-relative isSelf values.
-                result.Remove("targetList");
-                result["oppoTargetList"] = targets;
-            }
+            NormalizeTargetListForServerResult(result);
             return result;
+        }
+
+        internal static void NormalizeAuthorityLocalReplayMessage(
+            Dictionary<string, object> message)
+        {
+            // Authority results are fed directly into NetworkBattleReceiver
+            // with isPlayer=true.  The official server flattens keyAction's
+            // selectCard wrapper before that receiver sees the packet; perform
+            // the same normalization for the local replay path.
+            NormalizeOpponentKeyActions(message);
+            // NetworkOperationCollection's in-play action path reads
+            // OpponentTargetDataList even when the replay action itself is
+            // applied as the local player. The official server represents that
+            // list with oppoTargetList; targetList would be decoded into
+            // PlayerTargetDataList and make InPlayCardReflection.Attack read an
+            // empty target list.
+            NormalizeTargetListForServerResult(message);
+        }
+
+        private static void NormalizeTargetListForServerResult(
+            Dictionary<string, object> message)
+        {
+            if (message == null ||
+                !message.TryGetValue("targetList", out object targets))
+            {
+                return;
+            }
+
+            // The client emits targetList. The original server response uses
+            // oppoTargetList, which NetworkBattleReceiver always decodes into
+            // OpponentTargetDataList. Never leave both fields in a result: the
+            // receiver's dictionary iteration order is not protocol semantics.
+            message.Remove("targetList");
+            message["oppoTargetList"] = targets;
         }
 
         private static void NormalizeChatStamp(Dictionary<string, object> message)
@@ -528,7 +573,12 @@ namespace Shadowbus
                 else if (string.Equals(key, "p2pHiddenCards", StringComparison.Ordinal) ||
                     string.Equals(key, "p2pHiddenRemoved", StringComparison.Ordinal) ||
                     string.Equals(key, "p2pHiddenOwner", StringComparison.Ordinal) ||
+                    string.Equals(key, P2PBattleProtocol.AuthorityHiddenStatesKey,
+                        StringComparison.Ordinal) ||
                     string.Equals(key, "p2pPlayerHistory", StringComparison.Ordinal) ||
+                    string.Equals(key,
+                        P2PBattleProtocol.AuthorityPlayerHistoryStatesKey,
+                        StringComparison.Ordinal) ||
                     string.Equals(key, "p2pFusionActions", StringComparison.Ordinal) ||
                     string.Equals(key, "p2pMetamorphoses", StringComparison.Ordinal) ||
                     string.Equals(key,

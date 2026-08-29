@@ -12,6 +12,7 @@
     <Compile Include="Program.cs" />
     <Compile Include="..\..\LocalDeckCode.cs" Link="LocalDeckCode.cs" />
     <Compile Include="..\..\P2P\P2PBattleResult.cs" Link="P2PBattleResult.cs" />
+    <Compile Include="..\..\P2P\P2PAuthoritativeServer.cs" Link="P2PAuthoritativeServer.cs" />
     <Compile Include="..\..\P2P\P2PBattleProtocol.cs" Link="P2PBattleProtocol.cs" />
     <Compile Include="..\..\P2P\P2PConnectionCode.cs" Link="P2PConnectionCode.cs" />
     <Compile Include="..\..\P2P\P2PDealState.cs" Link="P2PDealState.cs" />
