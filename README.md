@@ -82,6 +82,26 @@ P2P 模式不提供账号服务、房间列表、STUN 打洞或 TURN 中继。�
 
 目前支持普通构筑 Open Room BO1 和自定义规则的 Room Two Pick BO1；不支持 HOF、Windfall、Avatar、原版 Backdraft/Cube/Chaos Two Pick、BO3/BO5、观战、断线重连、奖励和反作弊。`Mods/TwoPick` 下每个 JSON 文件对应一个建房时可选的双选模式，`displayName` 是界面名称；双方分别在本地选牌，房主会把所选完整规则同步给访客，完成后再使用最终牌组进入匹配。战斗中断线时，仍在线的一方按断线胜利结算。每个游戏安装目录会在 `Mods/P2PIdentity.json` 保存独立玩家 ID，并在 `Mods/Profile.json` 保存玩家修改后的名称、称号、徽章和地区；不要把已经生成的身份文件复制给另一名玩家或第二个测试实例。
 
+## 增强日志
+
+Shadowbus 会在 BepInEx 的全局日志分发边界统一格式化日志，因此普通模块、Unity/BepInEx 转发日志和 P2P 日志都会使用同一套格式。BepInEx 原有的 `[Level:Source]` 前缀只保留一次；等级颜色只在外部控制台输出边界应用，文本日志不会出现 ANSI 控制符。过长内容会按配置换行，并为前缀预留宽度。
+
+增强日志默认另存为 `BepInEx/LogOutput-enhanced.log`，不会替换原始日志文件。卡牌 ID 如果能在当前 `CardMaster` 中解析，会附加卡名和费用；卡牌效果文本默认关闭，以避免普通日志过长。
+
+配置文件中的 `[Logging]` 段：
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `EnhancedEnabled` | `true` | 启用全局增强格式和增强日志文件 |
+| `ShowCardDetails` | `true` | 将卡牌 ID 附加为“卡名 + 费用” |
+| `ShowCardEffects` | `false` | 附加卡牌效果和进化效果文本 |
+| `DetailedP2P` | `false` | 记录每个 P2P 发出、Host 接收/生成、客户端接收动作；卡牌效果是否显示仍由 `ShowCardEffects` 控制 |
+| `AnsiColors` | `true` | 在 BepInEx 外部控制台中按日志等级使用真实控制台颜色；`Player.log` 和增强日志文件始终保持纯文本 |
+| `WrapWidth` | `140` | 单行最大字符数，设置为 `0` 关闭自动换行 |
+| `EnhancedFile` | `BepInEx/LogOutput-enhanced.log` | 增强日志路径；相对路径以游戏根目录为基准 |
+
+`DetailedP2P=true` 适合复现联机问题；常规游玩建议关闭，以减少日志量和卡牌文本查询开销。详细模式下每个动作以表格形式显示阶段、原版 URI、动作类型、区域移动、选择/融合信息和 Host 权威序列；枚举字段同时显示原始数值与含义。
+
 ## 自定义练习
 
 进入“单人 > 对战”，在对手职业选择页点击第九个“自定义卡组”图标。配置页可同时选择：

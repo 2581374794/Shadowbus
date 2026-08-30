@@ -28,8 +28,11 @@ namespace Shadowbus
                 TestBattleResults();
                 TestBattleProtocol();
                 TestHostAuthoritativeServer();
+                TestOpenMyCardsServerBoundary();
                 TestHostAuthoritativeRegisterState();
                 TestHostPrivateStateDeltaAndRandomCanonicalization();
+                TestPreparedPrivateIdentityPromotion();
+                TestPublicTargetIndexDoesNotConsumeOtherOwnerPrivateIdentity();
                 TestPrivateStateFieldDeltaRoundTrip();
                 TestPlayerHistoryPolicy();
                 TestBattleStateDiagnostics();
@@ -2871,6 +2874,60 @@ namespace Shadowbus
                 "The Host did not route the server response to the opposing client.");
         }
 
+        private static void TestOpenMyCardsServerBoundary()
+        {
+            P2PAuthoritativeServer.Reset();
+            Assert(P2PAuthoritativeServer.RememberPrivateStateSnapshot(
+                    new Dictionary<string, object>
+                    {
+                        ["owner"] = 1,
+                        ["cards"] = new List<object>
+                        {
+                            new Dictionary<string, object>
+                            {
+                                ["idx"] = 41,
+                                ["cardId"] = 900444041,
+                                ["cost"] = 4,
+                                ["p2pZone"] = 10
+                            }
+                        }
+                    }) == 1,
+                "The openMyCards Host baseline was not stored.");
+
+            Dictionary<string, object> request = new Dictionary<string, object>
+            {
+                ["uri"] = "TurnEndActions",
+                ["orderList"] = new List<object>
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["openMyCards"] = new Dictionary<string, object>
+                        {
+                            ["idx"] = new List<object> { 41 }
+                        }
+                    }
+                }
+            };
+
+            Assert(P2PAuthoritativeServer.TryCreateAction(
+                    true, 100, request,
+                    out P2PHostAuthoritativeAction action,
+                    out string error),
+                "The Host rejected an openMyCards TurnEndActions request: " +
+                error);
+            List<object> known = action.ServerResponse["knownList"] as List<object>;
+            Dictionary<string, object> opened = known?.OfType<Dictionary<string, object>>()
+                .SingleOrDefault(entry =>
+                    entry.TryGetValue("idx", out object rawIndex) &&
+                    Convert.ToInt32(rawIndex) == 41);
+            Assert(opened != null &&
+                Convert.ToInt32(opened["cardId"]) == 900444041 &&
+                Convert.ToInt32(opened["is_open"]) == 1 &&
+                Convert.ToInt32(opened["isSelf"]) == 0,
+                "The Host did not convert openMyCards into a revealed native identity " +
+                "with the recipient perspective.");
+        }
+
         private static void TestHostAuthoritativeRegisterState()
         {
             P2PAuthoritativeServer.Reset();
@@ -3025,7 +3082,8 @@ namespace Shadowbus
                         new Dictionary<string, object>
                         {
                             ["idx"] = 8,
-                            ["cardId"] = 8008,
+                            ["cardId"] = 9008,
+                            ["p2pStateDelta"] = 1,
                             ["cost"] = 1,
                             ["p2pGenericKeys"] = new Dictionary<string, object>
                             {
@@ -3078,8 +3136,10 @@ namespace Shadowbus
             Assert(P2PAuthoritativeServer.TryGetCardState(0, 8,
                     out Dictionary<string, object> state) &&
                 Convert.ToInt32(state["cost"]) == 1 &&
+                Convert.ToInt32(state["cardId"]) == 8008 &&
                 state.ContainsKey("p2pGenericKeys"),
-                "The Host ledger did not absorb the incremental private-card state.");
+                "The Host ledger did not absorb the incremental private-card state " +
+                "without allowing a delta to replace native card identity.");
 
             List<object> deltaCards = deltaAction.ServerResponse
                 .TryGetValue("p2pHiddenCards", out object rawDeltaCards) &&
@@ -3163,6 +3223,172 @@ namespace Shadowbus
                     .SingleOrDefault(card => Convert.ToInt32(card["idx"]) == 8);
             Assert(laterKnown != null && Convert.ToInt32(laterKnown["cost"]) == 1,
                 "The Host did not reuse the updated private-card state in knownList.");
+        }
+
+        private static void TestPreparedPrivateIdentityPromotion()
+        {
+            P2PAuthoritativeServer.Reset();
+            Assert(P2PAuthoritativeServer.RememberPrivateStateSnapshot(
+                    new Dictionary<string, object>
+                    {
+                        ["owner"] = 1,
+                        ["cards"] = new List<object>
+                        {
+                            new Dictionary<string, object>
+                            {
+                                ["idx"] = 4,
+                                ["cardId"] = 118611011,
+                                ["cost"] = 2
+                            }
+                        }
+                    }) == 1,
+                "The prepared-identity test baseline was not stored.");
+
+            Dictionary<string, object> request =
+                new Dictionary<string, object>
+                {
+                    ["uri"] = "PlayActions",
+                    ["playIdx"] = 4,
+                    ["type"] = 30,
+                    [P2PBattleProtocol.PreparedActionKey] = 1,
+                    [P2PBattleProtocol.PreparedCardIdKey] = 709314011,
+                    ["knownList"] = new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["idx"] = 4,
+                            ["cardId"] = 118611011,
+                            ["isSelf"] = 1
+                        }
+                    },
+                    ["orderList"] = new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["move"] = new Dictionary<string, object>
+                            {
+                                ["idx"] = 4,
+                                ["isSelf"] = 1,
+                                ["from"] = 10,
+                                ["to"] = 30
+                            }
+                        }
+                    }
+                };
+
+            Assert(P2PAuthoritativeServer.TryCreateAction(
+                    true, 100, request,
+                    out P2PHostAuthoritativeAction action,
+                    out string error),
+                "The Host rejected a prepared private identity: " + error);
+            Dictionary<string, object> revealed =
+                (action.ServerResponse["knownList"] as List<object>)?
+                    .OfType<Dictionary<string, object>>()
+                    .SingleOrDefault(entry =>
+                        entry.TryGetValue("idx", out object rawIndex) &&
+                        Convert.ToInt32(rawIndex) == 4);
+            Assert(revealed != null &&
+                Convert.ToInt32(revealed["cardId"]) == 709314011 &&
+                Convert.ToInt32(revealed["isSelf"]) == 0,
+                "The Host response did not replace an old private baseline " +
+                "identity with the prepared native play identity.");
+            Assert(P2PAuthoritativeServer.TryGetCardState(1, 4,
+                    out Dictionary<string, object> state) &&
+                Convert.ToInt32(state["cardId"]) == 709314011,
+                "The Host ledger did not retain the prepared private identity.");
+        }
+
+        private static void
+            TestPublicTargetIndexDoesNotConsumeOtherOwnerPrivateIdentity()
+        {
+            P2PAuthoritativeServer.Reset();
+            Assert(P2PAuthoritativeServer.RememberPrivateStateSnapshot(
+                    new Dictionary<string, object>
+                    {
+                        ["owner"] = 0,
+                        ["cards"] = new List<object>
+                        {
+                            new Dictionary<string, object>
+                            {
+                                ["idx"] = 4,
+                                ["cardId"] = 2004,
+                                ["p2pZone"] = 10
+                            }
+                        }
+                    }) == 1 &&
+                P2PAuthoritativeServer.RememberPrivateStateSnapshot(
+                    new Dictionary<string, object>
+                    {
+                        ["owner"] = 1,
+                        ["cards"] = new List<object>
+                        {
+                            new Dictionary<string, object>
+                            {
+                                ["idx"] = 4,
+                                ["cardId"] = 1004,
+                                ["p2pZone"] = 10
+                            }
+                        }
+                    }) == 1,
+                "The public-target collision baseline was not stored.");
+
+            Dictionary<string, object> request =
+                new Dictionary<string, object>
+                {
+                    ["uri"] = "PlayActions",
+                    ["playIdx"] = 4,
+                    ["type"] = 10,
+                    ["targetList"] = new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["targetIdx"] = 4,
+                            ["isSelf"] = 0
+                        }
+                    },
+                    ["orderList"] = new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["move"] = new Dictionary<string, object>
+                            {
+                                ["idx"] = 4,
+                                ["isSelf"] = 1,
+                                ["from"] = 20,
+                                ["to"] = 30
+                            }
+                        }
+                    },
+                    // This is a post-action snapshot of the Host card.  It is
+                    // deliberately public now; it must not be promoted as a
+                    // Guest private identity just because targetIdx is also 4.
+                    ["p2pHiddenOwner"] = 1,
+                    ["p2pHiddenCards"] = new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            ["idx"] = 4,
+                            ["cardId"] = 1004,
+                            ["p2pZone"] = 20
+                        }
+                    }
+                };
+
+            Assert(P2PAuthoritativeServer.TryCreateAction(
+                    true, 100, request,
+                    out P2PHostAuthoritativeAction action,
+                    out string error),
+                "The Host rejected a public target collision request: " +
+                error);
+            List<object> known = action.ServerResponse["knownList"] as List<object>;
+            Assert(known != null &&
+                !known.OfType<Dictionary<string, object>>().Any(entry =>
+                    entry.TryGetValue("isSelf", out object rawSelf) &&
+                    Convert.ToInt32(rawSelf) == 0 &&
+                    entry.TryGetValue("cardId", out object rawCardId) &&
+                    Convert.ToInt32(rawCardId) == 2004),
+                "A public target index incorrectly consumed the other owner's " +
+                "private identity from the Host ledger.");
         }
 
         private static void TestPrivateStateFieldDeltaRoundTrip()
