@@ -705,7 +705,7 @@ internal static class EnhancedLogSystem
             add(rootCardId);
         }
 
-        foreach (string key in new[]
+        foreach (string key in new string[]
         {
             "knownList", "uList", "orderList", "keyAction",
             "p2pFusionActions", "p2pMetamorphoses",

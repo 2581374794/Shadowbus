@@ -28,10 +28,16 @@ namespace Shadowbus
 
         private static IEnumerator CustomConnectCoroutine(NetworkManager __instance, bool showErrorDialog)
         {
-            
+
             NetworkTask currentTask = __instance.lastRequestTask;
             string taskTypeName = currentTask.GetType().Name;
-            if (P2PTaskRouter.CanHandle(currentTask))
+
+            if (Server.OnlineTaskRouter.CanHandle(currentTask))
+            {
+                Plugin.Logger.LogInfo($"[Online] Intercepted room task: {taskTypeName}");
+                yield return Server.OnlineTaskRouter.Process(__instance, currentTask);
+            }
+            else if (P2PTaskRouter.CanHandle(currentTask))
             {
                 Plugin.Logger.LogInfo($"[P2P] Intercepted room task: {taskTypeName}");
                 yield return P2PTaskRouter.Process(__instance, currentTask);

@@ -5,7 +5,7 @@ using BepInEx.Unity.Mono;
 using HarmonyLib;
 using Shadowbus.LLMAI;
 using System.Linq;
-
+using UnityEngine;
 
 namespace Shadowbus;
 
@@ -20,9 +20,9 @@ public class Plugin : BaseUnityPlugin
 
     public BattleCardBase SelectedCard { get; set; }
 
-    private ConfigEntry<string> p2pBindAddress;
-    private ConfigEntry<string> p2pAdvertisedAddress;
-    private ConfigEntry<int> p2pPort;
+    private ConfigEntry<string> socketIoBindAddress;
+    private ConfigEntry<string> socketIoAdvertisedAddress;
+    private ConfigEntry<int> socketIoPort;
     private ConfigEntry<float> aiStallTimeout;
     private ConfigEntry<bool> llmAIEnabled;
     private ConfigEntry<string> llmAIEndpoint;
@@ -65,25 +65,28 @@ public class Plugin : BaseUnityPlugin
         }
         Logger.LogInfo($"Plugin Shadowbus is loaded!");
 
-        p2pBindAddress = Config.Bind(
-            "P2P",
+        socketIoBindAddress = Config.Bind(
+            "SocketIO",
             "BindAddress",
             "0.0.0.0",
-            "Local address used by the room host TCP listener.");
-        p2pAdvertisedAddress = Config.Bind(
-            "P2P",
+            "Address used by the Socket.IO listener.");
+        socketIoAdvertisedAddress = Config.Bind(
+            "SocketIO",
             "AdvertisedAddress",
             string.Empty,
-            "IP address embedded in the room password. Empty uses a concrete BindAddress or selects a same-family local address.");
-        p2pPort = Config.Bind(
-            "P2P",
+            "Address embedded in the room code. Empty falls back to the bind address.");
+        socketIoPort = Config.Bind(
+            "SocketIO",
             "Port",
             29600,
-            "TCP port used by P2P room hosting. Use 0 for an automatically assigned port.");
-        P2PRuntime.Configure(
-            p2pBindAddress.Value,
-            p2pAdvertisedAddress.Value,
-            p2pPort.Value);
+            "Socket.IO port used by room hosting.");
+        // 联机服务器配置（新系统）
+        Server.OnlineRuntime.Initialize(new Server.Core.ServerConfig
+        {
+            BindAddress = socketIoBindAddress.Value,
+            AdvertisedAddress = socketIoAdvertisedAddress.Value,
+            Port = socketIoPort.Value
+        });
         aiStallTimeout = Config.Bind(
             "AI",
             "StallTimeoutSeconds",
@@ -190,7 +193,7 @@ public class Plugin : BaseUnityPlugin
             "Shows a 随便选 button on the BossRush ability select screen that offers every configured buff instead of the three random candidates. Set to false to hide the button and keep the original random selection.");
         BossRushAbilityPicker.Configure(bossRushAbilityPicker.Value);
         CustomFormats.Initialize();
-        P2PTwoPickRules.Initialize();
+        // P2PTwoPickRules.Initialize(); // TODO: 重新实现 TwoPick 规则
         BossRushOfflineData.Initialize();
         BossRushReferenceExporter.Export();
 
@@ -215,6 +218,12 @@ public class Plugin : BaseUnityPlugin
                 $"[DeckListHotReload] Harmony registration complete: " +
                 $"{deckListHotReloadHarmony.GetPatchedMethods().Count()} game method(s) patched.");
             Harmony.CreateAndPatchAll(typeof(FakeConnect));
+            Harmony.CreateAndPatchAll(typeof(Server.OnlineRoomInputPatch));
+            Harmony.CreateAndPatchAll(typeof(Server.SocketIoProfilePatch));
+            Harmony.CreateAndPatchAll(typeof(Server.SocketIoCreateRoomIdentityPatch));
+            Harmony.CreateAndPatchAll(typeof(Server.SocketIoEnterRoomIdentityPatch));
+            Harmony.CreateAndPatchAll(typeof(Server.SocketIoCertificationViewerIdPatch));
+            Harmony.CreateAndPatchAll(typeof(Server.SocketIoBattleDeckPatch));
             Harmony.CreateAndPatchAll(typeof(BossRushPatches));
             try
             {
@@ -263,17 +272,27 @@ public class Plugin : BaseUnityPlugin
             Harmony.CreateAndPatchAll(typeof(StoryOfflinePatches));
             Harmony.CreateAndPatchAll(typeof(LanguageVoicePatches));
             Harmony.CreateAndPatchAll(typeof(DeckFormatUI));
+            Harmony.CreateAndPatchAll(typeof(RoomRuleSelectDialogCreatePatch));
+            Harmony.CreateAndPatchAll(typeof(RoomRuleSelectDialogInitializePatch));
+            Harmony.CreateAndPatchAll(typeof(RoomRuleSelectDialogDefaultSettingPatch));
+            Harmony.CreateAndPatchAll(typeof(RoomRuleSelectDialogRefreshPatch));
+            Harmony.CreateAndPatchAll(typeof(RoomRuleSelectDialogFormatButtonPatch));
+            Harmony.CreateAndPatchAll(typeof(MyPageItemBattleRoomFormatResetPatch));
+            Harmony.CreateAndPatchAll(typeof(PlayerControllerForOwnSelectDeckFormatPatch));
+            Harmony.CreateAndPatchAll(typeof(RoomRuleSettingTopBarFormatPatch));
+            Harmony.CreateAndPatchAll(typeof(GuestRoomUnlimitedBasePatch));
             Harmony.CreateAndPatchAll(typeof(LocalDeckCodePatches));
             var deckFormatRulesHarmony =
                 Harmony.CreateAndPatchAll(typeof(CustomFormatDeckEditRules));
             Logger.LogInfo(
                 $"[CustomFormats] Deck edit rule registration complete: " +
                 $"{deckFormatRulesHarmony.GetPatchedMethods().Count()} game method(s) patched.");
-            Harmony.CreateAndPatchAll(typeof(P2PPatches));
-            Harmony.CreateAndPatchAll(typeof(P2PTwoPickClassDescriptionPatch));
-            Harmony.CreateAndPatchAll(typeof(P2PTwoPickClassIconPatch));
-            Harmony.CreateAndPatchAll(typeof(P2PTwoPickDeckSizePatches));
-            Harmony.CreateAndPatchAll(typeof(P2PTwoPickCompletionPatch));
+            // 联机补丁（新系统）
+            // Harmony.CreateAndPatchAll(typeof(OnlinePatches)); // TODO: 实现新的联机补丁
+            // Harmony.CreateAndPatchAll(typeof(P2PTwoPickClassDescriptionPatch)); // TODO
+            // Harmony.CreateAndPatchAll(typeof(P2PTwoPickClassIconPatch)); // TODO
+            // Harmony.CreateAndPatchAll(typeof(P2PTwoPickDeckSizePatches)); // TODO
+            // Harmony.CreateAndPatchAll(typeof(P2PTwoPickCompletionPatch)); // TODO
 
         }
         catch (System.Exception exception)
@@ -284,7 +303,7 @@ public class Plugin : BaseUnityPlugin
 
     private void Update()
     {
-        P2PRuntime.Update();
+        Server.OnlineRuntime.Update();
         PracticeDualAI.Update();
         AITurnGuard.Update();
         AICardDataFallback.Update();
@@ -293,7 +312,7 @@ public class Plugin : BaseUnityPlugin
     private void OnDestroy()
     {
         LLMAITurnController.CancelAll("plugin_destroyed");
-        P2PRuntime.Shutdown();
+        Server.OnlineRuntime.Shutdown();
         EnhancedLogSystem.Shutdown();
     }
 }

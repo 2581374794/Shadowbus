@@ -401,7 +401,7 @@ namespace Shadowbus
         }
     }
 
-    internal enum CustomFormatRule
+    public enum CustomFormatRule
     {
         DeckSize,
         SameCard,
@@ -411,9 +411,9 @@ namespace Shadowbus
         CardDataUnavailable
     }
 
-    internal sealed class CustomFormatViolation
+    public sealed class CustomFormatViolation
     {
-        internal CustomFormatViolation(
+        public CustomFormatViolation(
             CustomFormatRule rule,
             int cardId,
             int actualCount,
@@ -425,10 +425,10 @@ namespace Shadowbus
             Limit = limit;
         }
 
-        internal CustomFormatRule Rule { get; }
-        internal int CardId { get; }
-        internal int ActualCount { get; }
-        internal int Limit { get; }
+        public CustomFormatRule Rule { get; }
+        public int CardId { get; }
+        public int ActualCount { get; }
+        public int Limit { get; }
 
         internal string ToLogMessage()
         {

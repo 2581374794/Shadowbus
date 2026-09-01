@@ -21,6 +21,9 @@ namespace Shadowbus
 
         private sealed class LocalProfileSettings
         {
+            [JsonProperty("viewer_id")]
+            public int ViewerId { get; set; }
+
             [JsonProperty("name")]
             public string Name { get; set; }
 
@@ -205,8 +208,9 @@ namespace Shadowbus
             ApplySettings(Data.Load?.data, LoadSettings(), true);
         }
 
-        internal static P2PProfile CreateP2PProfile(int viewerId)
+        internal static P2PProfile CreateP2PProfile()
         {
+            int viewerId = GetOrCreateViewerId();
             P2PProfile profile = new P2PProfile
             {
                 ViewerId = viewerId,
@@ -253,6 +257,41 @@ namespace Shadowbus
                 profile.IsOfficial = settings.IsOfficialMarkDisplayed.Value;
             }
             return profile;
+        }
+
+        /// <summary>
+        /// Returns the stable per-installation online identity. This is kept
+        /// separate from the game's original account viewer id because the
+        /// latter is shared by offline/test clients.
+        /// </summary>
+        internal static int GetOrCreateViewerId()
+        {
+            lock (SettingsLock)
+            {
+                LocalProfileSettings settings = LoadSettingsUnlocked();
+                if (settings.ViewerId > 0)
+                {
+                    return settings.ViewerId;
+                }
+
+                settings.ViewerId = GenerateViewerId();
+                SaveSettingsUnlocked(settings);
+                Plugin.Logger.LogInfo(
+                    $"[ProfileOffline] Generated persistent online viewer id {settings.ViewerId}.");
+                return settings.ViewerId;
+            }
+        }
+
+        private static int GenerateViewerId()
+        {
+            byte[] bytes = new byte[4];
+            using (var random = System.Security.Cryptography.RandomNumberGenerator.Create())
+            {
+                random.GetBytes(bytes);
+            }
+
+            uint value = BitConverter.ToUInt32(bytes, 0);
+            return (int)(100000000u + (value % 900000000u));
         }
 
         private static object CreateProfileData()
@@ -530,12 +569,17 @@ namespace Shadowbus
             {
                 LocalProfileSettings settings = LoadSettingsUnlocked();
                 update(settings);
-                string json = JsonConvert.SerializeObject(settings, Formatting.Indented);
-                File.WriteAllText(PathHelper.ProfileSettingsPath, json, Encoding.UTF8);
+                SaveSettingsUnlocked(settings);
                 ApplySettings(Data.Load?.data, settings, true);
                 Plugin.Logger.LogInfo(
                     $"[ProfileOffline] Saved local profile settings to {PathHelper.ProfileSettingsPath}.");
             }
+        }
+
+        private static void SaveSettingsUnlocked(LocalProfileSettings settings)
+        {
+            string json = JsonConvert.SerializeObject(settings, Formatting.Indented);
+            File.WriteAllText(PathHelper.ProfileSettingsPath, json, Encoding.UTF8);
         }
 
         private static void ApplySettings(

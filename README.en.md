@@ -16,7 +16,7 @@ The repository also ships an [all-in-one web configuration editor](WebEditor/REA
 - **Deck list hot reload** — `CardMaster` configuration is reloaded whenever you open the deck list.
 - **Active abilities** — `when_activate` adds an activate button to your followers on the field, with a configurable PP cost.
 - **Custom abilities** — copy a card's information and abilities, or gain a target's abilities while keeping your own.
-- **P2P rooms** — the host generates an encrypted connection code; once the other player pastes it, both can play a standard-constructed BO1.
+- **Socket.IO rooms** — the host runs an embedded Socket.IO node and generates an encrypted connection code; the other player joins through the stock realtime client.
 
 Only Unlimited decks are supported for now. AI improvements are ongoing.
 
@@ -49,7 +49,7 @@ Shadowverse/
 
 ## P2P rooms
 
-P2P mode does not connect to the official servers and does not need a permanently hosted server of your own. While the game is running, the host temporarily listens on a TCP port and takes care of the room flow, message relaying and match adjudication.
+Socket.IO room mode does not connect to the official servers and does not need a permanently hosted server of your own. While the game is running, the host temporarily listens on a Socket.IO WebSocket endpoint and serves the room flow and realtime message relay.
 
 Battle execution is Host-authoritative. The guest sends only an input request
 (play, evolution, fusion, attack, turn end, and selections); the host executes
@@ -65,24 +65,24 @@ result. This is intended for trusted friend matches, not anti-cheat.
 4. The guest pastes the full `SVP1-...` code into the connection-code field of the join dialog. The confirm button enables itself once the code validates.
 5. Both players choose a deck and ready up, then the battle starts through the stock room flow.
 
-The connection code carries the host's address, TCP port, protocol version and a one-time random token, with an integrity check. It is the password for that room, so do not publish it. Old codes stop working once the room closes or the game exits.
+The connection code carries the host's address, Socket.IO port, BattleId and an integrity check. It is the password for that room, so do not publish it. Old codes stop working once the room closes or the game exits.
 
 ### Network requirements
 
 P2P mode provides no account service, room list, STUN hole punching or TURN relay. The two players must satisfy one of the following:
 
 - Both are on the same LAN, and the connection code carries the host's LAN address.
-- The host has an inbound-reachable public IPv4 and has opened the configured TCP port in both the router and the system firewall.
+- The host has an inbound-reachable public IPv4 and has opened the configured Socket.IO port in both the router and the system firewall.
 - Both have mutually reachable IPv6, the host sets the bind and advertised addresses to that IPv6, and the firewall is open.
 - Both join a virtual LAN such as Tailscale, ZeroTier or Radmin VPN first, and the connection code carries the host's virtual adapter address.
 
 If the host is behind carrier-grade NAT with no usable IPv6, a virtual LAN is required; a connection code alone cannot traverse that kind of NAT.
 
-After the first launch, the `[P2P]` section of this plugin's file under `BepInEx/config/` can be edited:
+After the first launch, the `[SocketIO]` section of this plugin's file under `BepInEx/config/` can be edited:
 
 - `BindAddress` — the local address the host listens on. Defaults to `0.0.0.0` for IPv4.
 - `AdvertisedAddress` — the address written into the connection code. When empty, an explicitly configured `BindAddress` is preferred, otherwise a local address of the same family is chosen automatically. Set it explicitly across the public internet or on a virtual LAN. When using IPv6, both entries must be IPv6 addresses.
-- `Port` — the TCP port the host listens on, default `29600`. Setting `0` picks a random port, which does not suit fixed port forwarding.
+- `Port` — the Socket.IO port the host listens on, default `29600`.
 
 Currently supported: standard-constructed Open Room BO1 and Room Two Pick BO1 with custom rules. Not supported: HOF, Windfall, Avatar, stock Backdraft/Cube/Chaos Two Pick, BO3/BO5, spectating, reconnection, rewards and anti-cheat.
 
