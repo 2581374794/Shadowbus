@@ -21,9 +21,11 @@ namespace Shadowbus.Server.Room
     /// when it already existed in a hidden zone. Cards created by the skill
     /// (tokens) are generated identically on both sides and need no reveal.
     ///
-    /// Two signals feed the reveal:
+    /// Three signals feed the reveal:
     ///   1. a uList move out of a hidden zone into a visible one, and
-    ///   2. an orderList register in which the sender declares cards public
+    ///   2. an orderList move whose is_open positions explicitly mark a draw
+    ///      (or other state change) as public, and
+    ///   3. an orderList register in which the sender declares cards public
     ///      without moving them (a card opened while staying in hand).
     /// Both end up in the same knownList, because that is the only receive-side
     /// field able to express "the opponent's card at index N is face up now".
@@ -130,6 +132,23 @@ namespace Shadowbus.Server.Room
                     injected.Add(CreateKnownCard(index, cardId, true));
             }
 
+            foreach (int index in EnumerateOpenMoveIndexes(message))
+            {
+                if (!resolvedIndexes.Add(index))
+                    continue;
+                // is_open is an explicit sender declaration. Keep a
+                // placeholder when the identity is unavailable so the stock
+                // receiver can still pass its open-card condition gate.
+                identities.TryResolve(sourceIsHost, index, out int cardId);
+                if (cardId <= 0)
+                {
+                    Plugin.Logger.LogWarning(
+                        $"[HiddenCardReveal] unresolved open move index {index} " +
+                        $"from {(sourceIsHost ? "host" : "guest")}");
+                }
+                injected.Add(CreateKnownCard(index, cardId, true));
+            }
+
             foreach (int index in EnumerateDeclaredOpenIndexes(message))
             {
                 if (!resolvedIndexes.Add(index))
@@ -227,6 +246,50 @@ namespace Shadowbus.Server.Room
 
             return TryGetInt(destination, out int toPlace) &&
                 RevealedTargetPlaces.Contains(toPlace);
+        }
+
+        /// <summary>
+        /// Yields indexes explicitly marked public by RegisterStateChangeCard.
+        /// Its is_open value is a list of positions into the move's idx array,
+        /// not a list of card indexes. Ordinary hidden draws have no is_open
+        /// field and therefore remain hidden.
+        /// </summary>
+        private static IEnumerable<int> EnumerateOpenMoveIndexes(JObject message)
+        {
+            JArray orderList = message["orderList"] as JArray;
+            if (orderList == null)
+                yield break;
+
+            for (int i = 0; i < orderList.Count; i++)
+            {
+                JObject order = orderList[i] as JObject;
+                if (order == null)
+                    continue;
+
+                JObject move = order["move"] as JObject;
+                if (move == null || !IsSenderOwned(move))
+                    continue;
+
+                JToken openToken = move["is_open"];
+                JArray indexes = move["idx"] as JArray;
+                if (indexes == null)
+                    indexes = move["idxList"] as JArray;
+                JArray openPositions = openToken as JArray;
+                if (indexes == null || openPositions == null)
+                    continue;
+
+                for (int j = 0; j < openPositions.Count; j++)
+                {
+                    if (!TryGetInt(openPositions[j], out int position) ||
+                        position < 0 || position >= indexes.Count)
+                    {
+                        continue;
+                    }
+
+                    if (TryGetInt(indexes[position], out int index) && index > 0)
+                        yield return index;
+                }
+            }
         }
 
         /// <summary>
