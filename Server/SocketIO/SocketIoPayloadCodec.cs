@@ -335,7 +335,16 @@ namespace Shadowbus.Server.SocketIO
                 {
                     var names = new List<string>();
                     foreach (JProperty nested in nestedObject.Properties())
-                        names.Add(nested.Name);
+                    {
+                        // Register payloads carry their index list under `idx`.
+                        // The length is what a reveal register costs the
+                        // receiver's knownList, so it is worth logging; the
+                        // indexes themselves stay private.
+                        JArray nestedIndexes = nested.Value as JArray;
+                        names.Add(nestedIndexes == null
+                            ? nested.Name
+                            : nested.Name + "[" + nestedIndexes.Count + "]");
+                    }
                     fields.Add(property.Name + "Keys=" + FormatNames(names));
                     continue;
                 }

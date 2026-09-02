@@ -638,6 +638,49 @@ Phase A 的服务器侧观测已经加入：`SocketIoServer` 记录收到的事�
 
 已知耦合：`BattlePlayerBase.AddToDeckCardIndexChange` 会在牌返回牌库时互换索引，从而让静态映射失效。该路径需要 `BattleMgr` 持有激活的 `XorShiftRandom`，而后者只由 `idxChangeSeed`/`oppoIdxChangeSeed` 建立；服务器从不下发这两个字段，因此映射稳定。若日后新增这两个种子，本表必须同步执行相同的互换。
 
-未覆盖的相邻缺口：`IsPrivateTargetSkill` 为真的技能（例如"从对手牌库召唤"）不走 `uList`，而走 `RegisterOpenMyCards`/`Echo` 回执链路，属于同一子系统的另一半，待有具体复现用例后单独处理。
+未覆盖的相邻缺口：原地公开（牌不换区，因此不进 `uList`）由 §18.12.2 补上。
 
 当前验收：双开复现 `119631020`，主动方回合结束时确认服务器日志出现 `[BattleSession] ... TurnEndActions: revealed N hidden card(s)`，出站摘要中 `knownList[]`/`knownListOpen` 计数大于 0，且对手客户端能看到黑暗骑士从牌库登场；同时回归普通出牌（`PlayActions`）行为不变。
+
+### 18.12.2 orderList 揭示通道（原地公开）
+
+**联机模型：确定性重演，不是状态复制。** `NetworkExecutionInfoCreator.CheckCondition` 的第一句是 `bool flag = base.CheckCondition(...)`，即 `ExecutionInfoCreatorBase` 里那套普通的本地技能引擎（`ConditionFilterCollection.Filtering`），末尾 `return flag`。中间只在少数「网络敏感」分支里**覆盖**这个判定。绝大多数效果之所以不用中继帮忙就能同步，是因为接收方本地重算了一遍——这也是为什么实测中「大多数效果都没问题，只有少数涉及隐藏信息的效果会出错」。
+
+覆盖分支与其数据来源，构成了「什么会坏」的预测表：
+
+| 覆盖分支 | 依赖字段 | 中继现状 |
+| --- | --- | --- |
+| `_isCheckOppoActionData` | `OpponentTargetDataList` ← `targetList`/`oppoTargetList` | 已转发 |
+| `IsNotCheckBuriaRiteCondition` | 埋葬仪式选择 ← `targetList`/`uList` | 已转发 |
+| `_validateSkillCheckFlag` | `validateSkillIndexList` ← `targetList.skillIndex` | 已转发 |
+| `IsUnapprovedSkill()` | `unapprovedList` ← `uList` | 已转发 |
+| `_isReceiveSkillConditionCheck` | `SkillConditionCheckList` | 未验证，疑似同族缺陷 |
+| `OnWhenDraw`+open_card / `OnDisCardStart` | `knownList` 的 `IsOpen` | 无客户端生产者 |
+| `IsSendOpenMyCardsSkill`+`OnSelfTurnEndStart` | `knownList` | 无客户端生产者 ← 本节修复 |
+| 其余 | 无 | 本地重演即可 |
+
+**`orderList` 是只写通道。** 全量 grep 只有两处：`NetworkBattleSenderDefine` 的枚举与 `SendCardDataMaker` 的生产者，**零消费者**。这与 `knownList` 只有消费者、没有生产者是同一个指纹的两半——官服负责把发送侧的 `orderList` 翻译成接收侧的字段。旁证：`skillConditionCheck` 发送时只存在于 `orderList`，而接收方却是在 `uList`/`knownList` 的数组元素里找 `activate`/`count`/`callCount`/`param` 这些键；`validate` 的技能序号同样是从 `targetList` 里读出来的。
+
+**缺陷链（以 `900444040` 为例，技能 DSL 为 `(preprocess:open_card)(timing:self_turn_end)`）：**
+
+1. 该组合命中 `RegisterValidate.IsSendOpenMyCardsSkill`，`NetworkBattleSetupCardEvent` 挂上 `Event_RegisterOpenMyCards`，发送侧产出 `"orderList": [{"openMyCards": {"idx": [7]}}]`——`RegisterOpenMyCards.MakeSendData` 显式删掉 `isSelf`，也不带 `cardId`。
+2. 牌**始终留在手牌**，不换区，因此 `uList` 里没有它，§18.12 的「移动揭示」规则天然看不见。
+3. 中继原样转发 `orderList`，而 `NetworkBattleReceiver` 没有 `orderList` 分支 → 丢弃 → `knownCardList` 为空。
+4. `NetworkExecutionInfoCreator` 的 `IsSendOpenMyCardsSkill` + `OnSelfTurnEndStart` 分支要求 `GetReceiveCardList()` 里存在 `Index == ownerCard.Index` 的条目 → 不成立 → **技能在对手客户端上根本不执行**：没有伤害、没有 `OpenCardFromHandVfx`、手牌保持背面。
+5. `ReplaceReceivedCards(knownCardList)` 同样无事可做，占位卡不会被换成真牌。
+
+**修复：仍然是补 `knownList` 这一个字段，不是重建 `orderList` 通道。** `HiddenCardRevealer` 新增第二个揭示信号源：
+
+- `RevealRegisters` 白名单（目前只有 `openMyCards`）。`RegisterTool.OrderListParameter` 的另外 19 个 register 要么被接收方本地重演，要么已经经由 `uList`/`targetList` 抵达，丢掉不影响；`openMyCards` 是唯一信息别处不存在的。
+- `EnumerateDeclaredOpenIndexes` 读 `orderList` 每个 register 的载荷。注意 `RegisterActionBase.MakeSendData` 把整个索引数组写在 **`idx`** 键下（`MakeUList` 用的是 `idxList`），因此 `EnumerateIndexes` 必须同时接受两个键、且两者都可能是数组——原先只按标量解析 `idx` 的代码会静默产出零个索引。
+- 与移动揭示共用 `resolvedIndexes` 去重，共用同一条注入管线，注入时机同样在 `FlipBattlePerspective` 之前。
+- 与移动揭示的一处刻意差异：身份解析失败时**仍然注入 `is_open = 1` 的占位条目**并打 warning。发送方已明确声明这张牌公开，而 `NetworkExecutionInfoCreator` 只按索引放行技能——让效果结算出来比显示正确牌面更重要。
+- `notBuff` 不转写：接收方没有对应分支。
+
+**为什么这一条规则覆盖的是体系而不是单卡：** `RegisterOpenMyCards` 是原版所有「原地公开」机制的唯一出口——`IsSendOpenMyCardsSkill`（回合结束 open_card、放逐时 hand-self）、`IsOpenMyHandSkill`（公开整只手牌）、`Skill_update_deck.IsOpen`、以及目标不可见的 `Skill_token_draw`。四种机制共用一个 register，因此也共用这一次修复。
+
+**安全性：** 只揭示发送方自己声明为公开的牌，不存在信息泄露；`knownList` 条目缺 `from`/`to` 无害——`SearchForDummyCardInHandAndDeck` 按索引匹配、与区域无关，`CreateActualCard` 的 `_toStateList.Contains(Banish)` 判断在缺 `to` 时恒假。
+
+**待验证的同族预测：** `_isReceiveSkillConditionCheck` 可能是第三个同类缺陷（highlander 一类的条件）。`skillConditionCheck` 发送时只存在于 `orderList`，而接收方却在 `uList`/`knownList` 元素内查找它的键。若复现成立，按同一白名单机制扩展即可。
+
+**验收：** 双开复现 `900444040`，主动方回合结束时：入站日志 `hidden=` 中出现 `orderListKinds=openMyCards:1` 与 `orderEntries=openMyCardsKeys=idx[1]`；服务器出现 `[BattleSession] ... TurnEndActions: revealed N hidden card(s)`；出站 `hidden=` 的 `knownList[]`/`knownListOpen` 大于 0；对手客户端能看到手牌翻开并结算效果。同时回归 `119631020` 与普通出牌不受影响。
