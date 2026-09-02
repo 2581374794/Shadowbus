@@ -551,6 +551,24 @@ namespace Shadowbus.Server.Room
                         $"from {(sourceIsHost ? "host" : "guest")}");
                 }
 
+                // PlayActions is emitted after the local fusion/transform
+                // sequence completes, but its playIdx still identifies the
+                // original card that was played. Keep the reveal above on the
+                // old identity, then advance the server registry for future
+                // actions. Other battle messages do not use playIdx as a
+                // first-use reveal, so applying the same update here is safe.
+                int metamorphosed = HiddenCardRevealer.ApplyMetamorphoses(
+                    clone,
+                    sourceIsHost,
+                    _identities);
+                if (metamorphosed > 0)
+                {
+                    Plugin.Logger.LogInfo(
+                        $"[BattleSession] {RoomId} {uri}: updated " +
+                        $"{metamorphosed} transformed card identity(ies) " +
+                        $"from {(sourceIsHost ? "host" : "guest")}");
+                }
+
                 int bridgedConditions = HiddenConditionBridge.Inject(clone);
                 if (bridgedConditions > 0)
                 {

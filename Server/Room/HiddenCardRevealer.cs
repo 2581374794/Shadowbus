@@ -122,6 +122,21 @@ namespace Shadowbus.Server.Room
                 injected.Add(CreateKnownCard(playIndex, playCardId, playCardId > 0));
             }
 
+            // FusionMove() resolves the selected ingredients from the
+            // receiver's OpponentTargetDataList. Those cards are normally
+            // hidden hand placeholders, so the relay must disclose their
+            // identities before the targetList envelope is renamed and the
+            // sender perspective is flipped. Do not apply this to ordinary
+            // target selection: only fusion consumes targetList as card
+            // ingredients.
+            foreach (int index in EnumerateFusionMaterialIndexes(message))
+            {
+                if (!resolvedIndexes.Add(index))
+                    continue;
+                if (identities.TryResolve(sourceIsHost, index, out int cardId))
+                    injected.Add(CreateKnownCard(index, cardId, true));
+            }
+
             foreach (int index in EnumerateHiddenMoveIndexes(message))
             {
                 if (!resolvedIndexes.Add(index))
@@ -179,6 +194,75 @@ namespace Shadowbus.Server.Room
             for (int i = 0; i < injected.Count; i++)
                 knownList.Add(injected[i]);
             return injected.Count;
+        }
+
+        /// <summary>
+        /// Applies the current card identities declared by metamorphose
+        /// registers. The register is a sender-side orderList entry and is
+        /// therefore authoritative for the sender's index space. Callers
+        /// intentionally invoke this after PlayActions reveals so that the
+        /// action's playIdx still resolves to the card that was played before
+        /// its fusion transformation.
+        /// </summary>
+        internal static int ApplyMetamorphoses(
+            JObject message,
+            bool sourceIsHost,
+            CardIdentityRegistry identities)
+        {
+            if (message == null || identities == null)
+                return 0;
+
+            JArray orderList = message["orderList"] as JArray;
+            if (orderList == null)
+                return 0;
+
+            int applied = 0;
+            for (int i = 0; i < orderList.Count; i++)
+            {
+                JObject order = orderList[i] as JObject;
+                JObject metamorphose = order == null
+                    ? null
+                    : order["metamorphose"] as JObject;
+                if (metamorphose == null || !IsSenderOwned(metamorphose))
+                    continue;
+
+                JObject after = metamorphose["after"] as JObject;
+                if (after == null ||
+                    !TryGetInt(after["cardId"], out int cardId) || cardId <= 0)
+                {
+                    continue;
+                }
+
+                foreach (int index in EnumerateIndexes(metamorphose))
+                {
+                    if (identities.Transform(sourceIsHost, index, cardId))
+                        applied++;
+                }
+            }
+            return applied;
+        }
+
+        private static IEnumerable<int> EnumerateFusionMaterialIndexes(JObject message)
+        {
+            if (!TryGetInt(message["type"], out int actionType) ||
+                actionType != (int)NetworkBattleDefine.PlayActionType.FUSION)
+            {
+                yield break;
+            }
+
+            JArray targets = message["targetList"] as JArray;
+            if (targets == null)
+                yield break;
+
+            for (int i = 0; i < targets.Count; i++)
+            {
+                JObject target = targets[i] as JObject;
+                if (target == null || !IsSenderOwned(target))
+                    continue;
+
+                if (TryGetInt(target["targetIdx"], out int index) && index > 0)
+                    yield return index;
+            }
         }
 
         private static void LearnDeclaredIdentities(

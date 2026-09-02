@@ -94,5 +94,26 @@ namespace Shadowbus.Server.Room
                 }
             }
         }
+
+        /// <summary>
+        /// Applies an explicit metamorphose result to the current identity of
+        /// a card index. Unlike Learn, this is an authoritative state change,
+        /// so replacing the initial deck identity is expected and must not be
+        /// reported as index drift.
+        /// </summary>
+        public bool Transform(bool isHost, int index, int cardId)
+        {
+            if (index <= 0 || cardId <= 0)
+                return false;
+
+            lock (_sync)
+            {
+                Dictionary<int, int> target = isHost ? _hostCards : _guestCards;
+                if (target.TryGetValue(index, out int existing) && existing == cardId)
+                    return false;
+                target[index] = cardId;
+                return true;
+            }
+        }
     }
 }
