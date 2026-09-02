@@ -551,6 +551,15 @@ namespace Shadowbus.Server.Room
                         $"from {(sourceIsHost ? "host" : "guest")}");
                 }
 
+                int bridgedConditions = HiddenConditionBridge.Inject(clone);
+                if (bridgedConditions > 0)
+                {
+                    Plugin.Logger.LogInfo(
+                        $"[BattleSession] {RoomId} {uri}: bridged " +
+                        $"{bridgedConditions} hidden condition result(s) " +
+                        $"from {(sourceIsHost ? "host" : "guest")}");
+                }
+
                 // The active client encodes targets from its own view. The
                 // stock opponent receiver consumes this result as
                 // `oppoTargetList`; preserve the native target entries but
