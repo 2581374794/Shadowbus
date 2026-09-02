@@ -261,10 +261,14 @@ namespace Shadowbus.Server.SocketIO
             }
 
             string sequenceFields = SocketIoPayloadCodec.DescribeSequenceFields(message, sequence);
+            string structure = SocketIoPayloadCodec.DescribeBattleStructure(message);
+            string hiddenStructure = SocketIoPayloadCodec.DescribeHiddenConditionStructure(uri, message);
             Plugin.Logger.LogInfo(
                 $"[SocketIO] IN {eventName} {uri ?? "<unknown>"} from {connection.SessionId} " +
                 $"role={(connection.IsHost ? "host" : "guest")}, seq={sequence}, fields={sequenceFields}, " +
-                $"ack={(packetId.HasValue ? packetId.Value.ToString() : "none")}, bytes={binary.Length}");
+                $"shape={structure}, ack={(packetId.HasValue ? packetId.Value.ToString() : "none")}, " +
+                $"bytes={binary.Length}" +
+                (string.IsNullOrEmpty(hiddenStructure) ? string.Empty : ", hidden=" + hiddenStructure));
 
             if (uri == "ShadowbusProfile")
             {
@@ -362,6 +366,54 @@ namespace Shadowbus.Server.SocketIO
                     }
                     connection.LastRoomEntry = relayMessage?.DeepClone();
                 }
+            }
+
+            // The stock battle flow sends Judge back to the client that sent
+            // TurnEnd. NetworkOperationCollection.JudgeOperation then calls
+            // ControlTurnStartPlayer on that same client. Routing Judge to
+            // the opponent makes the player who ended the turn start another
+            // local turn, leaving both clients on the wrong turn state.
+            if (string.Equals(uri, "Judge", StringComparison.Ordinal))
+            {
+                // Judge is a server-generated loopback operation, but the
+                // native client has one receive playSeq stream per socket,
+                // not one stream per logical sender. Reserve its sequence on
+                // the already-established opponent -> sender bridge; using a
+                // fresh sender -> sender bridge would restart at playSeq=1
+                // and StockReceiveMgr would discard the packet as stale.
+                // The official response also marks the loopback recipient as
+                // the active player. Without this field, a second-player
+                // client keeps Matched.turnState=1 and its native
+                // SendTurnEnd() guard suppresses the next TurnEnd.
+                JToken judgeRelayMessage = relayMessage;
+                JObject judgeObject = relayMessage as JObject;
+                if (judgeObject != null)
+                {
+                    judgeRelayMessage = judgeObject.DeepClone();
+                    ((JObject)judgeRelayMessage)["turnState"] = 0;
+                }
+                Player opponent = FindOpponent(connection, room);
+                string sequenceSource = opponent == null
+                    ? connection.PlayerId
+                    : opponent.PlayerId;
+                RoutedMessage routed = _messageRouter.CreateServerMessage(
+                    room.RoomId,
+                    sequenceSource,
+                    connection.PlayerId,
+                    eventName,
+                    judgeRelayMessage);
+                if (routed != null && !routed.IsDuplicate)
+                {
+                    bool sent = SendRoutedMessage(connection, routed);
+                    if (sent)
+                        _messageRouter.MarkDelivered(room.RoomId, routed);
+                    Plugin.Logger.LogInfo(
+                        $"[SocketIO] Routed Judge back to sender {connection.SessionId}; " +
+                        $"sequenceSource={(opponent == null ? "self-fallback" : "opponent-stream")}, " +
+                        $"sent={sent}, sourceSeq={routed.SourceSequence}, " +
+                        $"deliverySeq={routed.DeliverySequence}");
+                }
+                return;
             }
 
             // Route against logical room slots rather than only currently
@@ -1054,9 +1106,9 @@ namespace Shadowbus.Server.SocketIO
             try
             {
                 JArray cards = snapshot["cardIds"] as JArray;
-                if (cards == null || cards.Count < 6 || cards.Count > 60)
+                if (cards == null || cards.Count < 6)
                 {
-                    error = "cardIds must contain between 6 and 60 cards";
+                    error = "cardIds must contain at least 6 cards";
                     return false;
                 }
 

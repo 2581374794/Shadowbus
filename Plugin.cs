@@ -224,6 +224,20 @@ public class Plugin : BaseUnityPlugin
             Harmony.CreateAndPatchAll(typeof(Server.SocketIoEnterRoomIdentityPatch));
             Harmony.CreateAndPatchAll(typeof(Server.SocketIoCertificationViewerIdPatch));
             Harmony.CreateAndPatchAll(typeof(Server.SocketIoBattleDeckPatch));
+            try
+            {
+                // Read-only diagnostics for hidden-card resolution. This is isolated so
+                // a game-version signature change cannot affect other patches.
+                var hiddenCardDiagnosticsHarmony =
+                    Harmony.CreateAndPatchAll(typeof(BattleHiddenCardDiagnostics));
+                Logger.LogInfo(
+                    $"[HiddenDiag] Harmony registration complete: " +
+                    $"{hiddenCardDiagnosticsHarmony.GetPatchedMethods().Count()} game method(s) patched.");
+            }
+            catch (System.Exception exception)
+            {
+                Logger.LogError($"[HiddenDiag] FAILED to apply diagnostics: {exception}");
+            }
             Harmony.CreateAndPatchAll(typeof(BossRushPatches));
             try
             {

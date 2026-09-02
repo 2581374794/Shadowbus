@@ -18,6 +18,7 @@ namespace Shadowbus.Server.Room
             new Dictionary<StreamKey, SequenceBridge>();
         private readonly Dictionary<string, InitRoomBattleState> _initStates =
             new Dictionary<string, InitRoomBattleState>(StringComparer.Ordinal);
+        private readonly CardIdentityRegistry _identities = new CardIdentityRegistry();
         private bool _matchedSent;
         private bool _battleStartSent;
         private bool _dealSent;
@@ -114,6 +115,11 @@ namespace Shadowbus.Server.Room
                 _hostFirst = new Random(_battleSeed).Next(2) == 0;
                 _hostCards = Shuffle(host.Deck.CardIds, new Random(_battleSeed ^ 0x13579BDF));
                 _guestCards = Shuffle(guest.Deck.CardIds, new Random(_battleSeed ^ 0x2468ACE0));
+                // The dealt order is the identity authority for both sides.
+                // It matches the idx = position + 1 contract that
+                // SocketIoServer.CreateDeckData sends to the owning client.
+                _identities.Seed(true, _hostCards);
+                _identities.Seed(false, _guestCards);
                 _hostMulligan = CreateMulliganState(
                     _hostCards.Length,
                     new Random(_battleSeed ^ 0x31415926));
@@ -462,7 +468,18 @@ namespace Shadowbus.Server.Room
             {
                 if (!_bridges.TryGetValue(key, out SequenceBridge bridge))
                 {
-                    bridge = new SequenceBridge(eventName);
+                    // A single `msg` bridge carries the whole battle stream,
+                    // including the setup frames that arrive before the host
+                    // and guest ids are recorded. Resolve the source role at
+                    // rewrite time so later battle frames still use the
+                    // correct perspective.
+                    bridge = new SequenceBridge(
+                        eventName,
+                        (data, sequence) => RewriteForReceiver(
+                            data,
+                            eventName,
+                            sequence,
+                            IsHostPlayer(sourcePlayerId)));
                     _bridges.Add(key, bridge);
                 }
                 return bridge.Accept(message, payload);
@@ -484,11 +501,133 @@ namespace Shadowbus.Server.Room
             {
                 if (!_bridges.TryGetValue(key, out SequenceBridge bridge))
                 {
-                    bridge = new SequenceBridge(eventName);
+                    bridge = new SequenceBridge(
+                        eventName,
+                        (data, sequence) => RewriteForReceiver(
+                            data,
+                            eventName,
+                            sequence,
+                            IsHostPlayer(sourcePlayerId)));
                     _bridges.Add(key, bridge);
                 }
                 return bridge.CreateServerMessage(message, deliverySequence);
             }
+        }
+
+        private bool IsHostPlayer(string playerId)
+        {
+            return !string.IsNullOrEmpty(playerId) &&
+                !string.IsNullOrEmpty(_hostPlayerId) &&
+                string.Equals(playerId, _hostPlayerId, StringComparison.Ordinal);
+        }
+
+        private JToken RewriteForReceiver(
+            JToken message,
+            string eventName,
+            int deliverySequence,
+            bool sourceIsHost)
+        {
+            // `hand` and matching/setup messages have their own native view
+            // semantics. Only battle messages contain relative `isSelf`
+            // fields and need the server-known card identities.
+            if (!string.Equals(eventName, "msg", StringComparison.Ordinal) ||
+                !(message is JObject data))
+            {
+                return message;
+            }
+
+            JObject clone = (JObject)data.DeepClone();
+            string uri = clone["uri"]?.Value<string>();
+            if (IsBattleViewMessage(uri))
+            {
+                // Reveal before flipping: the injected entries are written in
+                // the sender's perspective so the flip below turns them into
+                // the receiver's opponent-card form.
+                int revealed = HiddenCardRevealer.Inject(clone, uri, sourceIsHost, _identities);
+                if (revealed > 0)
+                {
+                    Plugin.Logger.LogInfo(
+                        $"[BattleSession] {RoomId} {uri}: revealed {revealed} hidden card(s) " +
+                        $"from {(sourceIsHost ? "host" : "guest")}");
+                }
+
+                // The active client encodes targets from its own view. The
+                // stock opponent receiver consumes this result as
+                // `oppoTargetList`; preserve the native target entries but
+                // move the envelope to the response-side name.
+                if (clone["targetList"] != null && clone["oppoTargetList"] == null)
+                {
+                    clone["oppoTargetList"] = clone["targetList"];
+                    clone.Remove("targetList");
+                }
+
+                FlipBattlePerspective(clone);
+            }
+
+            // The source pubSeq is used for ACK/retry. The receiving stock
+            // agent consumes its own contiguous playSeq stream.
+            clone["playSeq"] = deliverySequence;
+            return clone;
+        }
+
+        private static bool IsBattleViewMessage(string uri)
+        {
+            if (string.IsNullOrEmpty(uri))
+                return false;
+
+            switch (uri)
+            {
+                case "TurnStart":
+                case "PlayActions":
+                case "TurnEndActions":
+                case "TurnEnd":
+                case "TurnEndFinal":
+                case "Judge":
+                case "Echo":
+                case "BattleFinish":
+                case "Retire":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static bool TryGetInt(JToken value, out int result)
+        {
+            result = 0;
+            return value != null && int.TryParse(value.ToString(), out result);
+        }
+
+        private static void FlipBattlePerspective(JToken value)
+        {
+            JObject objectValue = value as JObject;
+            if (objectValue != null)
+            {
+                foreach (JProperty property in objectValue.Properties())
+                {
+                    // targetList/oppoTargetList entries keep the acting
+                    // player's target-relative `isSelf` flag.
+                    if (string.Equals(property.Name, "targetList", StringComparison.Ordinal) ||
+                        string.Equals(property.Name, "oppoTargetList", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+                    if (string.Equals(property.Name, "isSelf", StringComparison.Ordinal))
+                    {
+                        if (TryGetInt(property.Value, out int side) && (side == 0 || side == 1))
+                            property.Value = side == 0 ? 1 : 0;
+                        continue;
+                    }
+                    FlipBattlePerspective(property.Value);
+                }
+                return;
+            }
+
+            JArray arrayValue = value as JArray;
+            if (arrayValue == null)
+                return;
+            for (int i = 0; i < arrayValue.Count; i++)
+                FlipBattlePerspective(arrayValue[i]);
         }
 
         public void MarkDelivered(RoutedMessage message)
@@ -665,6 +804,7 @@ namespace Shadowbus.Server.Room
         private const int MaxHistory = 256;
 
         private readonly string _eventName;
+        private readonly Func<JToken, int, JToken> _rewrite;
         private readonly Dictionary<int, RoutedMessage> _history =
             new Dictionary<int, RoutedMessage>();
         private readonly Queue<RoutedMessage> _pending =
@@ -673,9 +813,12 @@ namespace Shadowbus.Server.Room
         private int _nextDeliverySequence = 1;
         private long _order;
 
-        public SequenceBridge(string eventName)
+        public SequenceBridge(
+            string eventName,
+            Func<JToken, int, JToken> rewrite = null)
         {
             _eventName = eventName ?? string.Empty;
+            _rewrite = rewrite;
         }
 
         public RoutedMessage Accept(JToken message, byte[] payload)
@@ -712,7 +855,9 @@ namespace Shadowbus.Server.Room
             // Keep accepting a forward gap and make it visible in logs; the
             // destination still receives a contiguous server-owned sequence.
             int deliverySequence = _nextDeliverySequence++;
-            JToken routedMessage = RewriteForReceiver(message, _eventName, deliverySequence);
+            JToken routedMessage = _rewrite == null
+                ? RewriteForReceiver(message, _eventName, deliverySequence)
+                : _rewrite(message, deliverySequence);
             byte[] routedPayload = routedMessage == message
                 ? payload
                 : SocketIoPayloadCodec.Encode(routedMessage);
@@ -746,7 +891,9 @@ namespace Shadowbus.Server.Room
                 deliverySequence = _nextDeliverySequence++;
             }
 
-            JToken routedMessage = RewriteForReceiver(message, _eventName, deliverySequence);
+            JToken routedMessage = _rewrite == null
+                ? RewriteForReceiver(message, _eventName, deliverySequence)
+                : _rewrite(message, deliverySequence);
             byte[] routedPayload = SocketIoPayloadCodec.Encode(routedMessage);
             var routed = new RoutedMessage(
                 _eventName,
@@ -817,26 +964,18 @@ namespace Shadowbus.Server.Room
             if (message == null)
                 return 0;
 
-            JToken value = message["pubSeq"];
-            if (value != null && int.TryParse(value.ToString(), out int sequence) && sequence > 0)
+            JObject wrapper = message as JObject;
+            JToken value = wrapper == null ? null : wrapper["pubSeq"];
+            int sequence;
+            if (value != null && int.TryParse(value.ToString(), out sequence) && sequence > 0)
                 return sequence;
-
-            if (string.Equals(eventName, "hand", StringComparison.Ordinal) &&
-                message is JArray hand && hand.Count > 3 &&
-                int.TryParse(hand[3]?.ToString(), out sequence) && sequence > 0)
-            {
-                return sequence;
-            }
 
             // Depending on the decoder path, hand data may be wrapped in the
             // StockHandData property instead of arriving as the root array.
-            // The native sender stores its source sequence at index 3 in both
-            // representations.
+            // Reliable hand URI types 2 and 5 carry pubSeq at index 3;
+            // ordinary hand types use that position as an input parameter.
             if (string.Equals(eventName, "hand", StringComparison.Ordinal) &&
-                message is JObject wrapper &&
-                wrapper["StockHandData"] is JArray stockHand &&
-                stockHand.Count > 3 &&
-                int.TryParse(stockHand[3]?.ToString(), out sequence) && sequence > 0)
+                SocketIoPayloadCodec.TryExtractReliableHandSequence(message, out sequence))
             {
                 return sequence;
             }

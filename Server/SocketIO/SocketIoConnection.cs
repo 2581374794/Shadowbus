@@ -161,14 +161,18 @@ namespace Shadowbus.Server.SocketIO
         {
             if (SocketIoPayloadCodec.TryDecodeQuiet(
                     payload,
-                    out Newtonsoft.Json.Linq.JToken message,
-                    out int sequence,
-                    out string uri))
+                out Newtonsoft.Json.Linq.JToken message,
+                out int sequence,
+                out string uri))
             {
                 string fields = SocketIoPayloadCodec.DescribeSequenceFields(message, sequence);
+                string structure = SocketIoPayloadCodec.DescribeBattleStructure(message);
+                string hiddenStructure = SocketIoPayloadCodec.DescribeHiddenConditionStructure(uri, message);
                 Plugin.Logger.LogInfo(
                     $"[SocketIO] OUT {eventName} {uri ?? "<unknown>"} to {SessionId} " +
-                    $"role={(IsHost ? "host" : "guest")}, seq={sequence}, fields={fields}, bytes={payload.Length}");
+                    $"role={(IsHost ? "host" : "guest")}, seq={sequence}, fields={fields}, " +
+                    $"shape={structure}, bytes={payload.Length}" +
+                    (string.IsNullOrEmpty(hiddenStructure) ? string.Empty : ", hidden=" + hiddenStructure));
             }
             else
             {
