@@ -684,3 +684,109 @@ Phase A 的服务器侧观测已经加入：`SocketIoServer` 记录收到的事�
 **待验证的同族预测：** `_isReceiveSkillConditionCheck` 可能是第三个同类缺陷（highlander 一类的条件）。`skillConditionCheck` 发送时只存在于 `orderList`，而接收方却在 `uList`/`knownList` 元素内查找它的键。若复现成立，按同一白名单机制扩展即可。
 
 **验收：** 双开复现 `900444040`，主动方回合结束时：入站日志 `hidden=` 中出现 `orderListKinds=openMyCards:1` 与 `orderEntries=openMyCardsKeys=idx[1]`；服务器出现 `[BattleSession] ... TurnEndActions: revealed N hidden card(s)`；出站 `hidden=` 的 `knownList[]`/`knownListOpen` 大于 0；对手客户端能看到手牌翻开并结算效果。同时回归 `119631020` 与普通出牌不受影响。
+
+### 18.13 隐藏卡费用状态桥接（暂缓，首次尝试已回退）
+
+原版发送端把隐藏区卡牌的费用变化写入 `orderList.alter`，例如
+`RegisterCostChangeCard` 的 `cost="s2"`。原版接收端不读取 `orderList`，而是在
+`knownList`/`uList` 卡牌条目中读取整数 `cost`，再由
+`ReplaceReceivedCard.CopyDataToActualCard` 应用最终消费。缺口本身是真实的。
+
+**首次尝试已回退**（服务器维护影子费用栈，在 `CardIdentityRegistry` 中记录修饰
+器并在每次揭示时写入 `cost`）。回退原因是两条与既定原则冲突的架构问题，不是参
+数可调的缺陷：
+
+1. **服务器重算了战斗规则。** 该实现把 Add/Set 与减半拆成两轮结算，无论原始顺
+   序减半永远最后生效；遇到 Set 还会清空所有非 resident 修饰器。原版由客户端自
+   己的 `ICardCostModifier` 栈按真实顺序结算。
+2. **写入语义远宽于原版。** `ReplaceReceivedCard.cs:590-593` 对 `cost` 的处理是
+   `CostSetModifier`（硬钉死），原版只在 accelerate/crystallize 链路带它（见
+   `NetworkBattleReceiver.cs:1473-1478` 的 `mutationAfterCost`）。该实现使任何
+   index 只要历史上出现过一次 `alter`，之后每一次揭示都携带 `cost`，波及
+   `119631020` 从牌库召唤出来的牌。
+
+**重做时必须先满足的收窄规则：** `cost` 只允许写在「揭示后卡牌仍留在手牌/牌库」
+的 reveal 上——即 `EnumerateDeclaredOpenIndexes`（openMyCards，牌不换区）与
+`to ∈ {Hand, Deck}` 的 `EnumerateOpenMoveIndexes`。卡牌进入场/墓地/消灭区后接收
+端已有真实卡对象，费用由其自身技能引擎推演，不需要也不应该由服务器指定。
+`EnumerateHiddenMoveIndexes`、`playIdx`、融合素材一律不写 `cost`。对客户端已有
+`knownList` 条目补写 `cost` 的做法（无区域约束的全局涂改）不要再引入。
+
+**影子费用栈另需同时满足的四个条件，缺一条则不要上：**
+
+- **幂等，抗 Echo。** `Inject` 对所有战斗 URI 调用，Echo 也在内；`MakeEchoData`
+  从回声方自己的 register manager 重建 orderList，同一逻辑修饰器可能被记两次。
+  需以 `(attachTarget, type, cost, idx)` 为幂等键——`attachTarget` 是
+  `RegisterAlter.MakeAttachTarget` 写入的 `EffectSkillPublicCount`，正是原版标识
+  技能实例的字段。
+- **随离开隐藏区清空。** 卡牌进场、被消灭、被 `Transform` 换身份时必须清掉该
+  index 的修饰器，否则 index 复用会把别人的费用带进来。
+- **分组索引显式放弃。** `PrivateAnytimeRandomTargetRegister` 路径的 `idx` 是
+  `PrivateGroupIndexMsg` 字符串，服务器无法解析。这类私有费用变化必须显式记一条
+  日志并跳过，不能静默漏掉——「部分同步」比完全不同步更难排查。
+- **base cost 不在网络线程上取。** `RewriteForReceiver` 跑在 socket 线程，
+  `CardMaster.GetInstanceForBattle()` 非主线程安全，catch-all 会让它静默返回
+  false、费用时有时无。应在发牌时一次性把 cardId→baseCost 缓存进注册表。
+
+叠加顺序无法在服务器上正确解决：只要不重算规则，就只能按接收顺序依次施加、不做
+任何重排；若某卡的实际效果依赖客户端特有的结算细节，接受它不同步，而不是猜。
+
+**已实现通用 alter 桥接（不含 cost）：** `HiddenAlterBridge` 处理 atk/life/clan/
+tribe/spellboost/unionburst/attachTarget 的隐藏区状态变更，在 `RewriteForReceiver`
+中、`HiddenCardRevealer.Inject` 之后调用。字段名翻译（atk→addAtk/setAtk，
+life→addLife/setLife）与数值剥前缀（`"a+3"`→`3`）按接收端 `MakeReceiveCardData` 的
+消费格式完成。**cost 排除**：需要 base cost（cardId→CardMaster 查询），socket 线程
+不安全且无主线程钩子填充缓存，留待后续架构改进（需在主线程发牌时缓存 baseCost，
+或改用主线程驱动的 message rewrite）。
+
+**复现用例缺失：** 现有日志中观察到的 `alter` 全部形如
+`alterKeys=[idx[N]|isSelf|type|spellboost|attachTarget]`（spellboost，不含
+`cost`），说明该局从未触发过 cost alter。重做前需先构造确定的复现用例，否则无法
+验证。
+
+### 18.14 瞬念召唤间歇性不同步（排查中）
+
+`119631020` 在联机中**间歇性**不同步——同一份代码，有时正常有时失效。这一条推翻
+了两个此前的判断，记录在此以免重复走弯路：
+
+1. **不是费用桥接导致的。** §18.13 的回退没有解决问题，回退后仍复现。
+2. **服务器侧是正确的，不需要再改。** 两次失败与成功的报文都经过核对：
+
+   ```
+   失败局 IN  idxList=[5]  from=0 to=20 ; idxList=[37] from=0 to=40 cardId=present
+          OUT knownList[]=2, knownListOpen=2
+   成功局 [HiddenCardReveal] TurnEndActions from guest: 16=>119631021 42=>119631021
+   ```
+
+   两局都识别了「牌库→场」与「牌库→消灭」两个 index，都注入了带 cardId 的
+   knownList。发牌日志确认 `119631021` 位于 guest 的 idx 16/17/42，注入的配对与
+   发牌完全一致。**索引契约也已核对无误**：对手牌库是 40 张 `100011010` 假卡，
+   `NetworkUserInfoData.IdListConvertToModelList` 与 `SBattleLoad.InitEnemy` 均按
+   `Index = i + 1` 编号，与服务器 `CreateDeckData` 的 `idx = position + 1` 一致。
+
+**故障因此位于接收端消费 knownList 的环节。** 首要嫌疑是
+`ReplaceReceivedCard.SearchForDummyCardInHandAndDeck`（`ReplaceReceivedCard.cs:70-80`）：
+
+```csharp
+this._originalDummyCard = battlePlayer.DeckCardList.SingleOrDefault(c => c.Index == this.CardIdx);
+```
+
+`SingleOrDefault` 在该 index 重复时**抛异常**、缺失时返回 null；`ReplaceCard` 随
+即返回 null，整条揭示被静默丢弃。两种情况都取决于该局此前发生过什么，因而表现为
+间歇性。次要嫌疑是 `NetworkBattleData.BeforeSettingReceiveData` 的 uList 调和
+（`from=Deck && to=Banish` 且 knownList 条目 `IsOpen` 时丢弃该 uList 条目）。
+
+**已加入只读诊断补丁**（`BattleHiddenCardDiagnostics.cs`，经用户批准）。三个钩子
+全部为 postfix 或无返回值 prefix，不改变任何战斗状态或控制流：
+
+- `ReplaceReceivedCard.ReplaceCard` postfix：记录 result 是否为 null，以及该
+  index 在 deck/hand/cemetery/necromance/reserved 各区的**匹配计数**——deck 与
+  hand 是 `SingleOrDefault` 查找，计数不为 0 或 1 即是缺陷；
+- `NetworkBattleData.BeforeSettingReceiveData` prefix：记录整份 knownList 与
+  uList（index、cardId、is_open、from→to），用于区分「条目被丢弃」与「条目从未
+  送达」；
+- `NetworkExecutionInfoCreator.CheckCondition` postfix（仅 deck-self、仅对手
+  卡）：记录判定结果与所走分支标志，以及 `GetReceiveCardList()` 的实际内容。
+
+**下一步：** 复现失败局，按上述三条日志定位是 dummy 缺失、index 重复，还是
+CheckCondition 在 knownList 完好的情况下仍然否决。

@@ -120,6 +120,11 @@ namespace Shadowbus.Server.Room
                 // SocketIoServer.CreateDeckData sends to the owning client.
                 _identities.Seed(true, _hostCards);
                 _identities.Seed(false, _guestCards);
+                // The whole reveal mechanism rests on this mapping being the
+                // same one each client received. Record it once so a mismatch
+                // can be diagnosed without patching the client.
+                LogDealtDeck("host", _hostCards);
+                LogDealtDeck("guest", _guestCards);
                 _hostMulligan = CreateMulliganState(
                     _hostCards.Length,
                     new Random(_battleSeed ^ 0x31415926));
@@ -201,6 +206,19 @@ namespace Shadowbus.Server.Room
                 result[j] = value;
             }
             return result;
+        }
+
+        private void LogDealtDeck(string role, int[] cards)
+        {
+            if (cards == null)
+                return;
+
+            var parts = new List<string>(cards.Length);
+            for (int i = 0; i < cards.Length; i++)
+                parts.Add((i + 1) + "=" + cards[i]);
+            Plugin.Logger.LogInfo(
+                $"[CardIdentity] {RoomId} dealt {role} deck: " +
+                string.Join(" ", parts.ToArray()));
         }
 
         private static MulliganState CreateMulliganState(int deckSize, Random random)
@@ -575,6 +593,15 @@ namespace Shadowbus.Server.Room
                     Plugin.Logger.LogInfo(
                         $"[BattleSession] {RoomId} {uri}: bridged " +
                         $"{bridgedConditions} hidden condition result(s) " +
+                        $"from {(sourceIsHost ? "host" : "guest")}");
+                }
+
+                int bridgedAlters = HiddenAlterBridge.Inject(clone, sourceIsHost, _identities);
+                if (bridgedAlters > 0)
+                {
+                    Plugin.Logger.LogInfo(
+                        $"[BattleSession] {RoomId} {uri}: bridged " +
+                        $"{bridgedAlters} hidden state alter(s) " +
                         $"from {(sourceIsHost ? "host" : "guest")}");
                 }
 

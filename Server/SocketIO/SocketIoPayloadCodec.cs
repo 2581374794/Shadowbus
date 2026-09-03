@@ -143,8 +143,15 @@ namespace Shadowbus.Server.SocketIO
         /// </summary>
         internal static string DescribeHiddenConditionStructure(string uri, JToken json)
         {
+            // Echo and TurnStart carry the same register kinds as the two
+            // action messages: Echo replays the receiver's own orderList back
+            // to the sender, which is exactly where a non-idempotent server
+            // rewrite would double-count. Leaving them out made half the
+            // battle traffic invisible.
             if (!string.Equals(uri, "PlayActions", StringComparison.Ordinal) &&
-                !string.Equals(uri, "TurnEndActions", StringComparison.Ordinal))
+                !string.Equals(uri, "TurnEndActions", StringComparison.Ordinal) &&
+                !string.Equals(uri, "Echo", StringComparison.Ordinal) &&
+                !string.Equals(uri, "TurnStart", StringComparison.Ordinal))
             {
                 return null;
             }

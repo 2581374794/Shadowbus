@@ -54,15 +54,6 @@ public class Plugin : BaseUnityPlugin
         Instance = this;
         // Plugin startup logic
         Logger = base.Logger;
-        EnhancedLogSystem.Initialize(Config);
-        try
-        {
-            Harmony.CreateAndPatchAll(typeof(EnhancedLogPatches));
-        }
-        catch (System.Exception exception)
-        {
-            Logger.LogError($"[Logging] FAILED to apply enhanced log patch: {exception}");
-        }
         Logger.LogInfo($"Plugin Shadowbus is loaded!");
 
         socketIoBindAddress = Config.Bind(
@@ -327,6 +318,5 @@ public class Plugin : BaseUnityPlugin
     {
         LLMAITurnController.CancelAll("plugin_destroyed");
         Server.OnlineRuntime.Shutdown();
-        EnhancedLogSystem.Shutdown();
     }
 }

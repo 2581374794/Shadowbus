@@ -193,7 +193,32 @@ namespace Shadowbus.Server.Room
             }
             for (int i = 0; i < injected.Count; i++)
                 knownList.Add(injected[i]);
+
+            // The identity is the one thing the server cannot verify on its
+            // own: a wrong index -> cardId mapping produces a message that
+            // looks correct here and fails silently inside the receiver's
+            // ReplaceReceivedCard. Log the pairs so they can be compared
+            // against what the opponent client actually renders.
+            Plugin.Logger.LogInfo(
+                $"[HiddenCardReveal] {uri} from {(sourceIsHost ? "host" : "guest")}: " +
+                DescribeInjected(injected));
             return injected.Count;
+        }
+
+        private static string DescribeInjected(List<JObject> injected)
+        {
+            var parts = new List<string>(injected.Count);
+            for (int i = 0; i < injected.Count; i++)
+            {
+                JObject entry = injected[i];
+                TryGetInt(entry["idx"], out int index);
+                string identity = TryGetInt(entry["cardId"], out int cardId)
+                    ? cardId.ToString()
+                    : "hidden";
+                bool isOpen = TryGetInt(entry["is_open"], out int open) && open == 1;
+                parts.Add($"{index}=>{identity}{(isOpen ? "" : "(closed)")}");
+            }
+            return string.Join(" ", parts.ToArray());
         }
 
         /// <summary>

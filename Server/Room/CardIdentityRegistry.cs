@@ -28,6 +28,13 @@ namespace Shadowbus.Server.Room
         private readonly object _sync = new object();
         private readonly Dictionary<int, int> _hostCards = new Dictionary<int, int>();
         private readonly Dictionary<int, int> _guestCards = new Dictionary<int, int>();
+        // Base cost for each dealt card, keyed by index. Populated when the
+        // deck is dealt so a hidden card's cost change (which the receiver
+        // settles as an absolute value) can be folded correctly later. Kept
+        // separate from the identity map because a card's identity can change
+        // (metamorphose) without its base cost being relearned.
+        private readonly Dictionary<int, int> _hostBaseCosts = new Dictionary<int, int>();
+        private readonly Dictionary<int, int> _guestBaseCosts = new Dictionary<int, int>();
 
         /// <summary>
         /// Records the shuffled deck the server dealt to one side. Replaces any
@@ -46,6 +53,40 @@ namespace Shadowbus.Server.Room
                     if (shuffledCards[i] > 0)
                         target[i + 1] = shuffledCards[i];
                 }
+            }
+        }
+
+        /// <summary>
+        /// Records the base cost of a card index. Call from the main thread
+        /// when the deck is dealt, so that a later socket-thread fold of a
+        /// cost change does not need to touch CardMaster.
+        /// </summary>
+        public void CacheBaseCost(bool isHost, int index, int baseCost)
+        {
+            if (index <= 0)
+                return;
+
+            lock (_sync)
+            {
+                Dictionary<int, int> target = isHost ? _hostBaseCosts : _guestBaseCosts;
+                target[index] = baseCost;
+            }
+        }
+
+        /// <summary>
+        /// Returns the cached base cost for an index. False when the card is
+        /// not one the server dealt, or the cost was never cached.
+        /// </summary>
+        public bool TryGetBaseCost(bool isHost, int index, out int baseCost)
+        {
+            baseCost = 0;
+            if (index <= 0)
+                return false;
+
+            lock (_sync)
+            {
+                Dictionary<int, int> source = isHost ? _hostBaseCosts : _guestBaseCosts;
+                return source.TryGetValue(index, out baseCost);
             }
         }
 
