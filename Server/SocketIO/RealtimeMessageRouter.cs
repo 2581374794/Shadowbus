@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using Shadowbus.Server.Room;
+using Wizard;
 
 namespace Shadowbus.Server.SocketIO
 {
@@ -14,6 +15,18 @@ namespace Shadowbus.Server.SocketIO
         private readonly Dictionary<string, BattleSession> _sessions =
             new Dictionary<string, BattleSession>(StringComparer.Ordinal);
         private readonly object _sync = new object();
+        private CardMaster _cardMaster;
+
+        public void SetCardMaster(CardMaster cardMaster)
+        {
+            lock (_sync)
+            {
+                _cardMaster = cardMaster;
+                // Propagate to existing sessions
+                foreach (var session in _sessions.Values)
+                    session.SetCardMaster(cardMaster);
+            }
+        }
 
         public BattleSession GetOrCreate(string roomId)
         {
@@ -25,6 +38,8 @@ namespace Shadowbus.Server.SocketIO
                 if (!_sessions.TryGetValue(roomId, out BattleSession session))
                 {
                     session = new BattleSession(roomId);
+                    if (_cardMaster != null)
+                        session.SetCardMaster(_cardMaster);
                     _sessions.Add(roomId, session);
                 }
                 return session;

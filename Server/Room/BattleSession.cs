@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using Newtonsoft.Json.Linq;
 using Shadowbus.Server.SocketIO;
+using Wizard;
 
 namespace Shadowbus.Server.Room
 {
@@ -19,6 +20,8 @@ namespace Shadowbus.Server.Room
         private readonly Dictionary<string, InitRoomBattleState> _initStates =
             new Dictionary<string, InitRoomBattleState>(StringComparer.Ordinal);
         private readonly CardIdentityRegistry _identities = new CardIdentityRegistry();
+        private readonly HiddenCardStateRegistry _hiddenCardStates =
+            new HiddenCardStateRegistry();
         private bool _matchedSent;
         private bool _battleStartSent;
         private bool _dealSent;
@@ -38,6 +41,11 @@ namespace Shadowbus.Server.Room
         }
 
         public string RoomId { get; }
+
+        public void SetCardMaster(CardMaster cardMaster)
+        {
+            _identities.SetCardMaster(cardMaster);
+        }
 
         public bool RecordInitRoomBattle(
             string playerId,
@@ -120,6 +128,7 @@ namespace Shadowbus.Server.Room
                 // SocketIoServer.CreateDeckData sends to the owning client.
                 _identities.Seed(true, _hostCards);
                 _identities.Seed(false, _guestCards);
+                _hiddenCardStates.Reset();
                 // The whole reveal mechanism rests on this mapping being the
                 // same one each client received. Record it once so a mismatch
                 // can be diagnosed without patching the client.
@@ -136,6 +145,15 @@ namespace Shadowbus.Server.Room
                 _matchedSent = true;
                 return true;
             }
+        }
+
+        public bool TryBeginMatched(
+            string hostPlayerId,
+            string guestPlayerId,
+            CardMaster cardMaster)
+        {
+            SetCardMaster(cardMaster);
+            return TryBeginMatched(hostPlayerId, guestPlayerId);
         }
 
         public bool TryGetBattleSetup(
@@ -425,6 +443,8 @@ namespace Shadowbus.Server.Room
                     _hostMulligan == null || _guestMulligan == null ||
                     !_hostMulligan.SwapSubmitted || !_guestMulligan.SwapSubmitted)
                     return false;
+                _identities.SetInitialHand(true, _hostMulligan.Final);
+                _identities.SetInitialHand(false, _guestMulligan.Final);
                 _readySent = true;
                 return true;
             }
@@ -558,6 +578,11 @@ namespace Shadowbus.Server.Room
             string uri = clone["uri"]?.Value<string>();
             if (IsBattleViewMessage(uri))
             {
+                // The client sends keyAction selections in a request-only
+                // envelope. Flatten it to the official response shape before
+                // the stock opponent receiver parses the action.
+                KeyActionBridge.NormalizeForReceiver(clone);
+
                 // Reveal before flipping: the injected entries are written in
                 // the sender's perspective so the flip below turns them into
                 // the receiver's opponent-card form.
@@ -567,6 +592,26 @@ namespace Shadowbus.Server.Room
                     Plugin.Logger.LogInfo(
                         $"[BattleSession] {RoomId} {uri}: revealed {revealed} hidden card(s) " +
                         $"from {(sourceIsHost ? "host" : "guest")}");
+                }
+
+                // A hidden card's own when_play_other cost change is omitted
+                // by NetworkSkill_cost_change.IsSend. Reconstruct that one
+                // official server responsibility while the played card and
+                // the resident cards are still in their pre-move hand state.
+                if (string.Equals(uri, "PlayActions", StringComparison.Ordinal) &&
+                    TryGetInt(clone["playIdx"], out int playedIndex) && playedIndex > 0)
+                {
+                    int residentAlters = _identities.ApplyHandResidentCostRules(
+                        sourceIsHost,
+                        playedIndex,
+                        _hiddenCardStates);
+                    if (residentAlters > 0)
+                    {
+                        Plugin.Logger.LogInfo(
+                            $"[BattleSession] {RoomId} {uri}: applied " +
+                            $"{residentAlters} hidden hand resident cost change(s) " +
+                            $"from {(sourceIsHost ? "host" : "guest")}");
+                    }
                 }
 
                 // PlayActions is emitted after the local fusion/transform
@@ -596,7 +641,12 @@ namespace Shadowbus.Server.Room
                         $"from {(sourceIsHost ? "host" : "guest")}");
                 }
 
-                int bridgedAlters = HiddenAlterBridge.Inject(clone, sourceIsHost, _identities);
+                int bridgedAlters = HiddenAlterBridge.Inject(
+                    clone,
+                    uri,
+                    sourceIsHost,
+                    _identities,
+                    _hiddenCardStates);
                 if (bridgedAlters > 0)
                 {
                     Plugin.Logger.LogInfo(
@@ -604,6 +654,11 @@ namespace Shadowbus.Server.Room
                         $"{bridgedAlters} hidden state alter(s) " +
                         $"from {(sourceIsHost ? "host" : "guest")}");
                 }
+
+                // Both uList and orderList.move describe authoritative zone
+                // transitions. Apply them only after the resident trigger has
+                // observed the hand state at the instant the card was played.
+                _identities.ApplyMessageZones(clone, sourceIsHost);
 
                 // The active client encodes targets from its own view. The
                 // stock opponent receiver consumes this result as

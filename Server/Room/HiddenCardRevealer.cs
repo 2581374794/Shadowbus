@@ -296,10 +296,7 @@ namespace Shadowbus.Server.Room
             CardIdentityRegistry identities)
         {
             JArray unapprovedList = message["uList"] as JArray;
-            if (unapprovedList == null)
-                return;
-
-            for (int i = 0; i < unapprovedList.Count; i++)
+            for (int i = 0; unapprovedList != null && i < unapprovedList.Count; i++)
             {
                 JObject entry = unapprovedList[i] as JObject;
                 if (entry == null || !IsSenderOwned(entry) ||
@@ -313,6 +310,99 @@ namespace Shadowbus.Server.Room
                 foreach (int index in EnumerateIndexes(entry))
                     identities.Learn(sourceIsHost, index, cardId);
             }
+
+            LearnAddedIdentities(message, sourceIsHost, identities);
+        }
+
+        /// <summary>
+        /// Records cards created after the initial deck was dealt. RegisterToken
+        /// sends card.cardId directly; RegisterChoiceAdd sends its candidates
+        /// while keyAction.selectCard carries the chosen identity. The latter is
+        /// the same result the stock receiver uses to recreate a choice token.
+        /// </summary>
+        private static void LearnAddedIdentities(
+            JObject message,
+            bool sourceIsHost,
+            CardIdentityRegistry identities)
+        {
+            JArray orderList = message["orderList"] as JArray;
+            if (orderList == null)
+                return;
+
+            List<int> selectedChoiceIds = CollectSelectedChoiceIds(message);
+            for (int i = 0; i < orderList.Count; i++)
+            {
+                JObject order = orderList[i] as JObject;
+                JObject add = order == null ? null : order["add"] as JObject;
+                JObject card = add == null ? null : add["card"] as JObject;
+                if (add == null || card == null || !IsSenderOwned(add))
+                    continue;
+
+                var indexes = new List<int>(EnumerateIndexes(add));
+                if (indexes.Count == 0)
+                    continue;
+
+                if (TryGetInt(card["cardId"], out int cardId) && cardId > 0)
+                {
+                    for (int j = 0; j < indexes.Count; j++)
+                        identities.Learn(sourceIsHost, indexes[j], cardId);
+                    continue;
+                }
+
+                var candidates = new HashSet<int>(EnumerateIndexToken(card["candidates"]));
+                if (candidates.Count == 0)
+                    continue;
+
+                if (candidates.Count == 1)
+                {
+                    int onlyCandidate = 0;
+                    foreach (int candidate in candidates)
+                        onlyCandidate = candidate;
+                    for (int j = 0; j < indexes.Count; j++)
+                        identities.Learn(sourceIsHost, indexes[j], onlyCandidate);
+                    continue;
+                }
+
+                var selectedForAdd = new List<int>();
+                for (int j = 0; j < selectedChoiceIds.Count; j++)
+                {
+                    int selected = selectedChoiceIds[j];
+                    if (candidates.Contains(selected))
+                        selectedForAdd.Add(selected);
+                }
+
+                // One selected card may be created repeatedly. Multiple
+                // selected cards are safe only when their count matches the
+                // emitted indexes; otherwise leave the identity unresolved.
+                if (selectedForAdd.Count == 1)
+                {
+                    for (int j = 0; j < indexes.Count; j++)
+                        identities.Learn(sourceIsHost, indexes[j], selectedForAdd[0]);
+                }
+                else if (selectedForAdd.Count == indexes.Count)
+                {
+                    for (int j = 0; j < indexes.Count; j++)
+                        identities.Learn(sourceIsHost, indexes[j], selectedForAdd[j]);
+                }
+            }
+        }
+
+        private static List<int> CollectSelectedChoiceIds(JObject message)
+        {
+            var result = new List<int>();
+            JArray actions = message["keyAction"] as JArray;
+            for (int i = 0; actions != null && i < actions.Count; i++)
+            {
+                JObject action = actions[i] as JObject;
+                JToken selection = action == null ? null : action["selectCard"];
+                JObject requestSelection = selection as JObject;
+                if (requestSelection != null)
+                    selection = requestSelection["cardId"];
+
+                foreach (int cardId in EnumerateIndexToken(selection))
+                    result.Add(cardId);
+            }
+            return result;
         }
 
         private static IEnumerable<int> EnumerateHiddenMoveIndexes(JObject message)

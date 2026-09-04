@@ -11,6 +11,7 @@ using Newtonsoft.Json.Linq;
 using Shadowbus.Server.Core;
 using Shadowbus.Server.Network;
 using Shadowbus.Server.Room;
+using Wizard;
 
 namespace Shadowbus.Server.SocketIO
 {
@@ -35,6 +36,7 @@ namespace Shadowbus.Server.SocketIO
         private TcpListener _listener;
         private Thread _listenerThread;
         private volatile bool _running;
+        private CardMaster _cardMaster;
 
         public SocketIoServer(ServerConfig config)
         {
@@ -46,6 +48,12 @@ namespace Shadowbus.Server.SocketIO
         public int Port => _config.Port;
         public string RoomCode { get; private set; }
         public RoomManager Rooms => _rooms;
+
+        public void SetCardMaster(CardMaster cardMaster)
+        {
+            _cardMaster = cardMaster;
+            _messageRouter.SetCardMaster(cardMaster);
+        }
 
         public bool Start()
         {
@@ -698,7 +706,7 @@ namespace Shadowbus.Server.SocketIO
             }
 
             if (host == null || guest == null ||
-                !session.TryBeginMatched(host.PlayerId, guest.PlayerId))
+                !session.TryBeginMatched(host.PlayerId, guest.PlayerId, _cardMaster))
                 return;
 
             SendMatched(session, room, host, guest);

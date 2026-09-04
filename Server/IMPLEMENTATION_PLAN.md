@@ -739,10 +739,20 @@ life→addLife/setLife）与数值剥前缀（`"a+3"`→`3`）按接收端 `Make
 不安全且无主线程钩子填充缓存，留待后续架构改进（需在主线程发牌时缓存 baseCost，
 或改用主线程驱动的 message rewrite）。
 
-**复现用例缺失：** 现有日志中观察到的 `alter` 全部形如
-`alterKeys=[idx[N]|isSelf|type|spellboost|attachTarget]`（spellboost，不含
-`cost`），说明该局从未触发过 cost alter。重做前需先构造确定的复现用例，否则无法
-验证。
+**2026-09-03 更新：隐藏状态记录第一阶段已实现。** `HiddenCardStateRegistry` 按双方
+index 跨消息保存增幅和原始费用修饰操作，按原版 `RegisterSpellboost` 语义把 `aN` 作为
+增量、`sN` 作为绝对设定，并跳过 `Echo` 以避免重复累计。仍未公开的卡通过不含 `cardId`
+的匿名 `knownList` 同步绝对 `spellboost`，复用原版 `SetPrivateCardSpellboost`；卡牌
+公开时，投影层补入当前累计状态，并在公开完成后清理该 index 的隐藏副本，避免 index
+复用继承旧状态。
+
+当前公开投影读取 CardMaster 的费用规则字段，用通用的算术表达式求值器计算内建魔力
+增幅费用，并将已记录的 `a/s/d/D` 费用操作按顺序折叠；这只是隐藏状态投影，不是完整
+服务器卡牌引擎。后续应继续扩展 DSL 编译覆盖面，再逐类扩展其他隐藏修饰器。
+
+本阶段继续补充了隐藏 `atk/life` 修饰的会话级记录。服务器保存 `a+N/s+N` 的有效
+折叠结果，卡牌公开时投影为原版 `knownList` 的 `addAtk/setAtk/addLife/setLife`；
+隐藏期间不发送客户端无法消费的伪匿名攻防条目。
 
 ### 18.14 瞬念召唤间歇性不同步（排查中）
 
@@ -790,3 +800,26 @@ this._originalDummyCard = battlePlayer.DeckCardList.SingleOrDefault(c => c.Index
 
 **下一步：** 复现失败局，按上述三条日志定位是 dummy 缺失、index 重复，还是
 CheckCondition 在 knownList 完好的情况下仍然否决。
+
+### 18.15 隐藏手牌自身驻留减费：第一阶段已实现（2026-09-04）
+
+本阶段针对 `131321010` 及同族效果完成服务器侧补全。原版
+`NetworkSkill_cost_change.IsSend` 会省略「技能持有卡仍在手牌、目标为自身」的
+`when_play_other` 费用变化；服务器因此必须利用双方完整的 index→cardId 映射，在
+公开出牌事件到达时重建这一类规则。
+
+已实现：
+
+- `CardIdentityRegistry` 保存双方 index 的 `Deck/Hand/其他` 区域，并在 Ready 时用
+  最终换牌结果初始化起手牌；之后由 `uList`、`orderList.move` 和 `PlayActions.playIdx`
+  更新区域。
+- 从 CardMaster 编译所有 `cost_change + when_play_other + target=self` 技能，按
+  公开出牌的 `card_type/tribe/clan` 过滤，并支持 `hand_self.count`、
+  `hand_self.unit.count` 的隐藏条件及常量 `add/set` 费用选项。没有卡牌 ID 特判。
+- 触发结果写入现有 `HiddenCardStateRegistry`。目标仍隐藏时不伪造可消费的费用字段；
+  目标之后公开时由现有 `HiddenAlterBridge` 将最终费用投影到 `knownList.cost`，继续
+  复用原版接收端。
+
+本阶段暂不计算含复杂私有变量、随机选择、临时移除语义或动态算术表达式的费用规则，
+这些留待单独阶段，避免服务器猜测客户端内部 modifier 栈。客户端和反编译源码均未
+修改。

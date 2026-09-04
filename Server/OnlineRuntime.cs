@@ -98,6 +98,15 @@ namespace Shadowbus.Server
                     SkinId = skinId,
                     SleeveId = (int)(selected?.GetDeckSleeveID() ?? dataMgr?.GetPlayerSleeveId() ?? 0L)
                 };
+
+                // Room creation can happen before the battle CardMaster is
+                // initialized. Deck capture happens later on the main thread,
+                // so refresh the server reference here before matching uses it
+                // to restore hidden spellboost-derived costs.
+                CardMaster cardMaster = CardMaster.GetInstanceForBattle();
+                if (cardMaster != null)
+                    _server?.SetCardMaster(cardMaster);
+
                 Plugin.Logger.LogInfo(
                     $"[OnlineRuntime] Captured local battle deck {deckNo}: " +
                     $"class={classId}, subclass={subclassId}, cards={_localBattleDeck.CardIds.Length}");
@@ -137,6 +146,21 @@ namespace Shadowbus.Server
             try
             {
                 _server = new SocketIoServer(_config);
+
+                // Pass CardMaster reference to server so it can populate base costs
+                // for hidden card state changes (cost alterations during battle).
+                // CardMaster is a singleton safe to call from the main thread.
+                try
+                {
+                    CardMaster cardMaster = CardMaster.GetInstanceForBattle();
+                    _server.SetCardMaster(cardMaster);
+                }
+                catch (Exception cmEx)
+                {
+                    Plugin.Logger.LogWarning(
+                        $"[OnlineRuntime] CardMaster unavailable, cost alterations will not sync: {cmEx.Message}");
+                }
+
                 if (!_server.Start())
                 {
                     LastError = "Unable to start Socket.IO listener";
