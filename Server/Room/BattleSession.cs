@@ -34,6 +34,14 @@ namespace Shadowbus.Server.Room
         private int[] _guestCards;
         private MulliganState _hostMulligan;
         private MulliganState _guestMulligan;
+        private string _lastPlayPlayerId;
+        private string _lastTurnEndActionsPlayerId;
+        private string _lastTurnEndPlayerId;
+        private string _lastTurnEndFinalPlayerId;
+        private string _lastDeckoutPlayerId;
+        private string _lastSpecialWinPlayerId;
+        private BattleEventKind _lastBattleEvent;
+        private BattleOutcome _outcome;
 
         public BattleSession(string roomId)
         {
@@ -41,6 +49,196 @@ namespace Shadowbus.Server.Room
         }
 
         public string RoomId { get; }
+
+        internal void RecordBattleEvent(string playerId, string uri, JToken message)
+        {
+            if (string.IsNullOrEmpty(playerId) || string.IsNullOrEmpty(uri))
+                return;
+
+            lock (_sync)
+            {
+                switch (uri)
+                {
+                    case "PlayActions":
+                        _lastPlayPlayerId = playerId;
+                        _lastBattleEvent = BattleEventKind.PlayActions;
+                        break;
+                    case "TurnEndActions":
+                        _lastTurnEndActionsPlayerId = playerId;
+                        _lastBattleEvent = BattleEventKind.TurnEndActions;
+                        break;
+                    case "TurnEnd":
+                        _lastTurnEndPlayerId = playerId;
+                        _lastBattleEvent = BattleEventKind.TurnEnd;
+                        break;
+                    case "TurnEndFinal":
+                        _lastTurnEndFinalPlayerId = playerId;
+                        _lastBattleEvent = BattleEventKind.TurnEndFinal;
+                        break;
+                }
+
+                JObject root = message as JObject;
+                JArray orderList = root?["orderList"] as JArray;
+                if (orderList == null)
+                    return;
+
+                for (int i = 0; i < orderList.Count; i++)
+                {
+                    JObject entry = orderList[i] as JObject;
+                    JObject specialWin = entry?["specialWin"] as JObject;
+                    if (specialWin != null)
+                    {
+                        int specialSelf;
+                        _lastSpecialWinPlayerId =
+                            !TryGetInt(specialWin["isSelf"], out specialSelf) || specialSelf != 0
+                                ? playerId
+                                : GetOpponentPlayerId(playerId);
+                    }
+                    JObject deckout = entry?["deckout"] as JObject;
+                    if (deckout == null)
+                        continue;
+
+                    int deckoutSelf;
+                    if (!TryGetInt(deckout["isSelf"], out deckoutSelf) || deckoutSelf != 0)
+                        _lastDeckoutPlayerId = playerId;
+                    else
+                        _lastDeckoutPlayerId = GetOpponentPlayerId(playerId);
+                    break;
+                }
+            }
+        }
+
+        internal void ResolveLikelyOutcome(
+            string judgePlayerId,
+            out string winnerPlayerId,
+            out int winnerResult,
+            out int loserResult)
+        {
+            lock (_sync)
+            {
+                winnerPlayerId = ResolveLikelyWinner(judgePlayerId);
+                if (!string.IsNullOrEmpty(_lastSpecialWinPlayerId))
+                {
+                    string specialWinner = _lastSpecialWinPlayerId;
+                    if (!string.IsNullOrEmpty(specialWinner))
+                    {
+                        winnerPlayerId = specialWinner;
+                        winnerResult = 107;
+                        loserResult = 108;
+                        return;
+                    }
+                }
+                if (!string.IsNullOrEmpty(_lastDeckoutPlayerId))
+                {
+                    string deckoutWinner = GetOpponentPlayerId(_lastDeckoutPlayerId);
+                    if (!string.IsNullOrEmpty(deckoutWinner))
+                    {
+                        winnerPlayerId = deckoutWinner;
+                        winnerResult = 103;
+                        loserResult = 104;
+                        return;
+                    }
+                }
+
+                winnerResult = 101;
+                loserResult = 102;
+            }
+        }
+
+        internal string ResolveLikelyWinner(string judgePlayerId)
+        {
+            lock (_sync)
+            {
+                // A lethal action is finalized by the acting client with
+                // TurnEndFinal. That client is the normal winner. A direct
+                // PlayActions terminal event uses the same acting player.
+                if (_lastBattleEvent == BattleEventKind.TurnEndFinal &&
+                    !string.IsNullOrEmpty(_lastTurnEndFinalPlayerId))
+                    return _lastTurnEndFinalPlayerId;
+                if (_lastBattleEvent == BattleEventKind.PlayActions &&
+                    !string.IsNullOrEmpty(_lastPlayPlayerId))
+                    return _lastPlayPlayerId;
+
+                // At the end of a turn, the active player's own death is
+                // resolved by the opponent's Judge operation.
+                if (_lastBattleEvent == BattleEventKind.TurnEnd &&
+                    !string.IsNullOrEmpty(_lastTurnEndPlayerId))
+                    return GetOpponentPlayerId(_lastTurnEndPlayerId);
+
+                if (_lastBattleEvent == BattleEventKind.TurnEndActions &&
+                    !string.IsNullOrEmpty(_lastTurnEndActionsPlayerId))
+                    return _lastTurnEndActionsPlayerId;
+
+                if (!string.IsNullOrEmpty(_lastPlayPlayerId))
+                    return _lastPlayPlayerId;
+
+                return GetOpponentPlayerId(judgePlayerId) ?? judgePlayerId;
+            }
+        }
+
+        internal bool TryRecordOutcome(
+            string winnerPlayerId,
+            int winnerResult,
+            int loserResult)
+        {
+            if (string.IsNullOrEmpty(winnerPlayerId))
+                return false;
+
+            lock (_sync)
+            {
+                if (_outcome != null)
+                    return false;
+
+                string loserPlayerId = GetOpponentPlayerId(winnerPlayerId);
+                if (string.IsNullOrEmpty(loserPlayerId))
+                    return false;
+
+                _outcome = new BattleOutcome
+                {
+                    WinnerPlayerId = winnerPlayerId,
+                    WinnerResult = winnerResult,
+                    LoserPlayerId = loserPlayerId,
+                    LoserResult = loserResult
+                };
+                return true;
+            }
+        }
+
+        internal bool TryGetOutcome(
+            out string winnerPlayerId,
+            out int winnerResult,
+            out string loserPlayerId,
+            out int loserResult)
+        {
+            lock (_sync)
+            {
+                if (_outcome == null)
+                {
+                    winnerPlayerId = null;
+                    winnerResult = 0;
+                    loserPlayerId = null;
+                    loserResult = 0;
+                    return false;
+                }
+
+                winnerPlayerId = _outcome.WinnerPlayerId;
+                winnerResult = _outcome.WinnerResult;
+                loserPlayerId = _outcome.LoserPlayerId;
+                loserResult = _outcome.LoserResult;
+                return true;
+            }
+        }
+
+        private string GetOpponentPlayerId(string playerId)
+        {
+            if (string.IsNullOrEmpty(playerId))
+                return null;
+            if (string.Equals(playerId, _hostPlayerId, StringComparison.Ordinal))
+                return _guestPlayerId;
+            if (string.Equals(playerId, _guestPlayerId, StringComparison.Ordinal))
+                return _hostPlayerId;
+            return null;
+        }
 
         public void SetCardMaster(CardMaster cardMaster)
         {
@@ -864,6 +1062,23 @@ namespace Shadowbus.Server.Room
             public int DeliverySequence;
             public bool Loaded;
             public int LoadedDeliverySequence;
+        }
+
+        private sealed class BattleOutcome
+        {
+            public string WinnerPlayerId;
+            public int WinnerResult;
+            public string LoserPlayerId;
+            public int LoserResult;
+        }
+
+        private enum BattleEventKind
+        {
+            None,
+            PlayActions,
+            TurnEndActions,
+            TurnEnd,
+            TurnEndFinal
         }
 
         private sealed class MulliganState

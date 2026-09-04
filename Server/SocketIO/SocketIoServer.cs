@@ -23,6 +23,23 @@ namespace Shadowbus.Server.SocketIO
     public sealed class SocketIoServer : IDisposable
     {
         private const string WebSocketMagic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        private const int ResultLifeWin = 101;
+        private const int ResultLifeLose = 102;
+        private const int ResultDeckoutWin = 103;
+        private const int ResultDeckoutLose = 104;
+        private const int ResultRetireWin = 105;
+        private const int ResultRetireLose = 106;
+        private const int ResultSpecialWin = 107;
+        private const int ResultSpecialLose = 108;
+        private const int ResultDisconnectWin = 201;
+        private const int ResultDisconnectLose = 202;
+        private const int ResultFirstcardWin = 203;
+        private const int ResultFirstcardLose = 204;
+        private const int ResultTurnendWin = 205;
+        private const int ResultTurnendLose = 206;
+        private const int ResultTurnstartWin = 207;
+        private const int ResultTurnstartLose = 208;
+        private const int ResultNoContest = 1;
 
         private readonly ServerConfig _config;
         private readonly RoomManager _rooms;
@@ -85,6 +102,11 @@ namespace Shadowbus.Server.SocketIO
 
         public void Stop()
         {
+            // A host closing its room while a battle is active is an explicit
+            // exit, not a transport failure. Finish the battle while sockets
+            // are still open so both stock clients receive their terminal
+            // result before the listener is torn down.
+            FinishBattlesForServerStop();
             _running = false;
             try
             {
@@ -313,6 +335,10 @@ namespace Shadowbus.Server.SocketIO
             if (room == null)
                 return;
 
+            BattleSession battleSession = _messageRouter.GetOrCreate(room.RoomId);
+            if (room.State == RoomState.InGame)
+                battleSession?.RecordBattleEvent(connection.PlayerId, uri, message);
+
             if (uri == "InitRoomBattle")
             {
                 HandleInitRoomBattle(connection, room, message, binary);
@@ -424,38 +450,33 @@ namespace Shadowbus.Server.SocketIO
                 return;
             }
 
+            if (string.Equals(uri, "JudgeResult", StringComparison.Ordinal))
+            {
+                HandleJudgeResult(connection, room, relayMessage as JObject);
+                return;
+            }
+
+            if (string.Equals(uri, "Retire", StringComparison.Ordinal))
+            {
+                RelayToOpponent(connection, room, eventName, relayMessage, message, binary);
+                if (room.State == RoomState.InGame)
+                {
+                    FinishBattle(
+                        room,
+                        battleSession,
+                        connection.PlayerId,
+                        ResultRetireLose,
+                        ResultRetireWin,
+                        "retire");
+                }
+                return;
+            }
+
             // Route against logical room slots rather than only currently
             // open sockets. A reliable frame received while the opponent is
             // reconnecting must stay in BattleSession.pending and be flushed
             // by Reenter once that slot binds again.
-            foreach (Player targetPlayer in room.GetPlayers())
-            {
-                if (targetPlayer == null ||
-                    string.Equals(targetPlayer.PlayerId, connection.PlayerId, StringComparison.Ordinal))
-                    continue;
-
-                RoutedMessage routed = _messageRouter.Accept(
-                    room.RoomId,
-                    connection.PlayerId,
-                    targetPlayer.PlayerId,
-                    eventName,
-                    relayMessage,
-                    relayMessage == message ? binary : SocketIoPayloadCodec.Encode(relayMessage));
-                if (routed == null || routed.IsDuplicate)
-                    continue;
-
-                SocketIoConnection peer = FindActiveConnection(connection.BattleId, targetPlayer.PlayerId);
-                bool sent = peer != null && SendRoutedMessage(peer, routed);
-                if (sent && routed.HasSequence)
-                {
-                    _messageRouter.MarkDelivered(
-                        room.RoomId,
-                        connection.PlayerId,
-                        targetPlayer.PlayerId,
-                        eventName,
-                        routed.SourceSequence);
-                }
-            }
+            RelayToOpponent(connection, room, eventName, relayMessage, message, binary);
 
             // RoomBase waits for the server's RoomReady URI before it starts
             // Matching_Room and emits InitRoomBattle. Both clients must have
@@ -500,6 +521,17 @@ namespace Shadowbus.Server.SocketIO
                 connection.SendBinaryEvent("synchronize", SocketIoPayloadCodec.Encode(result));
                 Plugin.Logger.LogInfo(
                     $"[SocketIO] Sent {uri} success result to {connection.SessionId}");
+
+                if (room.State == RoomState.InGame)
+                {
+                    FinishBattle(
+                        room,
+                        battleSession,
+                        connection.PlayerId,
+                        ResultRetireLose,
+                        ResultRetireWin,
+                        "room-exit");
+                }
             }
         }
 
@@ -522,11 +554,22 @@ namespace Shadowbus.Server.SocketIO
                 room.MarkPlayerDisconnected(connection.PlayerId);
                 foreach (SocketIoConnection peer in GetRoomPeers(connection))
                     peer.SendEvent("opponent_lost");
+
+                if (_running && room.State == RoomState.InGame)
+                {
+                    FinishBattle(
+                        room,
+                        _messageRouter.GetOrCreate(room.RoomId),
+                        connection.PlayerId,
+                        ResultDisconnectLose,
+                        ResultDisconnectWin,
+                        "disconnect");
+                }
             }
 
             Plugin.Logger.LogInfo($"[SocketIO] Client disconnected: {connection.SessionId} ({reason})");
 
-            if (room != null)
+            if (room != null && room.State != RoomState.Finished)
                 BroadcastAliveStatus(room, connection);
         }
 
@@ -563,6 +606,424 @@ namespace Shadowbus.Server.SocketIO
             {
                 JObject response = CreateAliveResponse(peer, room);
                 peer.SendBinaryEvent("alive", SocketIoPayloadCodec.Encode(response));
+            }
+        }
+
+        private void HandleJudgeResult(
+            SocketIoConnection connection,
+            GameRoom room,
+            JObject message)
+        {
+            if (connection == null || room == null ||
+                (room.State != RoomState.InGame && room.State != RoomState.Finished))
+                return;
+
+            BattleSession session = _messageRouter.GetOrCreate(room.RoomId);
+            if (session == null)
+                return;
+
+            if (session.TryGetOutcome(
+                    out string existingWinner,
+                    out int existingWinnerResult,
+                    out string existingLoser,
+                    out int existingLoserResult))
+            {
+                // A client may retry JudgeResult after a lost response. The
+                // outcome is immutable; resend only that player's result
+                // without creating a second finish event for the peer.
+                if (string.Equals(connection.PlayerId, existingWinner, StringComparison.Ordinal))
+                {
+                    SendBattleFinishToPlayer(
+                        session,
+                        room,
+                        existingWinner,
+                        existingLoser,
+                        existingWinnerResult);
+                }
+                else if (string.Equals(connection.PlayerId, existingLoser, StringComparison.Ordinal))
+                {
+                    SendBattleFinishToPlayer(
+                        session,
+                        room,
+                        existingLoser,
+                        existingWinner,
+                        existingLoserResult);
+                }
+                return;
+            }
+
+            int status = -1;
+            TryGetInt(message?["log"], out status);
+
+            // A custom/native client may include the computed result in the
+            // request. Trust it when it is one of the stock terminal codes.
+            if (TryGetInt(message?["result"], out int reportedResult) &&
+                IsTerminalResult(reportedResult))
+            {
+                if (IsWinResult(reportedResult))
+                {
+                    FinishBattle(
+                        room,
+                        session,
+                        connection.PlayerId,
+                        reportedResult,
+                        OppositeResult(reportedResult),
+                        "client-result");
+                }
+                else
+                {
+                    FinishBattle(
+                        room,
+                        session,
+                        FindOpponent(connection, room)?.PlayerId,
+                        OppositeResult(reportedResult),
+                        reportedResult,
+                        "client-result");
+                }
+                return;
+            }
+
+            switch (status)
+            {
+                case 300: // OppoDisconnectVictory
+                    FinishBattle(
+                        room,
+                        session,
+                        connection.PlayerId,
+                        ResultDisconnectWin,
+                        ResultDisconnectLose,
+                        "disconnect-result");
+                    return;
+                case 301: // DisconnectLose
+                    FinishBattle(
+                        room,
+                        session,
+                        FindOpponent(connection, room)?.PlayerId,
+                        ResultDisconnectWin,
+                        ResultDisconnectLose,
+                        "disconnect-result");
+                    return;
+                case 400: // OpponentNotTurnStartVictory
+                    FinishBattle(
+                        room,
+                        session,
+                        connection.PlayerId,
+                        ResultTurnstartWin,
+                        ResultTurnstartLose,
+                        "turn-start-timeout");
+                    return;
+                case 401: // TurnStartLose
+                    FinishBattle(
+                        room,
+                        session,
+                        FindOpponent(connection, room)?.PlayerId,
+                        ResultTurnstartWin,
+                        ResultTurnstartLose,
+                        "turn-start-timeout");
+                    return;
+                case 500: // OpponentNotTurnEndVictory
+                    FinishBattle(
+                        room,
+                        session,
+                        connection.PlayerId,
+                        ResultTurnendWin,
+                        ResultTurnendLose,
+                        "turn-end-timeout");
+                    return;
+                case 501: // TurnEndLose
+                    FinishBattle(
+                        room,
+                        session,
+                        FindOpponent(connection, room)?.PlayerId,
+                        ResultTurnendWin,
+                        ResultTurnendLose,
+                        "turn-end-timeout");
+                    return;
+                case 600: // OppoNotMulliganVictory
+                    FinishBattle(
+                        room,
+                        session,
+                        connection.PlayerId,
+                        ResultFirstcardWin,
+                        ResultFirstcardLose,
+                        "mulligan-timeout");
+                    return;
+                case 601: // MulliganLose
+                    FinishBattle(
+                        room,
+                        session,
+                        FindOpponent(connection, room)?.PlayerId,
+                        ResultFirstcardWin,
+                        ResultFirstcardLose,
+                        "mulligan-timeout");
+                    return;
+                case 800: // ReceiveRetire: receiver is the winner
+                    FinishBattle(
+                        room,
+                        session,
+                        connection.PlayerId,
+                        ResultRetireWin,
+                        ResultRetireLose,
+                        "retire-result");
+                    return;
+                case 900: // ReceiveConsistencyLose
+                case 901: // Invalid
+                    FinishBattle(
+                        room,
+                        session,
+                        connection.PlayerId,
+                        ResultNoContest,
+                        ResultNoContest,
+                        "no-contest");
+                    return;
+                case 100: // BattleFinishToJudge
+                case 110: // RecoveryBattleFinishToJudge
+                    session.ResolveLikelyOutcome(
+                        connection.PlayerId,
+                        out string winner,
+                        out int winnerResult,
+                        out int loserResult);
+                    FinishBattle(
+                        room,
+                        session,
+                        winner,
+                        winnerResult,
+                        loserResult,
+                        "normal-judge");
+                    return;
+                default:
+                    // RetrySend and diagnostic judge statuses are requests to
+                    // continue the native protocol, not terminal outcomes.
+                    Plugin.Logger.LogInfo(
+                        $"[SocketIO] Ignored non-terminal JudgeResult from " +
+                        $"{connection.SessionId}: status={status}");
+                    return;
+            }
+        }
+
+        private void FinishBattle(
+            GameRoom room,
+            BattleSession session,
+            string winnerPlayerId,
+            int winnerResult,
+            int loserResult,
+            string reason)
+        {
+            if (room == null || session == null || string.IsNullOrEmpty(winnerPlayerId))
+                return;
+
+            if (!session.TryRecordOutcome(
+                    winnerPlayerId,
+                    winnerResult,
+                    loserResult))
+            {
+                return;
+            }
+
+            if (!session.TryGetOutcome(
+                    out string recordedWinner,
+                    out int recordedWinnerResult,
+                    out string recordedLoser,
+                    out int recordedLoserResult))
+            {
+                return;
+            }
+
+            room.ChangeState(RoomState.Finished);
+            SendBattleFinish(
+                session,
+                room,
+                recordedWinner,
+                recordedWinnerResult,
+                recordedLoser,
+                recordedLoserResult);
+            Plugin.Logger.LogInfo(
+                $"[SocketIO] Battle finished in room {room.RoomId}: " +
+                $"winner={recordedWinner}, loser={recordedLoser}, reason={reason}");
+        }
+
+        private void FinishBattlesForServerStop()
+        {
+            if (!_running)
+                return;
+
+            foreach (GameRoom room in _rooms.GetAllRooms())
+            {
+                if (room == null || room.State != RoomState.InGame)
+                    continue;
+
+                Player host = null;
+                foreach (Player player in room.GetPlayers())
+                {
+                    if (player != null && player.IsHost)
+                    {
+                        host = player;
+                        break;
+                    }
+                }
+
+                if (host == null)
+                    continue;
+
+                FinishBattle(
+                    room,
+                    _messageRouter.GetOrCreate(room.RoomId),
+                    host.PlayerId,
+                    ResultRetireLose,
+                    ResultRetireWin,
+                    "server-stop");
+            }
+        }
+
+        private void SendBattleFinish(
+            BattleSession session,
+            GameRoom room,
+            string winnerPlayerId,
+            int winnerResult,
+            string loserPlayerId,
+            int loserResult)
+        {
+            SendBattleFinishToPlayer(
+                session,
+                room,
+                winnerPlayerId,
+                loserPlayerId,
+                winnerResult);
+            SendBattleFinishToPlayer(
+                session,
+                room,
+                loserPlayerId,
+                winnerPlayerId,
+                loserResult);
+        }
+
+        private void SendBattleFinishToPlayer(
+            BattleSession session,
+            GameRoom room,
+            string targetPlayerId,
+            string sourcePlayerId,
+            int result)
+        {
+            if (session == null || room == null ||
+                string.IsNullOrEmpty(targetPlayerId) || string.IsNullOrEmpty(sourcePlayerId))
+                return;
+
+            Player source = FindPlayer(room, sourcePlayerId);
+            JObject payload = new JObject
+            {
+                ["uri"] = "BattleFinish",
+                ["bid"] = room.RoomId,
+                ["result"] = result,
+                ["viewerId"] = source?.ViewerId ?? 0,
+                ["time"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            };
+
+            RoutedMessage routed = _messageRouter.CreateServerMessage(
+                room.RoomId,
+                sourcePlayerId,
+                targetPlayerId,
+                "msg",
+                payload);
+            SocketIoConnection target = FindActiveConnection(room.RoomId, targetPlayerId);
+            bool sent = routed != null && target != null && SendRoutedMessage(target, routed);
+            if (sent)
+                _messageRouter.MarkDelivered(room.RoomId, routed);
+
+            Plugin.Logger.LogInfo(
+                $"[SocketIO] OUT BattleFinish to {targetPlayerId}: " +
+                $"result={result}, sent={sent}, " +
+                $"playSeq={(routed == null ? 0 : routed.DeliverySequence)}");
+        }
+
+        private void RelayToOpponent(
+            SocketIoConnection connection,
+            GameRoom room,
+            string eventName,
+            JToken relayMessage,
+            JToken originalMessage,
+            byte[] binary)
+        {
+            if (connection == null || room == null)
+                return;
+
+            byte[] payload = relayMessage == null || relayMessage == originalMessage
+                ? binary
+                : SocketIoPayloadCodec.Encode(relayMessage);
+            foreach (Player targetPlayer in room.GetPlayers())
+            {
+                if (targetPlayer == null ||
+                    string.Equals(targetPlayer.PlayerId, connection.PlayerId, StringComparison.Ordinal))
+                    continue;
+
+                RoutedMessage routed = _messageRouter.Accept(
+                    room.RoomId,
+                    connection.PlayerId,
+                    targetPlayer.PlayerId,
+                    eventName,
+                    relayMessage,
+                    payload);
+                if (routed == null || routed.IsDuplicate)
+                    continue;
+
+                SocketIoConnection peer = FindActiveConnection(
+                    connection.BattleId,
+                    targetPlayer.PlayerId);
+                bool sent = peer != null && SendRoutedMessage(peer, routed);
+                if (sent && routed.HasSequence)
+                {
+                    _messageRouter.MarkDelivered(
+                        room.RoomId,
+                        connection.PlayerId,
+                        targetPlayer.PlayerId,
+                        eventName,
+                        routed.SourceSequence);
+                }
+            }
+        }
+
+        private static bool IsTerminalResult(int result)
+        {
+            return result == ResultLifeWin || result == ResultLifeLose ||
+                   result == ResultDeckoutWin || result == ResultDeckoutLose ||
+                   result == ResultRetireWin || result == ResultRetireLose ||
+                   result == ResultSpecialWin || result == ResultSpecialLose ||
+                   result == ResultDisconnectWin || result == ResultDisconnectLose ||
+                   result == ResultFirstcardWin || result == ResultFirstcardLose ||
+                   result == ResultTurnendWin || result == ResultTurnendLose ||
+                   result == ResultTurnstartWin || result == ResultTurnstartLose ||
+                   result == ResultNoContest;
+        }
+
+        private static bool IsWinResult(int result)
+        {
+            return result == ResultLifeWin || result == ResultDeckoutWin ||
+                   result == ResultRetireWin || result == ResultSpecialWin ||
+                   result == ResultDisconnectWin ||
+                   result == ResultFirstcardWin || result == ResultTurnendWin ||
+                   result == ResultTurnstartWin;
+        }
+
+        private static int OppositeResult(int result)
+        {
+            switch (result)
+            {
+                case ResultLifeWin: return ResultLifeLose;
+                case ResultLifeLose: return ResultLifeWin;
+                case ResultDeckoutWin: return ResultDeckoutLose;
+                case ResultDeckoutLose: return ResultDeckoutWin;
+                case ResultRetireWin: return ResultRetireLose;
+                case ResultRetireLose: return ResultRetireWin;
+                case ResultSpecialWin: return ResultSpecialLose;
+                case ResultSpecialLose: return ResultSpecialWin;
+                case ResultDisconnectWin: return ResultDisconnectLose;
+                case ResultDisconnectLose: return ResultDisconnectWin;
+                case ResultFirstcardWin: return ResultFirstcardLose;
+                case ResultFirstcardLose: return ResultFirstcardWin;
+                case ResultTurnendWin: return ResultTurnendLose;
+                case ResultTurnendLose: return ResultTurnendWin;
+                case ResultTurnstartWin: return ResultTurnstartLose;
+                case ResultTurnstartLose: return ResultTurnstartWin;
+                default: return ResultNoContest;
             }
         }
 
@@ -1503,6 +1964,12 @@ namespace Shadowbus.Server.SocketIO
                 // must not prevent slot binding through room state/profile.
                 return null;
             }
+        }
+
+        private static bool TryGetInt(JToken value, out int result)
+        {
+            result = 0;
+            return value != null && int.TryParse(value.ToString(), out result);
         }
 
         private void SendOpponentSnapshot(SocketIoConnection target, GameRoom room)

@@ -288,7 +288,7 @@ namespace Shadowbus.Server.Room
             {
                 if (!string.Equals(skills[i], "cost_change", StringComparison.Ordinal) ||
                     !string.Equals(timings[i], "when_play_other", StringComparison.Ordinal) ||
-                    !ContainsSelfTarget(targets[i]) ||
+                    !ContainsHandResidentTarget(targets[i]) ||
                     !TryGetOptionExpression(options[i], "add=", out _) &&
                     !TryGetOptionExpression(options[i], "set=", out _))
                 {
@@ -450,7 +450,11 @@ namespace Shadowbus.Server.Room
 
         private static bool MatchesTribe(string tribe, CardParameter card)
         {
-            if (string.Equals(tribe, "all", StringComparison.Ordinal))
+            // The stock parser maps any_tribe to SkillTribeFilter(ALL, "=").
+            // This is a wildcard condition, including cards whose parameter
+            // list does not explicitly contain the synthetic ALL entry.
+            if (string.Equals(tribe, "all", StringComparison.Ordinal) ||
+                string.Equals(tribe, "any_tribe", StringComparison.Ordinal))
                 return true;
             if (!Enum.TryParse(tribe.ToUpperInvariant(), out CardBasePrm.TribeType expected))
                 return false;
@@ -752,6 +756,21 @@ namespace Shadowbus.Server.Room
             for (int i = 0; i < parts.Length; i++)
             {
                 if (string.Equals(parts[i], "target=self", StringComparison.Ordinal))
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool ContainsHandResidentTarget(string target)
+        {
+            if (string.IsNullOrEmpty(target))
+                return false;
+
+            string[] parts = target.Split('&');
+            for (int i = 0; i < parts.Length; i++)
+            {
+                if (string.Equals(parts[i], "target=self", StringComparison.Ordinal) ||
+                    string.Equals(parts[i], "target=hand_self", StringComparison.Ordinal))
                     return true;
             }
             return false;
