@@ -650,11 +650,17 @@ namespace Shadowbus
                 return;
             }
 
+            if (classParameters == null)
+            {
+                return;
+            }
+
             foreach (KeyValuePair<int, LocalLeaderSkinSetting> pair in settings.LeaderSkins)
             {
                 LocalLeaderSkinSetting leaderSetting = pair.Value;
                 if (leaderSetting == null ||
-                    !classParameters.TryGetValue(pair.Key, out ClassCharaPrm classParameter))
+                    !classParameters.TryGetValue(pair.Key, out ClassCharaPrm classParameter) ||
+                    classParameter == null)
                 {
                     continue;
                 }
@@ -664,6 +670,10 @@ namespace Shadowbus
                     classParameter.SetCurrentCharaId(leaderSetting.CurrentCharaId);
                 }
                 classParameter.IsRandomLeaderSkin = leaderSetting.IsRandom;
+                if (classParameter.LeaderSkinIdList == null)
+                {
+                    continue;
+                }
                 classParameter.LeaderSkinIdList.Clear();
                 if (leaderSetting.SkinIds != null)
                 {

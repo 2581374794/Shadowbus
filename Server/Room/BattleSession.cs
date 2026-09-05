@@ -29,6 +29,7 @@ namespace Shadowbus.Server.Room
         private string _hostPlayerId;
         private string _guestPlayerId;
         private int _battleSeed;
+        private int _battleFieldId;
         private bool _hostFirst;
         private int[] _hostCards;
         private int[] _guestCards;
@@ -319,6 +320,10 @@ namespace Shadowbus.Server.Room
                 if (_battleSeed == 0)
                     _battleSeed = 1;
                 _hostFirst = new Random(_battleSeed).Next(2) == 0;
+                // The native normal battle path chooses one field in the
+                // inclusive range 1..7. Generate it once per room battle so
+                // both views receive exactly the same field.
+                _battleFieldId = new Random(_battleSeed ^ 0x5EED1234).Next(1, 8);
                 _hostCards = Shuffle(host.Deck.CardIds, new Random(_battleSeed ^ 0x13579BDF));
                 _guestCards = Shuffle(guest.Deck.CardIds, new Random(_battleSeed ^ 0x2468ACE0));
                 // The dealt order is the identity authority for both sides.
@@ -359,7 +364,8 @@ namespace Shadowbus.Server.Room
             out PlayerDeck selfDeck,
             out int[] selfCards,
             out int battleSeed,
-            out bool selfGoesFirst)
+            out bool selfGoesFirst,
+            out int battleFieldId)
         {
             lock (_sync)
             {
@@ -369,6 +375,7 @@ namespace Shadowbus.Server.Room
                     selfCards = null;
                     battleSeed = 0;
                     selfGoesFirst = false;
+                    battleFieldId = 0;
                     return false;
                 }
 
@@ -377,6 +384,7 @@ namespace Shadowbus.Server.Room
                 selfCards = (int[])(isHost ? _hostCards : _guestCards).Clone();
                 battleSeed = _battleSeed;
                 selfGoesFirst = isHost == _hostFirst;
+                battleFieldId = _battleFieldId;
                 return true;
             }
         }
@@ -774,6 +782,21 @@ namespace Shadowbus.Server.Room
 
             JObject clone = (JObject)data.DeepClone();
             string uri = clone["uri"]?.Value<string>();
+            if (string.Equals(uri, "ChatStamp", StringComparison.Ordinal))
+            {
+                // The sender uses the request field `stamp`; the native
+                // opponent receiver consumes the official response field
+                // `chatStamp` containing the nested stamp value.
+                JToken stamp = clone["stamp"];
+                if (stamp != null && clone["chatStamp"] == null)
+                {
+                    clone["chatStamp"] = new JObject
+                    {
+                        ["stamp"] = stamp.DeepClone()
+                    };
+                    clone.Remove("stamp");
+                }
+            }
             if (IsBattleViewMessage(uri))
             {
                 // The client sends keyAction selections in a request-only
@@ -1151,10 +1174,19 @@ namespace Shadowbus.Server.Room
             bool hasSequence = sourceSequence > 0;
             if (!hasSequence)
             {
+                // Some native battle messages, including ChatStamp, are
+                // intentionally unreliable and carry no pubSeq. They still
+                // need the same receiver-view rewrite as sequenced messages.
+                JToken unsequencedMessage = _rewrite == null
+                    ? RewriteForReceiver(message, _eventName, 0)
+                    : _rewrite(message, 0);
+                byte[] unsequencedPayload = unsequencedMessage == message
+                    ? payload
+                    : SocketIoPayloadCodec.Encode(unsequencedMessage);
                 return new RoutedMessage(
                     _eventName,
-                    message,
-                    payload,
+                    unsequencedMessage,
+                    unsequencedPayload,
                     0,
                     0,
                     false,
@@ -1319,7 +1351,8 @@ namespace Shadowbus.Server.Room
             }
 
             JObject clone = (JObject)data.DeepClone();
-            clone["playSeq"] = deliverySequence;
+            if (deliverySequence > 0)
+                clone["playSeq"] = deliverySequence;
             return clone;
         }
     }

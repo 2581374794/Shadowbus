@@ -21,7 +21,9 @@ namespace Shadowbus.Server
             if (task == null)
                 return false;
             string taskType = task.GetType().Name;
-            return (OnlineRuntime.IsEnabled && IsRoomBattleDoMatchingTask(taskType)) ||
+            return (OnlineRuntime.IsEnabled &&
+                    (IsRoomBattleDoMatchingTask(taskType) ||
+                     task is RoomBattleFinishTask || task is OpenRoomInitilizeRoomBattle)) ||
                    taskType == "OpenRoomBattleCreateRoomTask" ||
                    taskType == "OpenRoomBattleEnterRoomTask" ||
                    taskType == "OpenRoomBattleCloseRoomTask" ||
@@ -45,6 +47,14 @@ namespace Shadowbus.Server
             if (OnlineRuntime.IsEnabled && IsRoomBattleDoMatchingTask(taskTypeName))
             {
                 handler = ProcessRoomBattleDoMatching(task);
+            }
+            else if (OnlineRuntime.IsEnabled && task is RoomBattleFinishTask)
+            {
+                handler = ProcessRoomBattleFinish(task);
+            }
+            else if (OnlineRuntime.IsEnabled && task is OpenRoomInitilizeRoomBattle)
+            {
+                handler = ProcessRoomBattleInitialize(task);
             }
             else
             {
@@ -185,6 +195,95 @@ namespace Shadowbus.Server
                 $"matching_state={matchingState}, battle_state=0, battle_id={battleId}, " +
                 $"card_master_id={cardMasterId}");
             yield break;
+        }
+
+        private static IEnumerator ProcessRoomBattleFinish(NetworkTask task)
+        {
+            NetworkBattleManagerBase battle = BattleManagerBase.GetIns() as NetworkBattleManagerBase;
+            if (battle == null)
+            {
+                FailTask(task, "ROOM_FINISH_FAILED", "The network battle result is unavailable");
+                yield break;
+            }
+
+            // The request's battle_result only checks leader death, so a retiring
+            // player may still report a win. Preserve the received Socket verdict.
+            NetworkBattleReceiver.RESULT_CODE socketResult = battle.JudgeResultReceiveCode;
+            int battleResult = GetRoomBattleResult(socketResult);
+            JsonData response = CreateSuccessEnvelope();
+            response["data"]["battle_result"] = battleResult;
+
+            CompleteTask(task, response);
+            Plugin.Logger.LogInfo(
+                $"[OnlineTaskRouter] Local room finish response: task={task.GetType().Name}, " +
+                $"socket_result={socketResult}, battle_result={battleResult}, " +
+                $"is_retire={ReadInt(task.Params, "is_retire", 0)}");
+            yield break;
+        }
+
+        private static IEnumerator ProcessRoomBattleInitialize(NetworkTask task)
+        {
+            RoomInfoMessage room = OnlineRuntime.CurrentRoomInfo;
+            if (!OnlineRuntime.IsEnabled || room == null)
+            {
+                FailTask(task, "ROOM_INITIALIZE_FAILED", "The current Socket.IO room is unavailable");
+                yield break;
+            }
+
+            string battleId = room.BattleId ?? room.RoomId;
+            JsonData response = CreateSuccessEnvelope();
+            JsonData body = response["data"];
+            body["battle_id"] = battleId ?? string.Empty;
+            // The native history parser reads Count, so use objects, not null JsonData.
+            JsonData ownHistory = new JsonData();
+            ownHistory.SetJsonType(JsonType.Object);
+            JsonData opponentHistory = new JsonData();
+            opponentHistory.SetJsonType(JsonType.Object);
+            body["my_battle_result"] = ownHistory;
+            body["opponent_battle_result"] = opponentHistory;
+            body["used_deck"] = 0;
+            body["is_settled"] = 0;
+
+            CompleteTask(task, response);
+            Plugin.Logger.LogInfo(
+                $"[OnlineTaskRouter] Local room battle initialization response: battle_id={battleId}");
+            yield break;
+        }
+
+        private static int GetRoomBattleResult(NetworkBattleReceiver.RESULT_CODE result)
+        {
+            // HTTP settlement uses 0=lose, 1=win, 2=no contest, not Socket codes.
+            switch (result)
+            {
+                case NetworkBattleReceiver.RESULT_CODE.LifeWin:
+                case NetworkBattleReceiver.RESULT_CODE.DeckoutWin:
+                case NetworkBattleReceiver.RESULT_CODE.RetireWin:
+                case NetworkBattleReceiver.RESULT_CODE.SpecialWin:
+                case NetworkBattleReceiver.RESULT_CODE.DisconnectWin:
+                case NetworkBattleReceiver.RESULT_CODE.FirstcardWin:
+                case NetworkBattleReceiver.RESULT_CODE.TurnendWin:
+                case NetworkBattleReceiver.RESULT_CODE.TurnstartWin:
+                    return 1;
+                case NetworkBattleReceiver.RESULT_CODE.LifeLose:
+                case NetworkBattleReceiver.RESULT_CODE.DeckoutLose:
+                case NetworkBattleReceiver.RESULT_CODE.RetireLose:
+                case NetworkBattleReceiver.RESULT_CODE.SpecialLose:
+                case NetworkBattleReceiver.RESULT_CODE.DisconnectLose:
+                case NetworkBattleReceiver.RESULT_CODE.FirstcardLose:
+                case NetworkBattleReceiver.RESULT_CODE.TurnendLose:
+                case NetworkBattleReceiver.RESULT_CODE.TurnstartLose:
+                case NetworkBattleReceiver.RESULT_CODE.MaxTurnLose:
+                    return 0;
+                case NetworkBattleReceiver.RESULT_CODE.NoContest:
+                case NetworkBattleReceiver.RESULT_CODE.Invalid:
+                case NetworkBattleReceiver.RESULT_CODE.Error:
+                    return 2;
+                default:
+                    Plugin.Logger.LogWarning(
+                        $"[OnlineTaskRouter] Room finish has no terminal Socket verdict ({result}); " +
+                        "returning no contest");
+                    return 2;
+            }
         }
 
         private static IEnumerator ProcessEnterRoom(NetworkTask task)

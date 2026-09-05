@@ -67,7 +67,8 @@ namespace Shadowbus.Server.Room
 
         private static JObject CreateReceiverResult(JObject source)
         {
-            if (source == null || !TryGetInt(source["idx"], out int index) || index <= 0)
+            // Index 0 is the leader, whose attached skills also report conditions.
+            if (source == null || !TryGetInt(source["idx"], out int index) || index < 0)
                 return null;
 
             if (source["skillIdx"] == null && source["skillCount"] == null)

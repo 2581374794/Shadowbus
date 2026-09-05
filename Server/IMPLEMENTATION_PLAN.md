@@ -823,3 +823,216 @@ CheckCondition 在 knownList 完好的情况下仍然否决。
 本阶段暂不计算含复杂私有变量、随机选择、临时移除语义或动态算术表达式的费用规则，
 这些留待单独阶段，避免服务器猜测客户端内部 modifier 栈。客户端和反编译源码均未
 修改。
+
+### 18.16 房间对战 HTTP 结算离线化（2026-09-05，待双开验收）
+
+退出失败日志显示服务器已向投降方发送 `BattleFinish result=106`、向对手发送
+`result=105`，随后客户端仍把 `RoomBattleFinishTask` 发往已关闭的官方 HTTP API，
+导致无法连接。本阶段只修结算任务路由，不修改 Socket 胜负判定或战斗规则。
+
+用户已明确批准这一客户端请求适配例外：在现有 `OnlineTaskRouter` 中接管联网房间的
+`RoomBattleFinishTask` 及其派生任务（共用原版解析器），不新增 Harmony 补丁。
+通过现有 `CompleteTask` 返回非空 `data.battle_result` 和成功响应头，由原版
+`RoomBattleFinishTask.Parse`、`BattleFinishResponsProcessing`、`FinishResultSuccses`
+继续创建结算数据、结束战斗并播放胜负表现，不直接改 UI 或发放奖励。
+
+注意：`BattleFinishSendBase.SettingFinishBattleParameter` 只根据主战者是否死亡填入
+请求的 `battle_result`，不能用于投降等结算；`NetworkBattleManagerBase.BattleResultType`
+也由 HTTP 响应解析器赋值，不能作为输入。适配层读取原版已接收的
+`JudgeResultReceiveCode`，把各类 Win/Lose 结果转换为 HTTP 的 `1/0`，无效局转换为
+`2`。没有可用终局码时记录警告并返回无效局，不根据主战者存活猜测胜利。
+
+待用户部署后分别测试 Host 投降、Guest 投降，确认退出方失败、对手胜利且不再重试
+官方结算任务；另回归正常击败主战者的结算。异常断网只有在原版客户端已进入结算任务
+时才经过此适配，本阶段不扩展重连、进程退出或房主服务器关闭的处理。未部署。
+
+### 18.17 结算后返回房间初始化离线化（2026-09-05，待双开验收）
+
+用户确认已出现胜负结算，但返回房间时显示连线失败。代码确认原版调用链为
+`RoomMatchResultAnimationAgent.returnRoom` → `RoomBase.SetupReturnFromBattle` →
+`RoomConnectController.ReSetConnectCoroutine`，先重新连接 Socket 节点，再通过
+`PlayerControllerForOwn.InitilizeRoomBattleServer` 发起 `OpenRoomInitilizeRoomBattle`，
+成功后发送 `Reenter`。上一阶段只接管了 `RoomBattleFinishTask`，初始化任务仍会落入
+官方 HTTP 请求路径。排查时可读日志未包含这次返回失败，不能认定此处是现场唯一故障。
+
+本阶段经用户明确批准，仅在现有 `OnlineTaskRouter` 中接管联网模式下的
+`OpenRoomInitilizeRoomBattle`。响应返回当前房间的 `battle_id`，双方历史字段明确设为
+空 JSON 对象（不能用未指定类型的 `new JsonData()`，原版会读取 `Count`），以及
+`used_deck=0`、`is_settled=0`。本阶段不记录多局赛制历史。继续调用原版任务解析器和
+成功回调，让原版设置房间连接状态并发送 `Reenter`，不直接改房间 UI，不新增 Harmony
+补丁，不重置或删除服务器的 `BattleSession`，不修改胜负或卡牌逻辑。
+
+验收仅限返回房间：用户自行部署后分别测试 Host 投降、Guest 投降和正常结束，确认
+胜负画面后双方回到原房间。日志应出现 `[OnlineTaskRouter] Local room battle
+initialization response`，不再出现该初始化任务的 `Sending real request`。
+再次开局的会话重置、多局历史、观战和异常断线恢复不在本阶段范围内；通过本阶段测试
+后再单独推进。未部署，等待用户实际双开测试。
+
+### 18.18 原房间再次开局（服务器端，待双开验收）
+
+用户确认投降后双方已能返回房间，但再次准备不能开始。此次日志中的房间
+`101110267018` 第一局结束后仍为 `Finished`；新连接的 `Reenter.pubSeq=2`、
+`SetupComplete.pubSeq=3` 已从头计数。双方第二次准备均已到达并被设置为 true，
+但没有新的 `RoomReady`，也没有转发这两条 `SetupComplete`。
+
+原因有两层：`_roomReadySent` 留着第一局的广播标记，抑制再次广播；`BattleSession`
+仍保存旧 `pubSeq` 去重记录和 `_matchedSent`、发牌、换牌、隐藏状态、胜负结果，
+新准备消息被当作旧包，即使只解开 `RoomReady` 仍无法正常创建第二局。
+
+本阶段只修改 `SocketIoServer`。原版 `PlayerControllerForOwn.Init(false)` 是正常
+返房入口，恢复使用 `Init(true)`。因此只在 `Finished` 房间收到显式
+`Reenter(isRecovery=false)` 时，在接受该消息之前清除双方准备和广播标记、替换
+整个 `BattleSession`，并把房间恢复为 `Waiting`。保留房间号、玩家槽位、资料和
+赛制；新会话通过原有路由器初始化并继承 CardMaster，牌组仍由下一次原版
+`InitRoomBattle` 快照提交。双端同时或重复返房仅重置一次，不在第二个人返房时
+清掉第一个人的新消息或准备状态。
+
+已结束房间在 Socket 重新连接时暂不冲刷旧待发消息，等 `Reenter` 区分恢复与返房。
+对局未结束或 `isRecovery=true` 不触发此次重置。未修改客户端补丁、HTTP 任务适配、
+卡牌逻辑或胜负判定，也未修多局赛制历史及其他恢复机制。
+
+待用户自行部署：在同一房间结束第一局，再次双方准备，确认日志顺序为
+`reset for rematch` → 第二次 `RoomReady` → 双方 `InitRoomBattle` → `Matched` →
+`BattleStart`；第二局应能换牌、出牌、结束回合、正常结算。再回房开启第三局验证
+重复流程。首次开局和普通取消准备应保持不变。未部署，未进行实际游戏验收。
+
+### 18.19 返房后对手资料恢复（服务器端，待双开验收）
+
+用户反馈投降返房后，一方看不到对手。本次日志中的房间 `102095561639` 已成功
+重置新会话，双方新 Socket 的身份绑定也正确。Guest 先返房、Host 后返房；服务器
+只向重连者直接发送没有 `playSeq` 的对手资料，向另一方转发的则是 `Reenter`。
+
+原版 `RoomConnectController.ReSetConnectCoroutine` 会先调用双方 Player 的
+`Clear()`，但该函数仅设置 `IsReady=false`，不会清空身份资料（此前对此的判断
+有误，现已更正）。待新网络进入 `RoomReady`、初始化 HTTP 成功后发送
+`Reenter(isRecovery=false)`。正常返房保留的玩家资料不依赖重新入房；当前服务器
+若需要重发资料，则使用 `PlayerControllerForOpponent.OnReceived` 能消费的
+`RoomEntry`，不能把无处理分支的 `Reenter` 当成资料恢复消息。原来的资料包
+没有 `playSeq`，被 `StockReceiveMgr`
+判为不缓存消息，在 `OnReceiveFast`、`OnRoomInitializeStart` 或 UI 加载阶段被
+忽略后无法重放。仅在 Socket 建连时冲刷待发队列也过早：新 Agent 尚未进入房间
+状态时，原版 `RealTimeNetworkBattleAgent.PlayReceiveData()` 会移除房间消息。
+
+本阶段仅修改 `SocketIoServer`：
+
+- 新会话重置时记录双方尚未完成返房；对这些玩家不在建连时发送资料或冲刷队列。
+- 收到正常返房 `Reenter` 后，将发送者资料通过原版 `RoomEntry` 通知对手，不再
+  使用无序号的单向资料快照。保留请求 `pubSeq`，共用现有路由的去重和连续
+  `playSeq`；相同请求重发不会重复重置对手资料或准备状态。
+- 对手还在旧战斗、新 Socket 初始化中或尚未连接时，消息留在现有待发队列；
+  收到该玩家自己的 `Reenter` 后再投递。此时原版已进入 `RoomReady`，带序号的
+  `RoomEntry` 会留在原版接收队列，直到正常接收器和房间 UI 放行才更新玩家资料。
+- 已先返房者收到后返房者的 `RoomEntry`；后返房者收到先返房者排队的
+  `RoomEntry`，不额外重复注入资料，避免覆盖随后到达的准备消息。
+
+首次建房/加入、战斗恢复 `isRecovery=true`、HTTP 路由、胜负和卡牌逻辑未修改。
+未修改客户端或反编译源码，未部署。实际双开验收仍由用户完成：分别让 Host、
+Guest 先返回房间，另一方在结算画面稍作停留再返回，检查双方都能看到对手；
+随后准备进入第二局，再结算返房验证第三局。日志应显示双方各一条
+`rematch reentry`，向双方发送的资料为带 `playSeq` 的 `RoomEntry`，然后正常
+出现新一局 `RoomReady`、`Matched`、`BattleStart`。
+
+**本阶段复测修正（2026-09-05，仍待双开验收）：** 用户反馈 Guest 返房后仍看不到
+对手。房间 `101415323150` 的本次日志确认双方都已收到服务器发出的
+`RoomEntry(pubSeq=2, playSeq=1)`；这不能证明客户端已经成功消费。出站字段列表
+明确缺少 `isGuildMember`、`isGuildJoined`、`isFriend`。
+
+缺口在 `CreateRoomEntryWithProfile`：它原来依赖首次 `RoomEntry` 自带这三个
+字段，而本阶段传入的 `Reenter` 不含它们。原版 `Player.OnEnter` 在存在
+`userName` 时会无条件读取三者；缺键会在填入 `ViewerId`、完成资料恢复及调用
+`EnterRoom` 之前抛异常。`PlayerControllerForOpponent.OnReceived` 已先消费
+序号，外层又是空 `catch`，所以没有明显报错，也不会重试该资料包。
+
+此次仅在服务器资料生成函数中补齐缺失的三个字段，当时均默认 `0`，与已有
+`CreatePlayerSnapshot` 一致；该默认类型仍有错误，详见下方类型修正。首次入房
+携带的已有值保持不变。当时仅检查必读字段，未正确核对转换函数的类型要求。
+不改上一步返房队列、序号、客户端或其他
+逻辑，也不部署。验收仍为投降后双方返房能看到对手，再次准备进入第二局；
+出站 `RoomEntry` 的 `shape` 应包含以上三个关系字段。
+
+**Guest 显示复测修正（2026-09-05，待双开验收）：** 房间 `100344775348`
+日志确认向双方发送的 `RoomEntry(playSeq=1)` 已包含三个关系字段，但用户仍
+反馈 Guest 看不到对手。继续核对原版发现，完整解析资料不等于刷新房间界面：
+
+- `PlayerControllerForOpponent.OnReceived` 的 `RoomEntry` 分支重新创建对手
+  Player，再调用 `OnEnter`、`EnterRoom`。
+- `RoomBase.AttachEvent` 中对手的 `OnEnterRoom` 回调仅在非 `VISITOR` 或锦标赛
+  时调用 `OnPlayerEventOpponentEnterRoom`。普通 Guest 被明确排除，不会由此
+  请求 UI 更新。不能套用 Host 的显示链路。
+- `RoomBase.UpdateUI` 只设置刷新请求，界面并非每帧重读 Player；
+  `RoomPlayerDisplayBase.UpdateDisplayBase` 只有被调用时才按 `ViewerId != 0`
+  显示对手。原版正常返房保留身份并在初始化末尾刷新，而当前服务器晚到的
+  资料更新缺少 Guest 的刷新通知。仅凭服务器出站日志仍不能确认此次 Guest
+  的实际消费时刻或内存值，实际修复结果必须继续由用户验收。
+
+本次仅补全服务器返房状态快照：每名玩家每轮首次正常 `Reenter` 时，在其
+`RoomEntry` 后发送该玩家真实准备状态对应的 `SetupCancel/SetupComplete`，
+`isSelf=0`，复用同一玩家方向的连续 `playSeq` 与待发队列。原版接收链为
+`CancelReady/Ready` → `OnCancelReady/OnReady` →
+`OnPlayerEventOpponentReadyCancel/Ready` → `UpdateUI`，两种角色都会刷新。
+这是同步服务器已经重置的准备状态，不是让客户端假装点击按钮，也不调用
+服务器的准备请求处理或触发 `RoomReady`。
+
+状态快照在发送者的返房请求处理期间生成，先于该连接随后提交的真实准备操作；
+若对手尚未返房，资料、状态和后续操作均按序排队。重复 `Reenter` 不重复生成
+状态快照，以免回退对手准备状态。不修改客户端、HTTP、卡牌、胜负逻辑，不部署。
+验收首先检查双方返房后 Guest 无需选牌组或其他点击就能看到 Host，再测试双方
+准备进入第二局。该阶段仍未完成实际双开验收，不得据编译成功认定已修复。
+
+**关系字段类型修正（2026-09-05，待双开验收）：** 用户更正最新测试为双方都
+看不到对手。房间 `101938172511` 日志显示双方都已被发送完整字段的
+`RoomEntry(playSeq=1)` 和 `SetupCancel(playSeq=2)`，因此不能继续将此次
+故障归结为 Guest 独有的 UI 分支或未补发准备状态。
+
+共同的确定性错误在字段类型。原版 `Wizard.ConvertValue.ToBool(object)` 是
+`bool.Parse(obj.ToString())`，不是接受数字 0/1 的转换；而服务器在
+`CreateRoomEntryWithProfile` 和 `CreatePlayerSnapshot` 中都把
+`isGuildMember`、`isGuildJoined` 生成为整数 `0`。原版先
+`InitializeOpponentPlayer()` 创建 `ViewerId=0` 的新对象，再在 `OnEnter`
+读取 `isGuildMember` 时抛出 `FormatException`，尚未执行 `ViewerId=oppoId`。
+外层空 `catch` 吞掉异常；后续准备状态刷新显示的仍是 `IsValid=false` 的对象。
+首次真实 `RoomEntry` 的这两个字段原本是 bool，首次转发能保留正确类型，
+不能据首次入房可用认定服务器自己生成的快照也正确。
+
+此次只把两处生成函数的这两个默认字段改为 JSON 布尔值 `false`，保留原请求
+已有值；`isFriend`、`isOfficial`、`isSelf` 继续是整数，不能一起改为 bool。
+通过只读 .NET 转换检查确认 `bool.Parse("0")`、`bool.Parse("1")` 抛出
+`FormatException`，`false/true` 可以解析。这不等同于实际游戏验收。
+不新增消息或客户端补丁，不部署，不改其他战斗或返房逻辑。下一次测试仍只验收
+双方投降返房后对手显示，以及再次准备进入第二局。
+
+### 18.20 启动资料空引用与战斗表情（服务器/离线资料，待双开验收）
+
+启动日志中的 `SignUpTask`、`SendTraceLogTask` 异常共用同一调用链：
+`ProfileOfflineData.ReapplyCurrentSettings` → `ApplyLeaderSkinSettings`。本地配置
+可能包含角色皮肤设置，但游戏资料尚未完成初始化，`GetClassPrmDictionary()`
+可能返回 null，或单个 `ClassCharaPrm.LeaderSkinIdList` 尚未创建。旧代码直接
+调用 `TryGetValue`/`Clear`，异常被 `FakeConnect.ProcessOfflineTask` 捕获后只留下
+错误日志，不影响后续游玩。本次在离线资料侧增加两级空值保护：字典为空直接跳过，
+单个皮肤列表为空跳过该条设置；已有有效设置的行为不变。不修改反编译客户端。
+
+对战表情使用战斗协议 `NetworkBattleURI.ChatStamp`，不是房间 UI 的
+`PlayerController.ROOM_URI.ChatStamp`。原版发送端 `NetworkBattleSender.SendChatStamp`
+发送顶层 `stamp`；原版接收端 `NetworkBattleReceiver` 对对手只读取
+`chatStamp` 对象中的 `stamp`，顶层 `stamp` 会被忽略。官方节点会在转发时完成
+这一视图转换；Shadowbus 原先通用转发原样保留，导致对手收不到表情。本次在
+服务器 `BattleSession.RewriteForReceiver` 中仅针对协议 URI `ChatStamp` 将
+`stamp` 转为 `chatStamp: { stamp }`。由于原版表情不携带 `pubSeq`，同时修正
+`SequenceBridge` 的无序号分支，使它也经过视图转换；无序号消息不会虚构 `playSeq`。
+没有卡牌特判、没有客户端补丁，也不改变发送方本地表情。
+
+待用户部署测试：启动时确认不再出现两条 `ApplyLeaderSkinSettings` 空引用；进入
+对战后双方各发送一次普通表情，确认对手看到对应动画。房间表情、战斗消息顺序和
+返房流程回归不受影响。
+
+### 18.21 联机对战随机地图（服务器，待双开验收）
+
+原版普通对战的 `BattleManagerBase.CreateBackgroundId()` 使用地图 ID 1 至 7。
+此前服务器在双方 `selfInfo` 中都固定发送 `fieldId = 1`，所以每局总是同一场景。
+本次在 `BattleSession` 建立 `Matched` 时，使用独立于卡牌洗牌的随机流生成一次
+1..7 的地图 ID，并保存到本局会话；`Matched` 与 `BattleStart` 面向双方的所有
+`selfInfo`/`oppoInfo` 都复用该值。这样双方使用原版客户端场景加载逻辑，无需客户端补丁，
+也不会因两端各自随机而产生场景不一致。
+
+待用户部署测试：连续开始多局，确认地图会变化；每一局双方显示同一地图，且进入战斗、
+换牌和现有战斗同步不受影响。

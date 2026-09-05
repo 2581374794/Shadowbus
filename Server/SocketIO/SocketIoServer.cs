@@ -47,6 +47,8 @@ namespace Shadowbus.Server.SocketIO
             new Dictionary<string, SocketIoConnection>();
         private readonly HashSet<string> _roomReadySent =
             new HashSet<string>(StringComparer.Ordinal);
+        private readonly Dictionary<string, HashSet<string>> _pendingRoomReentries =
+            new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
         private readonly RealtimeMessageRouter _messageRouter =
             new RealtimeMessageRouter();
         private readonly object _connectionLock = new object();
@@ -126,7 +128,10 @@ namespace Shadowbus.Server.SocketIO
             foreach (SocketIoConnection connection in connections)
                 connection.Close("server_stopped");
             lock (_connectionLock)
+            {
                 _connections.Clear();
+                _pendingRoomReentries.Clear();
+            }
         }
 
         public string CreateRoomCode(string roomId)
@@ -242,13 +247,11 @@ namespace Shadowbus.Server.SocketIO
 
             Plugin.Logger.LogInfo($"[SocketIO] Client {connection.SessionId} bound to room {battleId} as {(player.IsHost ? "host" : "guest")}; query viewerId hint={(queryViewerId.HasValue ? queryViewerId.Value.ToString() : "none")}");
 
-            if (reconnecting)
+            if (reconnecting && room.State != RoomState.Finished &&
+                !IsPendingRoomReentry(room.RoomId, connection.PlayerId))
             {
-                // A reconnect can happen while the peer is still online or
-                // while frames are queued for this logical slot. Refresh the
-                // room view and flush those frames immediately; Reenter is
-                // still handled below for the native client's explicit
-                // recovery request.
+                // Preserve live recovery. Post-battle room agents must first
+                // send Reenter, after reaching the native RoomReady status.
                 SendOpponentSnapshot(connection, room);
                 FlushPendingMessages(connection, room);
             }
@@ -334,6 +337,18 @@ namespace Shadowbus.Server.SocketIO
             GameRoom room = _rooms.GetRoom(connection.BattleId);
             if (room == null)
                 return;
+
+            if (uri == "Reenter")
+            {
+                JToken isRecovery = (message as JObject)?["isRecovery"];
+                if (isRecovery != null && isRecovery.Type == JTokenType.Boolean &&
+                    !isRecovery.Value<bool>())
+                {
+                    PrepareRoomForRematch(room);
+                    if (TryHandleRematchReentry(connection, room, eventName, message, binary))
+                        return;
+                }
+            }
 
             BattleSession battleSession = _messageRouter.GetOrCreate(room.RoomId);
             if (room.State == RoomState.InGame)
@@ -968,7 +983,11 @@ namespace Shadowbus.Server.SocketIO
                 SocketIoConnection peer = FindActiveConnection(
                     connection.BattleId,
                     targetPlayer.PlayerId);
-                bool sent = peer != null && SendRoutedMessage(peer, routed);
+                // A connected peer may still be in the previous battle or
+                // initializing its new agent. Keep the new lobby stream queued.
+                bool sent = peer != null &&
+                    !IsPendingRoomReentry(room.RoomId, targetPlayer.PlayerId) &&
+                    SendRoutedMessage(peer, routed);
                 if (sent && routed.HasSequence)
                 {
                     _messageRouter.MarkDelivered(
@@ -1024,6 +1043,115 @@ namespace Shadowbus.Server.SocketIO
                 case ResultTurnstartWin: return ResultTurnstartLose;
                 case ResultTurnstartLose: return ResultTurnstartWin;
                 default: return ResultNoContest;
+            }
+        }
+
+        private void PrepareRoomForRematch(GameRoom room)
+        {
+            // Both clients send Reenter, possibly concurrently. Only the first
+            // normal return after a terminal result creates the next session.
+            lock (room)
+            {
+                if (room.State != RoomState.Finished)
+                    return;
+
+                var pendingReentries = new HashSet<string>(StringComparer.Ordinal);
+                foreach (Player player in room.GetPlayers())
+                {
+                    room.SetPlayerReady(player.PlayerId, false);
+                    pendingReentries.Add(player.PlayerId);
+                }
+                lock (_connectionLock)
+                {
+                    _roomReadySent.Remove(room.RoomId);
+                    _pendingRoomReentries[room.RoomId] = pendingReentries;
+                }
+
+                // Discard old pubSeq history and all per-battle state together,
+                // before accepting Reenter into the new lobby's message stream.
+                _messageRouter.Remove(room.RoomId);
+                _messageRouter.GetOrCreate(room.RoomId);
+                room.ChangeState(RoomState.Waiting);
+                Plugin.Logger.LogInfo(
+                    $"[SocketIO] Room {room.RoomId} reset for rematch: " +
+                    "new battle session, readiness and sequence history cleared");
+            }
+        }
+
+        private bool IsPendingRoomReentry(string roomId, string playerId)
+        {
+            lock (_connectionLock)
+                return _pendingRoomReentries.TryGetValue(roomId, out HashSet<string> pending) &&
+                    pending.Contains(playerId);
+        }
+
+        private bool TryHandleRematchReentry(
+            SocketIoConnection connection,
+            GameRoom room,
+            string eventName,
+            JToken message,
+            byte[] binary)
+        {
+            Player player = FindPlayer(room, connection.PlayerId);
+            if (player == null)
+                return false;
+
+            bool firstReturn;
+            lock (_connectionLock)
+            {
+                if (!_pendingRoomReentries.TryGetValue(room.RoomId, out HashSet<string> pending))
+                    return false;
+                firstReturn = pending.Remove(player.PlayerId);
+            }
+
+            // Reenter is acknowledged to the sender, but the native opponent
+            // controller restores membership only for RoomEntry. Retain pubSeq
+            // for deduplication and let the existing bridge assign playSeq so
+            // initialization gates defer consumption instead of losing the entry.
+            JObject entry = CreateRoomEntryWithProfile(message, player);
+            connection.LastRoomEntry = entry.DeepClone();
+            RelayToOpponent(connection, room, eventName, entry, message, binary);
+            if (firstReturn)
+                SendRematchPlayerState(connection, room, player);
+            FlushPendingMessages(connection, room);
+
+            if (firstReturn)
+            {
+                Plugin.Logger.LogInfo(
+                    $"[SocketIO] Room {room.RoomId} rematch reentry from " +
+                    $"{(connection.IsHost ? "host" : "guest")}: " +
+                    "routed sequenced RoomEntry and readiness to opponent, released pending lobby messages");
+            }
+            return true;
+        }
+
+        private void SendRematchPlayerState(SocketIoConnection connection, GameRoom room, Player player)
+        {
+            Player opponent = FindOpponent(connection, room);
+            if (opponent == null)
+                return;
+
+            // A normal guest does not refresh its UI on the opponent's RoomEntry.
+            // Follow the profile with the actual lobby readiness: the native
+            // readiness handler updates both roles' displays without a UI patch.
+            JObject state = new JObject
+            {
+                ["uri"] = player.IsReady ? "SetupComplete" : "SetupCancel",
+                ["isSelf"] = 0,
+                ["viewerId"] = player.ViewerId
+            };
+            RoutedMessage routed = _messageRouter.CreateServerMessage(
+                room.RoomId,
+                player.PlayerId,
+                opponent.PlayerId,
+                "msg",
+                state);
+            SocketIoConnection target = FindActiveConnection(room.RoomId, opponent.PlayerId);
+            if (routed != null && target != null &&
+                !IsPendingRoomReentry(room.RoomId, opponent.PlayerId) &&
+                SendRoutedMessage(target, routed))
+            {
+                _messageRouter.MarkDelivered(room.RoomId, routed);
             }
         }
 
@@ -1441,7 +1569,8 @@ namespace Shadowbus.Server.SocketIO
                     out PlayerDeck selfDeck,
                     out int[] selfCards,
                     out int battleSeed,
-                    out bool selfGoesFirst) ||
+                    out bool selfGoesFirst,
+                    out int battleFieldId) ||
                 !session.TryGetOpponentSetup(
                     target.PlayerId,
                     out PlayerDeck opponentDeck,
@@ -1449,9 +1578,10 @@ namespace Shadowbus.Server.SocketIO
                 return;
 
             JObject payload = battleStart
-                ? CreateBattleStartPayload(room, target, source, selfDeck, opponentDeck, battleSeed)
+                ? CreateBattleStartPayload(room, target, source, selfDeck, opponentDeck,
+                    battleSeed, battleFieldId)
                 : CreateMatchedPayload(room, target, source, selfDeck, opponentDeck,
-                    selfCards, battleSeed, selfGoesFirst);
+                    selfCards, battleSeed, selfGoesFirst, battleFieldId);
             payload["viewerId"] = source.ViewerId;
             payload["time"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
@@ -1486,15 +1616,18 @@ namespace Shadowbus.Server.SocketIO
             PlayerDeck opponentDeck,
             int[] selfCards,
             int battleSeed,
-            bool selfGoesFirst)
+            bool selfGoesFirst,
+            int battleFieldId)
         {
             return new JObject
             {
                 ["uri"] = "Matched",
                 ["bid"] = room.RoomId,
                 ["turnState"] = selfGoesFirst ? 0 : 1,
-                ["selfInfo"] = CreateBattleInfo(target, selfDeck, source, opponentDeck, battleSeed),
-                ["oppoInfo"] = CreateBattleInfo(source, opponentDeck, target, selfDeck, battleSeed),
+                ["selfInfo"] = CreateBattleInfo(target, selfDeck, source, opponentDeck,
+                    battleSeed, battleFieldId),
+                ["oppoInfo"] = CreateBattleInfo(source, opponentDeck, target, selfDeck,
+                    battleSeed, battleFieldId),
                 ["selfDeck"] = CreateDeckData(selfCards)
             };
         }
@@ -1505,15 +1638,18 @@ namespace Shadowbus.Server.SocketIO
             Player source,
             PlayerDeck selfDeck,
             PlayerDeck opponentDeck,
-            int battleSeed)
+            int battleSeed,
+            int battleFieldId)
         {
             return new JObject
             {
                 ["uri"] = "BattleStart",
                 ["bid"] = room.RoomId,
                 ["battleStartDate"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                ["selfInfo"] = CreateBattleInfo(target, selfDeck, source, opponentDeck, battleSeed),
-                ["oppoInfo"] = CreateBattleInfo(source, opponentDeck, target, selfDeck, battleSeed)
+                ["selfInfo"] = CreateBattleInfo(target, selfDeck, source, opponentDeck,
+                    battleSeed, battleFieldId),
+                ["oppoInfo"] = CreateBattleInfo(source, opponentDeck, target, selfDeck,
+                    battleSeed, battleFieldId)
             };
         }
 
@@ -1522,7 +1658,8 @@ namespace Shadowbus.Server.SocketIO
             PlayerDeck deck,
             Player opponent,
             PlayerDeck opponentDeck,
-            int battleSeed)
+            int battleSeed,
+            int battleFieldId)
         {
             return new JObject
             {
@@ -1542,7 +1679,7 @@ namespace Shadowbus.Server.SocketIO
                 ["degreeId"] = player.DegreeId,
                 ["country_code"] = player.CountryCode ?? string.Empty,
                 ["isOfficial"] = player.IsOfficial,
-                ["fieldId"] = 1,
+                ["fieldId"] = battleFieldId,
                 ["seed"] = battleSeed,
                 ["deckCount"] = deck?.CardIds?.Length ?? 0,
                 ["oppoDeckCount"] = opponentDeck?.CardIds?.Length ?? 0
@@ -2031,6 +2168,13 @@ namespace Shadowbus.Server.SocketIO
             result["rank"] = player.Rank;
             result["maxRank"] = player.Rank;
             result["isOfficial"] = player.IsOfficial ? 1 : 0;
+            // Player.OnEnter uses bool.Parse for guild flags, but int.Parse for isFriend.
+            if (result["isGuildMember"] == null)
+                result["isGuildMember"] = false;
+            if (result["isGuildJoined"] == null)
+                result["isGuildJoined"] = false;
+            if (result["isFriend"] == null)
+                result["isFriend"] = 0;
             if (result["battleNum"] == null)
                 result["battleNum"] = 1;
             if (result["ownerWin"] == null)
@@ -2058,8 +2202,8 @@ namespace Shadowbus.Server.SocketIO
                 ["maxRank"] = player.Rank,
                 ["isOfficial"] = player.IsOfficial ? 1 : 0,
                 ["isFriend"] = 0,
-                ["isGuildMember"] = 0,
-                ["isGuildJoined"] = 0,
+                ["isGuildMember"] = false,
+                ["isGuildJoined"] = false,
                 ["battleNum"] = 1,
                 ["ownerWin"] = 0,
                 ["guestWin"] = 0
