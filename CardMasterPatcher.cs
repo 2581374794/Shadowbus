@@ -2,6 +2,7 @@
 using HarmonyLib;
 using Newtonsoft.Json;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -944,6 +945,123 @@ namespace Shadowbus
                 Data.Load.data.UserCardList.Add(userCard);
             }
             Plugin.Logger.LogInfo("[End apply CardMaster mods]");
+            RegisterCardNameKeywords(master);
+        }
+
+        public static void RegisterCardNameKeywords(CardMaster cardMaster)
+        {
+            if (cardMaster == null)
+            {
+                return;
+            }
+            Master master = Data.Master;
+            if (master == null)
+            {
+                return;
+            }
+            IDictionary battleKeyWordDic = (IDictionary)master.BattleKeyWordDic;
+            if (battleKeyWordDic == null)
+            {
+                return;
+            }
+            IDictionary customLocalization = (IDictionary)CustomLocalization;
+            if (customLocalization == null)
+            {
+                return;
+            }
+            List<int> allCardIds = cardMaster.GetAllCardIds();
+            allCardIds.Sort();
+            IList cardIdList = (IList)allCardIds;
+            if (cardIdList == null)
+            {
+                return;
+            }
+            for (int i = 0; i < cardIdList.Count; i++)
+            {
+                int cardId = (int)cardIdList[i];
+                string key = cardId + "_CardName";
+                if (customLocalization.Contains(key))
+                {
+                    string cardName = (string)customLocalization[key];
+                    if (!string.IsNullOrEmpty(cardName) && !battleKeyWordDic.Contains(cardName))
+                    {
+                        battleKeyWordDic.Add(cardName, "[card]" + cardId + "[/card]");
+                    }
+                }
+            }
+        }
+
+        [HarmonyPatch(typeof(Master), "StartLoadBattleKeyWordText", MethodType.Normal)]
+        [HarmonyPostfix]
+        public static void Master_StartLoadBattleKeyWordText_Postfix()
+        {
+            RegisterCardNameKeywords(CardMaster.GetInstanceForBattle());
+            Plugin.Logger.LogInfo("Shadowbus: card-name keywords re-registered after BattleKeyWordDic reload");
+        }
+
+        public static int CompareCardIdByCost(int x, int y)
+        {
+            CardMaster master = CardMaster.GetInstanceForBattle();
+            if (master == null)
+            {
+                return x - y;
+            }
+            CardParameter cardParameter = master.GetCardParameterFromId(x);
+            CardParameter cardParameter2 = master.GetCardParameterFromId(y);
+            if (cardParameter != null && cardParameter2 != null)
+            {
+                int num = cardParameter.Cost - cardParameter2.Cost;
+                if (num != 0)
+                {
+                    return num;
+                }
+                return cardParameter.SortIndex - cardParameter2.SortIndex;
+            }
+            return x - y;
+        }
+
+        public static void SortCardIdListByCost(IList cardIds)
+        {
+            if (cardIds == null)
+            {
+                return;
+            }
+            int count = cardIds.Count;
+            for (int i = 1; i < count; i++)
+            {
+                int num = (int)cardIds[i];
+                int j = i - 1;
+                while (j >= 0 && CompareCardIdByCost((int)cardIds[j], num) > 0)
+                {
+                    cardIds[j + 1] = cardIds[j];
+                    j--;
+                }
+                cardIds[j + 1] = num;
+            }
+        }
+
+        [HarmonyPatch(typeof(UIBase_CardManager), "SelectAllCardIDInConditionMask", MethodType.Normal)]
+        [HarmonyPostfix]
+        public static void SelectAllCardIDInConditionMask_Postfix(IList<int> __result)
+        {
+            IList cardIds = (IList)__result;
+            if (cardIds == null)
+            {
+                return;
+            }
+            SortCardIdListByCost(cardIds);
+        }
+
+        [HarmonyPatch(typeof(UIBase_CardManager), "SortIDList", MethodType.Normal)]
+        [HarmonyPostfix]
+        public static void SortIDList_Postfix(List<int> __result)
+        {
+            IList cardIds = (IList)__result;
+            if (cardIds == null)
+            {
+                return;
+            }
+            SortCardIdListByCost(cardIds);
         }
 
         private static bool HasExplicitIntField(CardParameterPatch patch, string fieldName)
