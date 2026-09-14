@@ -1,4 +1,4 @@
-﻿using Cute;
+using Cute;
 using HarmonyLib;
 using Newtonsoft.Json;
 using System;
@@ -31,8 +31,38 @@ namespace Shadowbus
         // Optional. A normal or foil CardId from the original game whose foil
         // material is used as this card's visual-effect template.
         public int? foilEffectCardId;
+        // Optional artwork borrowing, one slot at a time. Each value is a card id
+        // from the original game whose card face this card uses for that slot;
+        // absent or 0 keeps the engine's own resolution.
+        //   normalArtCardId    - face shown before evolution (follower art)
+        //   evolutionArtCardId - face shown after evolution ("<id>1_M")
+        //   spellArtCardId     - spell/amulet face, i.e. 咒术 and 魔法阵 art; both
+        //                        come from the same material set and only the card's
+        //                        own CharType decides how it is drawn
+        // A slot may also be borrowed across card kinds: a follower card can use a
+        // spell/amulet face and the other way round, because the material is fetched
+        // from the bundle the source card actually lives in.
+        // Foil (闪卡) is not a separate face here - it is the foil material of
+        // foilEffectCardId above.
+        public int? normalArtCardId;
+        public int? evolutionArtCardId;
+        public int? spellArtCardId;
         public Dictionary<string, bool> boolFields = [];
         public Dictionary<string, int> intFields = [];
+        // Single-valued float CardParameter properties (SummonTime, EvolTime, ...).
+        // intFields is Int32-only and the string group assigns raw strings, so these
+        // had no usable JSON channel at all before.
+        public Dictionary<string, float> floatFields = [];
+        // Optional. Lets this card play another card's voice.
+        // Voices live in one ACB per card id ("v/vo_<cardId>.acb") and the game
+        // only ever loads the card's own bank, so a cross-id voice entry would
+        // otherwise point at a bank that was never loaded and stay silent.
+        // Every entry is a voice id as written in the master voice columns
+        // (PlayVoice/EvoVoice/AtkVoice/DestroyVoice/SkillVoice), for example
+        // "125641030_4"; only the part before the first '_' matters, because the
+        // game itself derives the bank name that way. Listing "125641030" and
+        // "125641030_4" loads the same bank. Missing or empty loads nothing extra.
+        public string[] extraVoiceIds = [];
         public Dictionary<string, int[]> intArrayFields = [];
         public Dictionary<string, string> stringChangeFields = [];
         public Dictionary<string, string> stringAppendFields = [];
@@ -50,6 +80,7 @@ namespace Shadowbus
 
             ApplyFields(card, boolFields, preserveVariantIdentity);
             ApplyFields(card, intFields, preserveVariantIdentity);
+            ApplyFields(card, floatFields, preserveVariantIdentity);
             ApplyIntArrayFields(card, preserveVariantIdentity);
             ApplyFields(card, stringChangeFields, preserveVariantIdentity);
 
@@ -296,7 +327,30 @@ namespace Shadowbus
                 return Enum.ToObject(property.PropertyType, enumValue);
             }
 
-            return value;
+            if (value == null)
+            {
+                return null;
+            }
+
+            Type targetType = property.PropertyType;
+            if (targetType.IsAssignableFrom(value.GetType()))
+            {
+                return value;
+            }
+
+            // CardParameter owns Single fields (SummonTime / EvolTime / ...). An Int32
+            // coming from intFields was widened by SetValue itself, but a raw string
+            // from stringChangeFields threw
+            // "Object of type 'System.String' cannot be converted to type 'System.Single'".
+            // Convert explicitly so numeric text can drive numeric properties.
+            try
+            {
+                return Convert.ChangeType(value, targetType, System.Globalization.CultureInfo.InvariantCulture);
+            }
+            catch (Exception)
+            {
+                return value;
+            }
         }
 
         public void ConvertFrom(CardParameter original)
@@ -321,6 +375,10 @@ namespace Shadowbus
                 if (propType == typeof(int))
                 {
                     this.intFields[property.Name] = (int)value;
+                }
+                else if (propType == typeof(float))
+                {
+                    this.floatFields[property.Name] = (float)value;
                 }
                 else if (propType == typeof(bool))
                 {
@@ -447,6 +505,33 @@ namespace Shadowbus
         private static readonly HashSet<string> FoilEffectWarnings = [];
         private static readonly HashSet<Material> GeneratedCardMaterials = [];
 
+        // cardId -> extra voice bank ACB paths ("v/vo_<cardId>.acb") declared by
+        // that card's patch. Filled while the CardMaster patches are applied and
+        // consumed by the voice-loading hooks below.
+        private static readonly Dictionary<int, List<string>> ExtraVoiceAcbPathsByCardId = [];
+        // Banks already requested in the current battle. Trying to load the same
+        // ACB on every attack/destroy would spam the loader, so each bank is
+        // requested once; a battle start clears this set again.
+        private static readonly HashSet<string> LoadedExtraVoiceAcbs =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Target resource id -> per-slot artwork sources. The engine resolves every
+        // card face through ResourcesManager.FindCardMaterial(targetResourceCardId,
+        // ...), so a single entry here can redirect the face of one card without
+        // touching anything else, as long as the target resource id belongs to that
+        // card alone.
+        private static readonly Dictionary<int, ArtSlotBinding> ArtSlotsByTargetResourceId = [];
+        // Bundle type each target resource id uses, needed to recognise the target
+        // bundle while the game preloads assets.
+        private static readonly Dictionary<int, ResourcesManager.AssetLoadPathType>
+            ArtSlotTargetBundleTypes = [];
+        // Source bundles already requested in this scene, so the artwork load is not
+        // repeated for every lookup.
+        private static readonly HashSet<string> RequestedArtSourceBundles =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> ArtSlotWarnings = [];
+        private static readonly HashSet<int> DisabledArtSlotResourceIds = [];
+
         [ThreadStatic]
         private static bool IsResolvingFoilEffectTemplate;
 
@@ -463,6 +548,36 @@ namespace Shadowbus
         {
             public int TargetCardId;
             public int SourceCardId;
+        }
+
+        private sealed class ArtSlotRequest
+        {
+            public int CardId;
+            public CardParameterPatch Patch;
+
+            public static bool DeclaresAnySlot(CardParameterPatch patch)
+            {
+                return patch != null &&
+                    (patch.normalArtCardId.GetValueOrDefault() != 0 ||
+                     patch.evolutionArtCardId.GetValueOrDefault() != 0 ||
+                     patch.spellArtCardId.GetValueOrDefault() != 0);
+            }
+        }
+
+        // One resolved artwork source: the resource id whose material set the slot
+        // draws from, plus the bundle that resource id lives in. The bundle is not
+        // always the one the target card would use, which is what makes borrowing a
+        // spell/amulet face onto a follower (and the other way round) work.
+        private sealed class ArtSlotBinding
+        {
+            public int TargetResourceCardId;
+            public int OwnerCardId;
+            public int NormalResourceCardId;
+            public ResourcesManager.AssetLoadPathType NormalBundleType;
+            public int EvolutionResourceCardId;
+            public ResourcesManager.AssetLoadPathType EvolutionBundleType;
+            public int SpellResourceCardId;
+            public ResourcesManager.AssetLoadPathType SpellBundleType;
         }
 
         private static readonly ConditionalWeakTable<CardParameter, RuntimeCardText>
@@ -636,6 +751,11 @@ namespace Shadowbus
             masterDict.Clear();
             CustomLocalization.Clear();
             ClearFoilEffectRegistry();
+            ExtraVoiceAcbPathsByCardId.Clear();
+            LoadedExtraVoiceAcbs.Clear();
+            ArtSlotsByTargetResourceId.Clear();
+            ArtSlotTargetBundleTypes.Clear();
+            RequestedArtSourceBundles.Clear();
             foreach (var kvp in CardParameterBackup)
             {
                 masterDict.Add(kvp.Key,kvp.Value.Clone());
@@ -657,6 +777,122 @@ namespace Shadowbus
             if (FoilEffectWarnings.Add(key))
             {
                 Plugin.Logger.LogWarning(message);
+            }
+        }
+
+        // Turns the patch's extraVoiceIds into the voice bank paths that have to
+        // be loaded on top of the card's own bank.
+        private static void RegisterExtraVoices(int cardId, CardParameterPatch patch)
+        {
+            if (patch.extraVoiceIds == null || patch.extraVoiceIds.Length == 0 || cardId <= 0)
+            {
+                return;
+            }
+
+            List<string> paths = null;
+            foreach (string voiceId in patch.extraVoiceIds)
+            {
+                if (string.IsNullOrEmpty(voiceId))
+                {
+                    continue;
+                }
+
+                // The game derives the bank name by cutting the voice id at the
+                // first '_' (VoiceDictionaries.GetVoiceIDBeforeUnderBar), so
+                // "125641030_4" and "125641030" both mean v/vo_125641030.acb.
+                string bankId = voiceId.Trim().Split('_')[0];
+                if (bankId.Length == 0)
+                {
+                    Plugin.Logger.LogWarning(
+                        $"card {cardId} has an unusable extra voice id '{voiceId}'");
+                    continue;
+                }
+
+                string path = "v/vo_" + bankId + ".acb";
+                paths ??= [];
+                if (!paths.Contains(path))
+                {
+                    paths.Add(path);
+                }
+            }
+
+            if (paths == null)
+            {
+                return;
+            }
+
+            if (!ExtraVoiceAcbPathsByCardId.TryGetValue(cardId, out List<string> registered))
+            {
+                ExtraVoiceAcbPathsByCardId[cardId] = paths;
+                Plugin.Logger.LogInfo(
+                    $"card {cardId} gets extra voice bank(s): {string.Join(", ", paths)}");
+                return;
+            }
+
+            foreach (string path in paths)
+            {
+                if (!registered.Contains(path))
+                {
+                    registered.Add(path);
+                    Plugin.Logger.LogInfo($"card {cardId} gets extra voice bank: {path}");
+                }
+            }
+        }
+
+        // Runs on every voice use of a card. Only the first call per bank does
+        // any work, and when no card declares extraVoiceIds the registry is empty
+        // and this returns immediately.
+        private static void EnsureExtraVoicesLoaded(int cardId)
+        {
+            if (cardId <= 0 || ExtraVoiceAcbPathsByCardId.Count == 0 ||
+                !ExtraVoiceAcbPathsByCardId.TryGetValue(cardId, out List<string> paths))
+            {
+                return;
+            }
+
+            List<string> pending = null;
+            foreach (string path in paths)
+            {
+                if (LoadedExtraVoiceAcbs.Add(path))
+                {
+                    pending ??= [];
+                    pending.Add(path);
+                }
+            }
+
+            if (pending == null)
+            {
+                return;
+            }
+
+            try
+            {
+                ResourcesManager resourcesManager = Toolbox.ResourcesManager;
+                if (resourcesManager == null)
+                {
+                    foreach (string path in pending)
+                    {
+                        LoadedExtraVoiceAcbs.Remove(path);
+                    }
+
+                    return;
+                }
+
+                // Same call the game's own WaitLoadVoiceResourceVfx uses, so the
+                // bank lands in the same atom cue sheet the card plays from.
+                resourcesManager.StartCoroutine_LoadAssetGroupAsync(pending, null, true);
+                Plugin.Logger.LogInfo(
+                    $"loading extra voice bank(s) for card {cardId}: {string.Join(", ", pending)}");
+            }
+            catch (Exception e)
+            {
+                foreach (string path in pending)
+                {
+                    LoadedExtraVoiceAcbs.Remove(path);
+                }
+
+                Plugin.Logger.LogWarning(
+                    $"failed to load extra voice bank(s) for card {cardId}: {e.Message}");
             }
         }
 
@@ -797,6 +1033,323 @@ namespace Shadowbus
             }
         }
 
+        // Resolves one declared art slot into the resource id and the bundle that
+        // resource id lives in. A slot value is a card id from the original game;
+        // when that card is unknown the number is used as resource id directly, so a
+        // raw resource id works as well.
+        private static bool TryResolveArtSource(
+            CardMaster master,
+            int declaredCardId,
+            out int resourceCardId,
+            out ResourcesManager.AssetLoadPathType bundleType)
+        {
+            resourceCardId = 0;
+            bundleType = ResourcesManager.AssetLoadPathType.UnitCardMaterial;
+            if (declaredCardId == 0)
+            {
+                return false;
+            }
+
+            CardParameter source = master.GetCardParameterFromId(declaredCardId);
+            resourceCardId = source?.ResourceCardId ?? declaredCardId;
+            if (resourceCardId <= 0)
+            {
+                return false;
+            }
+
+            bundleType = source != null && UsesUnitCardMaterial(source)
+                ? ResourcesManager.AssetLoadPathType.UnitCardMaterial
+                : ResourcesManager.AssetLoadPathType.SpellCardMaterial;
+            return true;
+        }
+
+        private static void BuildArtSlotRegistry(
+            CardMaster master,
+            IEnumerable<ArtSlotRequest> requests)
+        {
+            foreach (ArtSlotRequest request in requests)
+            {
+                CardParameter target = master.GetCardParameterFromId(request.CardId);
+                if (target == null)
+                {
+                    continue;
+                }
+
+                int targetResourceCardId = target.ResourceCardId;
+                if (targetResourceCardId <= 0 ||
+                    DisabledArtSlotResourceIds.Contains(targetResourceCardId))
+                {
+                    continue;
+                }
+
+                var binding = new ArtSlotBinding
+                {
+                    TargetResourceCardId = targetResourceCardId,
+                    OwnerCardId = request.CardId
+                };
+                TryResolveArtSource(
+                    master,
+                    request.Patch.normalArtCardId.GetValueOrDefault(),
+                    out binding.NormalResourceCardId,
+                    out binding.NormalBundleType);
+                TryResolveArtSource(
+                    master,
+                    request.Patch.evolutionArtCardId.GetValueOrDefault(),
+                    out binding.EvolutionResourceCardId,
+                    out binding.EvolutionBundleType);
+                TryResolveArtSource(
+                    master,
+                    request.Patch.spellArtCardId.GetValueOrDefault(),
+                    out binding.SpellResourceCardId,
+                    out binding.SpellBundleType);
+
+                if (ArtSlotsByTargetResourceId.TryGetValue(
+                        targetResourceCardId,
+                        out ArtSlotBinding existing))
+                {
+                    if (SameArtSlots(existing, binding))
+                    {
+                        continue;
+                    }
+
+                    // Two cards sharing one resource id want different faces. Any
+                    // choice would show the wrong artwork on the other card, so the
+                    // override is dropped and both keep the engine's own artwork.
+                    ArtSlotsByTargetResourceId.Remove(targetResourceCardId);
+                    ArtSlotTargetBundleTypes.Remove(targetResourceCardId);
+                    DisabledArtSlotResourceIds.Add(targetResourceCardId);
+                    WarnArtSlotOnce(
+                        $"resource-conflict:{targetResourceCardId}",
+                        $"resource id {targetResourceCardId} is used by several cards with different artwork slots; the artwork override is disabled for this shared resource (give each new card its own ResourceCardId or drop intFields.ResourceCardId)");
+                    continue;
+                }
+
+                ArtSlotsByTargetResourceId[targetResourceCardId] = binding;
+                ArtSlotTargetBundleTypes[targetResourceCardId] = UsesUnitCardMaterial(target)
+                    ? ResourcesManager.AssetLoadPathType.UnitCardMaterial
+                    : ResourcesManager.AssetLoadPathType.SpellCardMaterial;
+                Plugin.Logger.LogInfo(
+                    $"card {request.CardId} (resource {targetResourceCardId}) artwork slots: " +
+                    $"normal={DescribeArtSlot(binding.NormalResourceCardId, binding.NormalBundleType)}, " +
+                    $"evolution={DescribeArtSlot(binding.EvolutionResourceCardId, binding.EvolutionBundleType)}, " +
+                    $"spell={DescribeArtSlot(binding.SpellResourceCardId, binding.SpellBundleType)}");
+            }
+        }
+
+        private static bool SameArtSlots(ArtSlotBinding left, ArtSlotBinding right)
+        {
+            return left.NormalResourceCardId == right.NormalResourceCardId &&
+                   left.NormalBundleType == right.NormalBundleType &&
+                   left.EvolutionResourceCardId == right.EvolutionResourceCardId &&
+                   left.EvolutionBundleType == right.EvolutionBundleType &&
+                   left.SpellResourceCardId == right.SpellResourceCardId &&
+                   left.SpellBundleType == right.SpellBundleType;
+        }
+
+        private static string DescribeArtSlot(
+            int resourceCardId,
+            ResourcesManager.AssetLoadPathType bundleType)
+        {
+            return resourceCardId == 0 ? "engine" : $"{resourceCardId}@{bundleType}";
+        }
+
+        private static void WarnArtSlotOnce(string key, string message)
+        {
+            if (ArtSlotWarnings.Add(key))
+            {
+                Plugin.Logger.LogWarning(message);
+            }
+        }
+
+        // Picks the declared source for the slot the engine is asking for.
+        // A missing slot falls back to the natural sibling: an evolved face without
+        // its own source uses the normal source's evolved artwork.
+        private static bool TryGetArtSlot(
+            int targetResourceCardId,
+            ResourcesManager.AssetLoadPathType type,
+            bool isEvolution,
+            out int resourceCardId,
+            out ResourcesManager.AssetLoadPathType bundleType)
+        {
+            resourceCardId = 0;
+            bundleType = type;
+            if (!ArtSlotsByTargetResourceId.TryGetValue(
+                    targetResourceCardId,
+                    out ArtSlotBinding binding))
+            {
+                return false;
+            }
+
+            if (type == ResourcesManager.AssetLoadPathType.SpellCardMaterial)
+            {
+                if (binding.SpellResourceCardId != 0)
+                {
+                    resourceCardId = binding.SpellResourceCardId;
+                    bundleType = binding.SpellBundleType;
+                    return true;
+                }
+
+                if (binding.NormalResourceCardId != 0)
+                {
+                    resourceCardId = binding.NormalResourceCardId;
+                    bundleType = binding.NormalBundleType;
+                    return true;
+                }
+
+                if (isEvolution && binding.EvolutionResourceCardId != 0)
+                {
+                    resourceCardId = binding.EvolutionResourceCardId;
+                    bundleType = binding.EvolutionBundleType;
+                    return true;
+                }
+
+                return false;
+            }
+
+            if (isEvolution)
+            {
+                if (binding.EvolutionResourceCardId != 0)
+                {
+                    resourceCardId = binding.EvolutionResourceCardId;
+                    bundleType = binding.EvolutionBundleType;
+                    return true;
+                }
+
+                if (binding.NormalResourceCardId != 0)
+                {
+                    resourceCardId = binding.NormalResourceCardId;
+                    bundleType = binding.NormalBundleType;
+                    return true;
+                }
+
+                if (binding.SpellResourceCardId != 0)
+                {
+                    resourceCardId = binding.SpellResourceCardId;
+                    bundleType = binding.SpellBundleType;
+                    return true;
+                }
+
+                return false;
+            }
+
+            if (binding.NormalResourceCardId != 0)
+            {
+                resourceCardId = binding.NormalResourceCardId;
+                bundleType = binding.NormalBundleType;
+                return true;
+            }
+
+            if (binding.SpellResourceCardId != 0)
+            {
+                resourceCardId = binding.SpellResourceCardId;
+                bundleType = binding.SpellBundleType;
+                return true;
+            }
+
+            return false;
+        }
+
+        // Fetches the borrowed face. It goes back into the very same
+        // FindCardMaterial the game uses, so whatever the source card's own face is
+        // (follower, spell, amulet, evolved, another bundle) is returned as is.
+        private static Material GetArtSlotMaterial(
+            int resourceCardId,
+            ResourcesManager.AssetLoadPathType bundleType,
+            bool isEvolution,
+            bool isMutation,
+            CardBasePrm.CharaType originalType,
+            bool isChoiceBrave)
+        {
+            if (resourceCardId == 0 || Toolbox.ResourcesManager == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                IsResolvingFoilEffectTemplate = true;
+                Material material = Toolbox.ResourcesManager.FindCardMaterial(
+                    resourceCardId,
+                    bundleType,
+                    isEvolution,
+                    isMutation,
+                    originalType,
+                    isChoiceBrave);
+                if (material == null)
+                {
+                    WarnArtSlotOnce(
+                        $"material-unavailable:{resourceCardId}:{bundleType}:{isEvolution}",
+                        $"artwork source {resourceCardId} ({bundleType}) is unavailable; the engine artwork is used instead");
+                }
+
+                return material;
+            }
+            finally
+            {
+                IsResolvingFoilEffectTemplate = false;
+            }
+        }
+
+        private static void AddArtSourceBundlesToLoadList(
+            ResourcesManager resourcesManager,
+            HashSet<string> loaded,
+            List<string> expanded,
+            int targetResourceCardId)
+        {
+            if (!ArtSlotsByTargetResourceId.TryGetValue(
+                    targetResourceCardId,
+                    out ArtSlotBinding binding))
+            {
+                return;
+            }
+
+            AddArtSourceBundle(
+                resourcesManager,
+                loaded,
+                expanded,
+                binding.NormalResourceCardId,
+                binding.NormalBundleType);
+            AddArtSourceBundle(
+                resourcesManager,
+                loaded,
+                expanded,
+                binding.EvolutionResourceCardId,
+                binding.EvolutionBundleType);
+            AddArtSourceBundle(
+                resourcesManager,
+                loaded,
+                expanded,
+                binding.SpellResourceCardId,
+                binding.SpellBundleType);
+        }
+
+        private static void AddArtSourceBundle(
+            ResourcesManager resourcesManager,
+            HashSet<string> loaded,
+            List<string> expanded,
+            int resourceCardId,
+            ResourcesManager.AssetLoadPathType bundleType)
+        {
+            if (resourceCardId == 0)
+            {
+                return;
+            }
+
+            string bundle = resourcesManager.GetAssetTypePath(
+                resourceCardId.ToString(),
+                bundleType,
+                false);
+            if (string.IsNullOrEmpty(bundle) || !loaded.Add(bundle))
+            {
+                return;
+            }
+
+            expanded.Add(bundle);
+            RequestedArtSourceBundles.Add(bundle);
+            Plugin.Logger.LogInfo(
+                $"loading borrowed artwork bundle for resource {resourceCardId}: {bundle}");
+        }
+
         private static void AddSourceBundleMapping(
             int targetResourceCardId,
             ResourcesManager.AssetLoadPathType materialType,
@@ -825,6 +1378,30 @@ namespace Shadowbus
             var card_master_folder = Directory.CreateDirectory(Plugin.CardMasterPath);
             var patches = card_master_folder.GetFiles("*.json");
             List<FoilEffectRequest> foilEffectRequests = [];
+            List<ArtSlotRequest> artSlotRequests = [];
+
+            // Every card id the patch files ask for. The automatic foil companion must
+            // never steal an id that another record already claims, so explicitly
+            // written foil records always win over a generated one.
+            HashSet<int> requestedNewCardIds = [];
+            foreach (var declaredFile in patches)
+            {
+                try
+                {
+                    foreach (CardParameterPatch declared in JsonConvert.DeserializeObject<List<CardParameterPatch>>(
+                        File.ReadAllText(declaredFile.FullName)) ?? [])
+                    {
+                        if (declared != null && declared.newCard && declared.cardId > 0)
+                        {
+                            requestedNewCardIds.Add(declared.cardId);
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                    // The main pass below reports malformed files with their file name.
+                }
+            }
             foreach (var pat in patches)
             {
                 string json = File.ReadAllText(pat.FullName);
@@ -866,6 +1443,15 @@ namespace Shadowbus
                             }
 
                             patch.PatchTemplate(variant, preserveVariantIdentity: true);
+                            RegisterExtraVoices(variant.CardId, patch);
+                            if (ArtSlotRequest.DeclaresAnySlot(patch))
+                            {
+                                artSlotRequests.Add(new ArtSlotRequest
+                                {
+                                    CardId = variant.CardId,
+                                    Patch = patch
+                                });
+                            }
                             if (patch.foilEffectCardId.HasValue)
                             {
                                 foilEffectRequests.Add(new FoilEffectRequest
@@ -895,6 +1481,17 @@ namespace Shadowbus
                             // registered under the new card's ID.
                             newCard.CardId = patch.cardId;
                             patch.PatchTemplate(newCard);
+
+                            // A new card that borrows artwork per slot keeps a resource
+                            // id of its own, so those overrides can never leak into an
+                            // original card that happens to share the template's
+                            // resource id. The card then has no bundle of its own and
+                            // its faces come entirely from the declared slots.
+                            if (!HasExplicitIntField(patch, nameof(CardParameter.ResourceCardId)) &&
+                                ArtSlotRequest.DeclaresAnySlot(patch))
+                            {
+                                newCard.ResourceCardId = patch.cardId;
+                            }
                             if (HasExplicitIntField(patch, nameof(CardParameter.CardId)) &&
                                 newCard.CardId != patch.cardId)
                             {
@@ -920,6 +1517,15 @@ namespace Shadowbus
                             }
 
                             masterDict.Add(patch.cardId, newCard);
+                            RegisterExtraVoices(patch.cardId, patch);
+                            if (ArtSlotRequest.DeclaresAnySlot(patch))
+                            {
+                                artSlotRequests.Add(new ArtSlotRequest
+                                {
+                                    CardId = patch.cardId,
+                                    Patch = patch
+                                });
+                            }
                             if (patch.foilEffectCardId.HasValue)
                             {
                                 foilEffectRequests.Add(new FoilEffectRequest
@@ -928,12 +1534,36 @@ namespace Shadowbus
                                     SourceCardId = patch.foilEffectCardId.Value
                                 });
                             }
+
+                            // Pair the new card with a foil version of itself, so a patch
+                            // that only describes the normal card still yields both.
+                            int foilCompanionId = TryAddFoilCompanion(
+                                master,
+                                masterDict,
+                                requestedNewCardIds,
+                                patch,
+                                newCard,
+                                template,
+                                artSlotRequests);
+                            if (foilCompanionId != 0)
+                            {
+                                RegisterExtraVoices(foilCompanionId, patch);
+                                if (patch.foilEffectCardId.HasValue)
+                                {
+                                    foilEffectRequests.Add(new FoilEffectRequest
+                                    {
+                                        TargetCardId = foilCompanionId,
+                                        SourceCardId = patch.foilEffectCardId.Value
+                                    });
+                                }
+                            }
                         }
                     }
                 }
             }
 
             BuildFoilEffectRegistry(master, foilEffectRequests);
+            BuildArtSlotRegistry(master, artSlotRequests);
 
             Data.Load.data.UserCardList.Clear();
             var all = master.GetAllCardIds();
@@ -1064,9 +1694,137 @@ namespace Shadowbus
             SortCardIdListByCost(cardIds);
         }
 
+        // Deck edit (the card pool with the search box) uses a THIRD path that
+        // neither of the two patches above covers:
+        //   UIBase_CardManager.SelectAllCardIDInConditionMask  <- only called by CardAllListUI.GetFilteringIDList
+        //   UIBase_CardManager.SortIDList                      <- FilterController / DeckData
+        // Deck edit instead goes through CardBundleControllerBase.GetFilteringIDList,
+        // so its result stayed in raw CardId order. It is declared virtual on the base
+        // class and is not overridden by CardBundleController, so patching the base
+        // covers every deck-edit card pool.
+        [HarmonyPatch(typeof(Wizard.DeckCardEdit.CardBundleControllerBase), nameof(Wizard.DeckCardEdit.CardBundleControllerBase.GetFilteringIDList))]
+        [HarmonyPostfix]
+        public static void CardBundleControllerBase_GetFilteringIDList_Postfix(List<int> __result)
+        {
+            IList cardIds = (IList)__result;
+            if (cardIds == null)
+            {
+                return;
+            }
+            SortCardIdListByCost(cardIds);
+        }
+
+        // CardDestruct overrides GetFilteringIDList on
+        // CardDestruct_CardBundleController, so the base-class patch above never
+        // sees that card pool: an override carries its own method body and the
+        // caller binds straight to it, bypassing the patched base implementation.
+        // Patching the override too closes the last card-pool path. For any single
+        // call only one of these two postfixes ever runs.
+        [HarmonyPatch(typeof(Wizard.CardDestruct.CardDestruct_CardBundleController), nameof(Wizard.CardDestruct.CardDestruct_CardBundleController.GetFilteringIDList))]
+        [HarmonyPostfix]
+        public static void CardDestruct_CardBundleController_GetFilteringIDList_Postfix(List<int> __result)
+        {
+            IList cardIds = (IList)__result;
+            if (cardIds == null)
+            {
+                return;
+            }
+            SortCardIdListByCost(cardIds);
+        }
+
+        // The game keeps a normal and a foil record for every card, and the foil one
+        // is what carries IsFoil plus the NormalCardId/FoilCardId back-references. A
+        // patch that only creates the normal record therefore leaves the card with no
+        // foil version at all, so one is derived from the same patch: identical stats,
+        // skills and text, cloned from the template's own foil card so it also keeps
+        // the foil material and artwork.
+        // Returns the companion's card id, or 0 when none was created.
+        private static int TryAddFoilCompanion(
+            CardMaster master,
+            IDictionary<int, CardParameter> masterDict,
+            ISet<int> requestedNewCardIds,
+            CardParameterPatch patch,
+            CardParameter normal,
+            CardParameter template,
+            List<ArtSlotRequest> artSlotRequests)
+        {
+            if (HasExplicitBoolField(patch, nameof(CardParameter.IsFoil)) &&
+                patch.boolFields[nameof(CardParameter.IsFoil)])
+            {
+                // The patch is itself the foil record, so the pair is managed by hand.
+                return 0;
+            }
+
+            int foilCardId = normal.CardId + 1;
+            if (masterDict.ContainsKey(foilCardId) ||
+                (requestedNewCardIds != null && requestedNewCardIds.Contains(foilCardId)))
+            {
+                Plugin.Logger.LogInfo(
+                    $"card {normal.CardId} gets no foil companion: card id {foilCardId} is already claimed");
+                return 0;
+            }
+
+            int foilTemplateId = template.FoilCardId != 0 && template.FoilCardId != template.CardId
+                ? template.FoilCardId
+                : template.CardId;
+            CardParameter foilTemplate = master.GetCardParameterFromId(foilTemplateId) ?? template;
+
+            CardParameter foil = CardParameterCloner.DeepClone(foilTemplate);
+            // Set the id before PatchTemplate so localizationFields are registered under
+            // the companion's own id as well.
+            foil.CardId = foilCardId;
+            patch.PatchTemplate(foil);
+            foil.CardId = foilCardId;
+            foil.IsFoil = true;
+            foil.BaseCardId = normal.BaseCardId != 0 ? normal.BaseCardId : normal.CardId;
+            foil.NormalCardId = normal.CardId;
+            foil.FoilCardId = foilCardId;
+            if (!HasExplicitIntField(patch, nameof(CardParameter.ResourceCardId)))
+            {
+                if (ArtSlotRequest.DeclaresAnySlot(patch))
+                {
+                    // Borrowed faces: each version deliberately keeps a resource id of
+                    // its own so the slots cannot collide.
+                    foil.ResourceCardId = foilCardId;
+                }
+                else if (Utils.HasExternalTexture(normal.ResourceCardId, false))
+                {
+                    // Player artwork in Mods/CardImages is addressed by ResourceCardId,
+                    // so the foil companion has to share the id of the normal version.
+                    // Otherwise it would resolve the template's own resource id and
+                    // show the original card's artwork instead of the custom PNG.
+                    foil.ResourceCardId = normal.ResourceCardId;
+                }
+            }
+
+            if (!HasExplicitIntField(patch, nameof(CardParameter.FoilCardId)))
+            {
+                normal.FoilCardId = foilCardId;
+            }
+
+            masterDict.Add(foilCardId, foil);
+            if (ArtSlotRequest.DeclaresAnySlot(patch))
+            {
+                artSlotRequests.Add(new ArtSlotRequest
+                {
+                    CardId = foilCardId,
+                    Patch = patch
+                });
+            }
+
+            Plugin.Logger.LogInfo(
+                $"added foil companion {foilCardId} for new card {normal.CardId} (cloned from {foilTemplateId})");
+            return foilCardId;
+        }
+
         private static bool HasExplicitIntField(CardParameterPatch patch, string fieldName)
         {
             return patch.intFields != null && patch.intFields.ContainsKey(fieldName);
+        }
+
+        private static bool HasExplicitBoolField(CardParameterPatch patch, string fieldName)
+        {
+            return patch.boolFields != null && patch.boolFields.ContainsKey(fieldName);
         }
 
         [HarmonyPatch(typeof(Wizard.CardMaster), "CreateCardMaster")]
@@ -1087,13 +1845,36 @@ namespace Shadowbus
             ref List<string> rogueAssetList)
         {
             if (rogueAssetList == null || rogueAssetList.Count == 0 ||
-                SourceBundleResourcesByTargetBundleResourceId.Count == 0)
+                (SourceBundleResourcesByTargetBundleResourceId.Count == 0 &&
+                 ArtSlotTargetBundleTypes.Count == 0))
             {
                 return;
             }
 
             List<string> expanded = new List<string>(rogueAssetList);
             HashSet<string> loaded = new HashSet<string>(expanded, StringComparer.OrdinalIgnoreCase);
+
+            // Borrowed card faces: the bundle of the card whose face is borrowed has
+            // to be resident before its material can be fetched.
+            if (ArtSlotTargetBundleTypes.Count != 0)
+            {
+                foreach (var artPair in ArtSlotTargetBundleTypes)
+                {
+                    string targetBundle = __instance.GetAssetTypePath(
+                        artPair.Key.ToString(),
+                        artPair.Value,
+                        false);
+                    if (!string.IsNullOrEmpty(targetBundle) && loaded.Contains(targetBundle))
+                    {
+                        AddArtSourceBundlesToLoadList(
+                            __instance,
+                            loaded,
+                            expanded,
+                            artPair.Key);
+                    }
+                }
+            }
+
             foreach (var pair in SourceBundleResourcesByTargetBundleResourceId)
             {
                 ResourcesManager.AssetLoadPathType materialType =
@@ -1127,6 +1908,55 @@ namespace Shadowbus
             rogueAssetList = expanded;
         }
 
+        // A card can only play cues from voice banks that are loaded, and the game
+        // itself only ever loads "v/vo_<ownCardId>.acb" (WaitLoadVoiceResourceVfx
+        // is handed VoiceDictionaries.VoiceId). These two hooks pull in the banks
+        // declared by extraVoiceIds, which is what makes a cross-id voice audible
+        // instead of silent. Both are cheap no-ops while no patch declares any
+        // extra voice id.
+        //
+        // InitializeVoiceInfo runs from BattleCardView's constructor, i.e. as soon
+        // as the card gets a view, so the bank is normally ready long before the
+        // first play/attack/destroy voice.
+        [HarmonyPatch(
+            typeof(Wizard.Battle.View.BattleCardView),
+            nameof(Wizard.Battle.View.BattleCardView.InitializeVoiceInfo))]
+        [HarmonyPrefix]
+        public static void BattleCardView_InitializeVoiceInfo_Prefix(int cardID)
+        {
+            EnsureExtraVoicesLoaded(cardID);
+        }
+
+        // Safety net for views that never went through InitializeVoiceInfo with
+        // the battle CardMaster's id (replay/choice cards and similar), so the
+        // banks are still requested at the moment the voice is actually set up.
+        [HarmonyPatch(
+            typeof(Wizard.Battle.View.Vfx.WaitLoadVoiceResourceVfx),
+            MethodType.Constructor,
+            new Type[] { typeof(Wizard.Battle.View.IBattleCardView), typeof(string) })]
+        [HarmonyPrefix]
+        public static void WaitLoadVoiceResourceVfx_Prefix(Wizard.Battle.View.IBattleCardView view)
+        {
+            if (view == null)
+            {
+                return;
+            }
+
+            var cardInfo = view.CardInfo;
+            if (cardInfo == null)
+            {
+                return;
+            }
+
+            var baseParameter = cardInfo.BaseParameter;
+            if (baseParameter == null)
+            {
+                return;
+            }
+
+            EnsureExtraVoicesLoaded(baseParameter.CardId);
+        }
+
         [HarmonyPatch(typeof(Cute.ResourcesManager), nameof(Cute.ResourcesManager.FindCardMaterial))]
         [HarmonyPostfix]
         public static void ResourcesManager_FindCardMaterial(
@@ -1146,6 +1976,30 @@ namespace Shadowbus
             if (__result != null && commonCardMaterial == null)
             {
                 commonCardMaterial = UnityEngine.Object.Instantiate(__result);
+            }
+
+            // Borrowed card face: every card face in the UI and in battle is resolved
+            // here, so redirecting this one lookup is enough for a card to display
+            // another card's artwork - including across follower/spell/amulet kinds,
+            // because the source material is fetched from the bundle it really lives in.
+            if (TryGetArtSlot(
+                    cardId,
+                    type,
+                    isEvol,
+                    out int artResourceCardId,
+                    out ResourcesManager.AssetLoadPathType artBundleType))
+            {
+                Material artMaterial = GetArtSlotMaterial(
+                    artResourceCardId,
+                    artBundleType,
+                    isEvol,
+                    isMutation,
+                    originalType,
+                    isChoiceBrave);
+                if (artMaterial != null)
+                {
+                    __result = artMaterial;
+                }
             }
 
             Material foilEffectTemplate = GetFoilEffectMaterial(
@@ -1174,7 +2028,8 @@ namespace Shadowbus
             ref VfxBase __result)
         {
             int resourceCardId = ResolveResourceCardId(cardId);
-            if (!Utils.HasExternalTexture(resourceCardId, isEvolution))
+            if (!Utils.HasExternalTexture(resourceCardId, isEvolution) &&
+                !ArtSlotsByTargetResourceId.ContainsKey(resourceCardId))
             {
                 return true;
             }
@@ -1199,6 +2054,27 @@ namespace Shadowbus
                 : ResourcesManager.AssetLoadPathType.SpellCardMaterial;
             bool isMutation = target != null && CardMaster.IsMutationCardCheck(target.BaseCardId);
             CardBasePrm.CharaType originalType = target?.CharType ?? CardBasePrm.CharaType.NORMAL;
+
+            // Borrowed card face: this path builds the material from a bundle path of
+            // its own instead of FindCardMaterial, so the borrowed artwork has to be
+            // supplied here as well.
+            Material artMaterial = null;
+            if (TryGetArtSlot(
+                    resourceCardId,
+                    type,
+                    isEvolution,
+                    out int artResourceCardId,
+                    out ResourcesManager.AssetLoadPathType artBundleType))
+            {
+                artMaterial = GetArtSlotMaterial(
+                    artResourceCardId,
+                    artBundleType,
+                    isEvolution,
+                    isMutation,
+                    originalType,
+                    false);
+            }
+
             Material foilEffectTemplate = GetFoilEffectMaterial(
                 resourceCardId,
                 type,
@@ -1209,12 +2085,17 @@ namespace Shadowbus
             Material customMaterial = CreateCardMaterial(
                 resourceCardId,
                 isEvolution,
-                __result,
+                __result ?? artMaterial,
                 foilEffectTemplate);
             if (customMaterial != null)
             {
                 __result = customMaterial;
                 ApplyCardShader(customMaterial, target);
+            }
+            else if (__result == null && artMaterial != null)
+            {
+                __result = artMaterial;
+                ApplyCardShader(artMaterial, target);
             }
         }
 
