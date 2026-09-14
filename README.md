@@ -16,6 +16,8 @@ Shadowverse 国际服的单机化与卡牌 Mod 工具，基于 BepInEx 6 开发�
 - 自定义练习：可指定对手卡组、职业、主战者和 AI CSV。
 - 卡牌 Mod：修改或新增卡牌，并支持自定义卡图与文本。
 - 卡组列表热重载：进入卡组列表时重新加载 `CardMaster` 配置。
+- 卡名可点击：`localizationFields` 改过的卡名会注册为卡牌关键字，在卡牌描述中点击即可查看该卡详情。
+- 卡牌列表排序：牌组编辑的搜索框与卡牌图鉴按费用升序排列，同费用保持原版顺序。
 - 主动技能：使用 `when_activate` 为场上随从添加“启动”按钮，可设置 PP 消费。
 - 自定义技能：复制卡牌信息与能力，或在保留自身能力的同时获得目标能力。
 - Socket.IO 房间对战：房主启动内嵌 Socket.IO 节点并生成加密连接码，另一名玩家粘贴连接码后通过原版实时网络加入房间。
@@ -51,7 +53,40 @@ Shadowverse/
 
 ## 联机对战
 
-联机对战功能正在开发中。实时传输已从自定义 TCP 切换为原版兼容的 Socket.IO over WebSocket；创建/加入房间仍由本地任务路由适配官方 HTTP API。
+Socket.IO 房间模式不连接官方服务器，也不需要自己长期架设服务器。游戏运行期间，房主临时监听一个 Socket.IO WebSocket 端点，负责房间流程与实时消息转发。
+
+战斗由房主权威执行。访客只发送输入请求（出牌、进化、融合、攻击、结束回合与各类选择），由房主用原版战斗管理器执行，并回传原版格式的 `PlayActions`、回合切换与结果封包供访客重放。双方在对战初始化时交换房主所需的私有卡牌/状态基线，之后随每次结果发送精简的权威状态变更。该模式面向互相信任的好友对战，不具备反作弊能力。
+
+1. 双方安装相同版本的游戏、Shadowbus 以及卡牌 Mod 数据。
+2. 房主在原版房间界面选择标准构筑 BO1 并创建房间。
+3. 房主点击复制房间号。剪贴板得到的是以 `SVP1-` 开头的加密连接码，而不是界面上显示的短房间号。
+4. 访客把完整的 `SVP1-...` 连接码粘贴到加入对话框的连接码输入框。校验通过后确认按钮才会启用。
+5. 双方各自选择卡组并准备，随后通过对战房间流程开始对战。
+
+连接码包含房主地址、Socket.IO 端口、BattleId 与完整性校验。它相当于该房间的密码，请勿公开。房间关闭或游戏退出后，旧连接码即失效。
+
+### 网络要求
+
+P2P 模式不提供账号服务、房间列表、STUN 打洞或 TURN 中继。双方必须满足以下条件之一：
+
+- 双方处于同一局域网，且连接码携带房主的局域网地址。
+- 房主拥有可被外部访问的公网 IPv4，并在路由器和系统防火墙中放行所配置的 Socket.IO 端口。
+- 双方具备可互相访问的 IPv6，房主把绑定地址与对外公布地址都设为该 IPv6，并放行防火墙。
+- 双方先加入 Tailscale、ZeroTier 或 Radmin VPN 等虚拟局域网，连接码携带房主的虚拟网卡地址。
+
+如果房主处于运营商级 NAT 之后且没有可用的 IPv6，则必须使用虚拟局域网；仅凭连接码无法穿透这类 NAT。
+
+首次启动后，可在 `BepInEx/config/` 下本插件的配置文件中编辑 `[SocketIO]` 段：
+
+- `BindAddress` — 房主监听的本地地址，IPv4 下默认为 `0.0.0.0`。
+- `AdvertisedAddress` — 写入连接码的地址。留空时优先使用显式配置的 `BindAddress`，否则自动选择一个同地址族的本机地址。跨公网或在虚拟局域网中使用时建议显式设置。使用 IPv6 时两项都必须是 IPv6 地址。
+- `Port` — 房主监听的 Socket.IO 端口，默认 `29600`。
+
+目前支持：标准构筑的 Open Room BO1，以及带自定义规则的 Room Two Pick BO1。不支持：HOF、Windfall、Avatar、原版 Backdraft/Cube/Chaos Two Pick、BO3/BO5、观战、断线重连、奖励与反作弊。
+
+`Mods/TwoPick` 下的每个 JSON 文件对应一种创建房间时可选的二选一模式，以 `displayName` 作为显示名。双方在本地各自选牌，房主把完整规则同步给访客，最终卡组再进入匹配。对战中掉线时，仍在线的一方默认获胜。
+
+每个游戏安装各自在 `Mods/P2PIdentity.json` 保存玩家 ID，并在 `Mods/Profile.json` 保存修改后的名称、称号、徽章与地区。请勿把生成的身份文件复制给其他玩家或第二个测试实例。
 
 ## 增强日志
 
@@ -111,7 +146,7 @@ Shadowbus 会在 BepInEx 的全局日志分发边界统一格式化日志，因�
 - `intArrayFields` 修改整数或枚举数组字段；卡牌类型使用 `"Tribe": [类型枚举值]`。
 - `stringChangeFields` 替换技能等字符串字段。
 - `stringAppendFields` 在原字符串后追加内容。
-- `localizationFields` 修改卡名、能力文本和背景文本。
+- `localizationFields` 修改卡名、能力文本和背景文本。改过的卡名会注册为卡牌关键字，因此在卡牌描述中可以直接点击查看该卡详情。
 
 修改配置后进入卡组列表即可热重载。新增卡牌应使用未占用的卡牌 ID；卡图放在 `Mods/CardImages/`，并通过 `ResourceCardId` 引用。
 
@@ -121,6 +156,8 @@ Shadowbus 会在 BepInEx 的全局日志分发边界统一格式化日志，因�
 - `stringArrayFields` 可用于替换 `SkillEffectPath`、`SkillSe`、`EvolEffectPath` 等 `string[]` 字段。
 - `foilEffectCardId` 可为闪卡指定原版卡牌的动态材质效果。可填写该来源卡的普通或闪卡 `CardId`；仅目标记录为 `IsFoil=true` 时生效，卡图仍使用目标卡自己的 `ResourceCardId` 和 PNG。来源与目标必须同为随从或同为法术/护符，且来源必须是原版已有卡。若同时制作普通版和闪卡版，为了让普通版不误用闪卡材质，两者必须使用不同的 `ResourceCardId`；共享资源 ID 时该覆盖会被禁用。只有单独制作一条闪卡记录时可以继续使用它自己的 `NormalCardId`。
 - 游戏内导出卡牌数据时会把卡牌类型写入 `intArrayFields.Tribe`；例如士兵为 `[2]`、机械为 `[7]`。
+
+牌组编辑的搜索框和卡牌图鉴按费用升序排列，同费用的卡牌保持原版顺序。排序依据是 `intFields` 中生效的 `Cost`，因此通常不需要再手工配置 `SortIndex`。
 
 项目已提供以下扩展：
 
@@ -152,10 +189,14 @@ Shadowbus 会在 BepInEx 的全局日志分发边界统一格式化日志，因�
 ## 构建
 
 ```powershell
-dotnet build Shadowbus.sln
+dotnet build Shadowbus.sln -c Release
 ```
 
-构建产物位于 `bin/Debug/net46/Shadowbus.dll`。项目需要引用游戏的 `Assembly-CSharp.dll`；如果游戏安装位置不同，请调整 `Shadowbus.csproj` 中的 `HintPath`。
+发布版本使用 `Release` 配置，构建产物位于 `bin/Release/net46/Shadowbus.dll`。不带 `-c` 时 `dotnet build` 默认为 `Debug`，产物在 `bin/Debug/net46/`，其 IL 未经优化，请勿用于发布。
+
+构建需要 .NET SDK（提供 `dotnet` 命令）。依赖的 NuGet 源已写在 `Shadowbus.csproj` 的 `RestoreAdditionalProjectSources` 中，首次构建会自动还原。
+
+项目需要引用游戏的 `Assembly-CSharp.dll`；如果游戏安装位置不同，请调整 `Shadowbus.csproj` 中的 `HintPath`。
 
 ## 注意事项
 
