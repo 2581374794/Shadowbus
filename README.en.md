@@ -14,8 +14,6 @@ The repository also ships an [all-in-one web configuration editor](WebEditor/REA
 - **Custom practice** — choose the opponent's deck, class, leader and AI CSV files.
 - **Card mods** — modify or add cards, including custom artwork and text.
 - **Deck list hot reload** — `CardMaster` configuration is reloaded whenever you open the deck list.
-- **Clickable card names** — names changed through `localizationFields` are registered as card keywords, so they can be clicked inside card text to open that card's details.
-- **Card list ordering** — deck-edit search results and the card gallery are sorted by cost, keeping the stock order within equal costs.
 - **Active abilities** — `when_activate` adds an activate button to your followers on the field, with a configurable PP cost.
 - **Custom abilities** — copy a card's information and abilities, or gain a target's abilities while keeping your own.
 - **Socket.IO rooms** — the host runs an embedded Socket.IO node and generates an encrypted connection code; the other player joins through the stock realtime client.
@@ -92,26 +90,6 @@ Each JSON file under `Mods/TwoPick` is one two-pick mode selectable when creatin
 
 Every game installation keeps its own player ID in `Mods/P2PIdentity.json` and its edited name, title, emblem and region in `Mods/Profile.json`. Do not copy a generated identity file to another player or to a second test instance.
 
-## Enhanced logging
-
-Shadowbus formats logging at BepInEx's global dispatch boundary, so ordinary modules, forwarded Unity/BepInEx messages and online logs all share one format. BepInEx's own `[Level:Source]` prefix is kept only once; level colours are applied only at the external console boundary, so text logs never contain ANSI escapes. Overlong content is wrapped according to the configuration, reserving width for the prefix.
-
-The enhanced log is saved separately as `BepInEx/LogOutput-enhanced.log` and never replaces the original log file. A card ID that resolves in the current `CardMaster` is annotated with its name and cost; card effect text is off by default to keep ordinary logs short.
-
-The `[Logging]` section of the config file:
-
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| `EnhancedEnabled` | `true` | Enable the global enhanced format and the enhanced log file. |
-| `ShowCardDetails` | `true` | Annotate card IDs as "name + cost". |
-| `ShowCardEffects` | `false` | Append card effect and evolved effect text. |
-| `DetailedOnline` | `false` | Log detailed online battle messages; whether card effects appear is still controlled by `ShowCardEffects`. |
-| `AnsiColors` | `true` | Use real console colours by log level in BepInEx's external console; `Player.log` and the enhanced log file always stay plain text. |
-| `WrapWidth` | `140` | Maximum characters per line; `0` disables wrapping. |
-| `EnhancedFile` | `BepInEx/LogOutput-enhanced.log` | Path of the enhanced log; relative paths resolve against the game root. |
-
-`DetailedOnline=true` is useful for reproducing online issues; keep it off for normal play to reduce log volume and card-text lookups.
-
 ## Custom practice
 
 Go to **Solo > Battle** and click the ninth "custom deck" icon on the opponent class selection page. The setup page lets you choose:
@@ -150,7 +128,7 @@ Card patches live in `Mods/CardMaster/`:
 - `intArrayFields` changes integer or enum array fields; card traits use `"Tribe": [trait enum values]`.
 - `stringChangeFields` replaces string fields such as abilities.
 - `stringAppendFields` appends to the original string.
-- `localizationFields` changes the card name, ability text and flavour text. A changed name is registered as a card keyword, so it can be clicked inside card text to open that card's details.
+- `localizationFields` changes the card name, ability text and flavour text.
 
 Opening the deck list hot-reloads the configuration. New cards should use an unused card ID. Artwork goes into `Mods/CardImages/` and is referenced through `ResourceCardId`.
 
@@ -159,8 +137,6 @@ Opening the deck list hot-reloads the configuration. New cards should use an unu
 - Patching an existing card applies to both its normal and animated versions while keeping each version's own identity fields.
 - `stringArrayFields` replaces `string[]` fields such as `SkillEffectPath`, `SkillSe` and `EvolEffectPath`.
 - In-game card export writes card traits to `intArrayFields.Tribe`; for example, Officer is `[2]` and Machina is `[7]`.
-
-Deck-edit search results and the card gallery are sorted by ascending cost, keeping the stock order within equal costs. The ordering follows the effective `Cost` from `intFields`, so configuring `SortIndex` by hand is normally no longer necessary.
 
 The project ships these extensions:
 
@@ -192,14 +168,10 @@ See the samples and existing card files under `Mods/CardMaster/` for concrete co
 ## Building
 
 ```powershell
-dotnet build Shadowbus.sln -c Release
+dotnet build Shadowbus.sln
 ```
 
-Releases use the `Release` configuration; the output is `bin/Release/net46/Shadowbus.dll`. Without `-c`, `dotnet build` defaults to `Debug` and produces `bin/Debug/net46/`, whose IL is unoptimized — do not ship it.
-
-Building requires the .NET SDK (which provides the `dotnet` command). The NuGet sources are declared in `RestoreAdditionalProjectSources` inside `Shadowbus.csproj`, so the first build restores them automatically.
-
-The project references the game's `Assembly-CSharp.dll`; adjust the `HintPath` entries in `Shadowbus.csproj` if the game is installed elsewhere.
+The output is `bin/Debug/net46/Shadowbus.dll`. The project references the game's `Assembly-CSharp.dll`; adjust the `HintPath` entries in `Shadowbus.csproj` if the game is installed elsewhere.
 
 ## Notes
 

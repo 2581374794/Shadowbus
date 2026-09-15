@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
-using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
@@ -150,127 +149,11 @@ namespace Shadowbus.Server.SocketIO
             global::Shadowbus.P2PProfile hostProfile,
             RoomRules roomRules)
         {
-            string address = ResolveAdvertisedAddress();
+            string address = _config.AdvertisedAddress;
+            if (string.IsNullOrWhiteSpace(address))
+                address = _config.BindAddress == "0.0.0.0" ? "127.0.0.1" : _config.BindAddress;
             RoomCode = ConnectionCode.Generate(address, Port, roomId, hostProfile, roomRules);
             return RoomCode;
-        }
-
-        private string ResolveAdvertisedAddress()
-        {
-            if (!string.IsNullOrWhiteSpace(_config.AdvertisedAddress))
-            {
-                return _config.AdvertisedAddress.Trim();
-            }
-            if (!string.IsNullOrWhiteSpace(_config.BindAddress) && !IsWildcardBindAddress(_config.BindAddress))
-            {
-                return _config.BindAddress.Trim();
-            }
-            string text = DetectAdvertisedIpv4Address();
-            if (!string.IsNullOrEmpty(text))
-            {
-                Plugin.Logger.LogInfo($"[SocketIO] AdvertisedAddress is empty; using detected local address {text}");
-                return text;
-            }
-            Plugin.Logger.LogWarning("[SocketIO] Could not detect a non-loopback local address; falling back to 127.0.0.1. Set SocketIO.AdvertisedAddress for remote/VPN play.");
-            return "127.0.0.1";
-        }
-
-        private static bool IsWildcardBindAddress(string value)
-        {
-            return string.Equals(value, "0.0.0.0", StringComparison.Ordinal) || string.Equals(value, "+", StringComparison.Ordinal) || string.Equals(value, "::", StringComparison.Ordinal);
-        }
-
-        private static string DetectAdvertisedIpv4Address()
-        {
-            IPAddress ipAddress = null;
-            int num = int.MinValue;
-            try
-            {
-                NetworkInterface[] allNetworkInterfaces = NetworkInterface.GetAllNetworkInterfaces();
-                for (int i = 0; i < allNetworkInterfaces.Length; i++)
-                {
-                    NetworkInterface networkInterface = allNetworkInterfaces[i];
-                    if (networkInterface == null || networkInterface.OperationalStatus != OperationalStatus.Up || networkInterface.NetworkInterfaceType == NetworkInterfaceType.Loopback)
-                    {
-                        continue;
-                    }
-                    int num2 = ScoreAdapter((networkInterface.Name ?? string.Empty) + " " + (networkInterface.Description ?? string.Empty));
-                    IPInterfaceProperties iPProperties;
-                    try
-                    {
-                        iPProperties = networkInterface.GetIPProperties();
-                    }
-                    catch
-                    {
-                        continue;
-                    }
-                    foreach (UnicastIPAddressInformation unicastAddress in iPProperties.UnicastAddresses)
-                    {
-                        IPAddress address = unicastAddress?.Address;
-                        if (address == null || address.AddressFamily != AddressFamily.InterNetwork || IPAddress.IsLoopback(address))
-                        {
-                            continue;
-                        }
-                        byte[] addressBytes = address.GetAddressBytes();
-                        if (addressBytes.Length == 4 && addressBytes[0] == 169 && addressBytes[1] == 254)
-                        {
-                            continue;
-                        }
-                        int num3 = num2 + ScoreAddress(addressBytes);
-                        if (ipAddress == null || num3 > num)
-                        {
-                            ipAddress = address;
-                            num = num3;
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Plugin.Logger.LogWarning($"[SocketIO] Local address detection failed: {ex.Message}");
-            }
-            return ipAddress?.ToString();
-        }
-
-        private static int ScoreAdapter(string adapterName)
-        {
-            string text = (adapterName ?? string.Empty).ToLowerInvariant();
-            int num = 0;
-            string[] array = new string[8] { "radmin", "hamachi", "zerotier", "tailscale", "wireguard", "openvpn", "vpn", "virtual" };
-            for (int i = 0; i < array.Length; i++)
-            {
-                if (text.Contains(array[i]))
-                {
-                    num += 1000;
-                    break;
-                }
-            }
-            return num;
-        }
-
-        private static int ScoreAddress(byte[] address)
-        {
-            if (address == null || address.Length != 4)
-            {
-                return 0;
-            }
-            if (address[0] == 25 || address[0] == 26 || (address[0] == 100 && address[1] >= 64 && address[1] <= 127))
-            {
-                return 300;
-            }
-            if (address[0] == 10)
-            {
-                return 120;
-            }
-            if (address[0] == 192 && address[1] == 168)
-            {
-                return 100;
-            }
-            if (address[0] == 172 && address[1] >= 16 && address[1] <= 31)
-            {
-                return 80;
-            }
-            return 20;
         }
 
         internal void OnSocketConnected(SocketIoConnection connection)
@@ -2391,7 +2274,9 @@ namespace Shadowbus.Server.SocketIO
 
         private string BuildPrefix()
         {
-            string host = string.IsNullOrWhiteSpace(_config.BindAddress) ? "0.0.0.0" : _config.BindAddress;
+            string host = string.IsNullOrWhiteSpace(_config.BindAddress) || _config.BindAddress == "0.0.0.0"
+                ? "127.0.0.1"
+                : _config.BindAddress;
             string path = string.IsNullOrWhiteSpace(_config.SocketPath) ? "/socket.io/" : _config.SocketPath;
             if (!path.StartsWith("/", StringComparison.Ordinal))
                 path = "/" + path;
