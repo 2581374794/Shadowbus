@@ -9,7 +9,7 @@ using UnityEngine;
 
 namespace Shadowbus;
 
-[BepInPlugin("08c8e386-a794-442f-a98c-aec65a183898", "GeorgesZebit.Shadowbus", "2.5.2")]
+[BepInPlugin("08c8e386-a794-442f-a98c-aec65a183898", "GeorgesZebit.Shadowbus", "2.5.1")]
 public class Plugin : BaseUnityPlugin
 {
     public static new ManualLogSource Logger;
@@ -65,7 +65,7 @@ public class Plugin : BaseUnityPlugin
             "SocketIO",
             "AdvertisedAddress",
             string.Empty,
-            "Address embedded in the room code. Empty auto-detects a reachable local adapter.");
+            "Address embedded in the room code. Empty falls back to the bind address.");
         socketIoPort = Config.Bind(
             "SocketIO",
             "Port",
