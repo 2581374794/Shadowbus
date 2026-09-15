@@ -65,7 +65,7 @@ public class Plugin : BaseUnityPlugin
             "SocketIO",
             "AdvertisedAddress",
             string.Empty,
-            "Address embedded in the room code. Empty falls back to the bind address.");
+            "Address embedded in the room code. Empty auto-detects a reachable local adapter.");
         socketIoPort = Config.Bind(
             "SocketIO",
             "Port",

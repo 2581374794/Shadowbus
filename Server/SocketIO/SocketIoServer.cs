@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
@@ -149,11 +150,146 @@ namespace Shadowbus.Server.SocketIO
             global::Shadowbus.P2PProfile hostProfile,
             RoomRules roomRules)
         {
-            string address = _config.AdvertisedAddress;
-            if (string.IsNullOrWhiteSpace(address))
-                address = _config.BindAddress == "0.0.0.0" ? "127.0.0.1" : _config.BindAddress;
+            string address = ResolveAdvertisedAddress();
             RoomCode = ConnectionCode.Generate(address, Port, roomId, hostProfile, roomRules);
             return RoomCode;
+        }
+
+        private string ResolveAdvertisedAddress()
+        {
+            if (!string.IsNullOrWhiteSpace(_config.AdvertisedAddress))
+                return _config.AdvertisedAddress.Trim();
+
+            // A specific bind address is already an address peers can use.
+            // Wildcard binds (0.0.0.0/+) must be replaced with a real local
+            // address before writing the connection code; 127.0.0.1 only
+            // works for two clients on the same machine.
+            if (!string.IsNullOrWhiteSpace(_config.BindAddress) &&
+                !IsWildcardBindAddress(_config.BindAddress))
+            {
+                return _config.BindAddress.Trim();
+            }
+
+            string detected = DetectAdvertisedIpv4Address();
+            if (!string.IsNullOrEmpty(detected))
+            {
+                Plugin.Logger.LogInfo(
+                    $"[SocketIO] AdvertisedAddress is empty; using detected local address {detected}");
+                return detected;
+            }
+
+            Plugin.Logger.LogWarning(
+                "[SocketIO] Could not detect a non-loopback local address; " +
+                "falling back to 127.0.0.1. Set SocketIO.AdvertisedAddress for remote/VPN play.");
+            return "127.0.0.1";
+        }
+
+        private static bool IsWildcardBindAddress(string value)
+        {
+            return string.Equals(value, "0.0.0.0", StringComparison.Ordinal) ||
+                string.Equals(value, "+", StringComparison.Ordinal) ||
+                string.Equals(value, "::", StringComparison.Ordinal);
+        }
+
+        private static string DetectAdvertisedIpv4Address()
+        {
+            IPAddress bestAddress = null;
+            int bestScore = int.MinValue;
+
+            try
+            {
+                foreach (NetworkInterface networkInterface in
+                    NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (networkInterface == null ||
+                        networkInterface.OperationalStatus != OperationalStatus.Up ||
+                        networkInterface.NetworkInterfaceType == NetworkInterfaceType.Loopback)
+                        continue;
+
+                    string adapterText =
+                        (networkInterface.Name ?? string.Empty) + " " +
+                        (networkInterface.Description ?? string.Empty);
+                    int adapterScore = ScoreAdapter(adapterText);
+
+                    IPInterfaceProperties properties;
+                    try
+                    {
+                        properties = networkInterface.GetIPProperties();
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    foreach (UnicastIPAddressInformation unicast in properties.UnicastAddresses)
+                    {
+                        IPAddress address = unicast?.Address;
+                        if (address == null || address.AddressFamily != AddressFamily.InterNetwork ||
+                            IPAddress.IsLoopback(address))
+                            continue;
+
+                        byte[] bytes = address.GetAddressBytes();
+                        // Ignore APIPA/link-local addresses; they are not
+                        // reachable through a normal virtual LAN connection.
+                        if (bytes.Length == 4 && bytes[0] == 169 && bytes[1] == 254)
+                            continue;
+
+                        int score = adapterScore + ScoreAddress(bytes);
+                        if (bestAddress == null || score > bestScore)
+                        {
+                            bestAddress = address;
+                            bestScore = score;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning(
+                    $"[SocketIO] Local address detection failed: {ex.Message}");
+            }
+
+            return bestAddress?.ToString();
+        }
+
+        private static int ScoreAdapter(string adapterText)
+        {
+            string value = (adapterText ?? string.Empty).ToLowerInvariant();
+            int score = 0;
+            string[] virtualKeywords =
+            {
+                "radmin", "hamachi", "zerotier", "tailscale", "wireguard",
+                "openvpn", "vpn", "virtual"
+            };
+            for (int i = 0; i < virtualKeywords.Length; i++)
+            {
+                if (value.Contains(virtualKeywords[i]))
+                {
+                    score += 1000;
+                    break;
+                }
+            }
+            return score;
+        }
+
+        private static int ScoreAddress(byte[] bytes)
+        {
+            if (bytes == null || bytes.Length != 4)
+                return 0;
+
+            // Common virtual-LAN ranges: Radmin (26/8), Hamachi (25/8),
+            // and Tailscale CGNAT (100.64/10).
+            if (bytes[0] == 25 || bytes[0] == 26 ||
+                (bytes[0] == 100 && bytes[1] >= 64 && bytes[1] <= 127))
+                return 300;
+
+            if (bytes[0] == 10)
+                return 120;
+            if (bytes[0] == 192 && bytes[1] == 168)
+                return 100;
+            if (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31)
+                return 80;
+            return 20;
         }
 
         internal void OnSocketConnected(SocketIoConnection connection)
@@ -2274,8 +2410,8 @@ namespace Shadowbus.Server.SocketIO
 
         private string BuildPrefix()
         {
-            string host = string.IsNullOrWhiteSpace(_config.BindAddress) || _config.BindAddress == "0.0.0.0"
-                ? "127.0.0.1"
+            string host = string.IsNullOrWhiteSpace(_config.BindAddress)
+                ? "0.0.0.0"
                 : _config.BindAddress;
             string path = string.IsNullOrWhiteSpace(_config.SocketPath) ? "/socket.io/" : _config.SocketPath;
             if (!path.StartsWith("/", StringComparison.Ordinal))
