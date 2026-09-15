@@ -12,7 +12,7 @@ The repository also ships an [all-in-one web configuration editor](WebEditor/REA
 - **Everything unlocked** — all cards, leader skins, sleeves and home backgrounds are available by default, and the background choice is saved locally.
 - **Unlimited decks** — class, per-card and deck-size limits are ignored, and tokens can be added to a deck.
 - **Custom practice** — choose the opponent's deck, class, leader and AI CSV files.
-- **Card mods** — modify or add cards, including custom artwork and text.
+- **Card mods** — modify or add cards, including custom artwork, voices and text.
 - **Deck list hot reload** — `CardMaster` configuration is reloaded whenever you open the deck list.
 - **Active abilities** — `when_activate` adds an activate button to your followers on the field, with a configurable PP cost.
 - **Custom abilities** — copy a card's information and abilities, or gain a target's abilities while keeping your own.
@@ -44,7 +44,8 @@ Shadowverse/
    │  └─ emote/
    ├─ UnlimitedDecks/
    ├─ CardMaster/
-   └─ CardImages/
+   ├─ CardImages/
+   └─ CardVoices/
 ```
 
 ## P2P rooms
@@ -129,6 +130,7 @@ Card patches live in `Mods/CardMaster/`:
 - `stringChangeFields` replaces string fields such as abilities.
 - `stringAppendFields` appends to the original string.
 - `localizationFields` changes the card name, ability text and flavour text.
+- `voiceFiles` replaces card voices with local audio under `Mods/CardVoices/`.
 
 Opening the deck list hot-reloads the configuration. New cards should use an unused card ID. Artwork goes into `Mods/CardImages/` and is referenced through `ResourceCardId`.
 
@@ -136,6 +138,7 @@ Opening the deck list hot-reloads the configuration. New cards should use an unu
 - Evolved artwork is named `<ResourceCardId>_evo.png`; the base image is used when it is absent.
 - Patching an existing card applies to both its normal and animated versions while keeping each version's own identity fields.
 - `stringArrayFields` replaces `string[]` fields such as `SkillEffectPath`, `SkillSe` and `EvolEffectPath`.
+- `voiceFiles` accepts WAV, MP3, OGG, AIF and AIFF paths relative to `Mods/CardVoices/`. It has separate slots for play, evolve, attack, evolved attack, destroy, evolved destroy, and normal/evolved skill voices.
 - In-game card export writes card traits to `intArrayFields.Tribe`; for example, Officer is `[2]` and Machina is `[7]`.
 
 The project ships these extensions:

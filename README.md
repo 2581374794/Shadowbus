@@ -14,7 +14,7 @@ Shadowverse 国际服的单机化与卡牌 Mod 工具，基于 BepInEx 6 开发�
 - 默认解锁全部卡牌、主战者皮肤、卡背与主界面背景，并在本地保存背景选择。
 - 无限制卡组：忽略职业、卡牌数量和卡组张数限制，也可以加入衍生卡。
 - 自定义练习：可指定对手卡组、职业、主战者和 AI CSV。
-- 卡牌 Mod：修改或新增卡牌，并支持自定义卡图与文本。
+- 卡牌 Mod：修改或新增卡牌，并支持自定义卡图、语音与文本。
 - 卡组列表热重载：进入卡组列表时重新加载 `CardMaster` 配置。
 - 主动技能：使用 `when_activate` 为场上随从添加“启动”按钮，可设置 PP 消费。
 - 自定义技能：复制卡牌信息与能力，或在保留自身能力的同时获得目标能力。
@@ -46,7 +46,8 @@ Shadowverse/
    │  └─ emote/
    ├─ UnlimitedDecks/
    ├─ CardMaster/
-   └─ CardImages/
+   ├─ CardImages/
+   └─ CardVoices/
 ```
 
 ## 联机对战
@@ -112,6 +113,7 @@ Shadowbus 会在 BepInEx 的全局日志分发边界统一格式化日志，因�
 - `stringChangeFields` 替换技能等字符串字段。
 - `stringAppendFields` 在原字符串后追加内容。
 - `localizationFields` 修改卡名、能力文本和背景文本。
+- `voiceFiles` 使用 `Mods/CardVoices/` 下的本地音频替换卡牌语音。
 
 修改配置后进入卡组列表即可热重载。新增卡牌应使用未占用的卡牌 ID；卡图放在 `Mods/CardImages/`，并通过 `ResourceCardId` 引用。
 
@@ -120,6 +122,7 @@ Shadowbus 会在 BepInEx 的全局日志分发边界统一格式化日志，因�
 - 修改已有卡牌时，补丁会同步应用到其普通版和闪卡版，同时保留两个版本各自的身份字段。
 - `stringArrayFields` 可用于替换 `SkillEffectPath`、`SkillSe`、`EvolEffectPath` 等 `string[]` 字段。
 - `foilEffectCardId` 可为闪卡指定原版卡牌的动态材质效果。可填写该来源卡的普通或闪卡 `CardId`；仅目标记录为 `IsFoil=true` 时生效，卡图仍使用目标卡自己的 `ResourceCardId` 和 PNG。来源与目标必须同为随从或同为法术/护符，且来源必须是原版已有卡。若同时制作普通版和闪卡版，为了让普通版不误用闪卡材质，两者必须使用不同的 `ResourceCardId`；共享资源 ID 时该覆盖会被禁用。只有单独制作一条闪卡记录时可以继续使用它自己的 `NormalCardId`。
+- `voiceFiles` 支持 WAV、MP3、OGG、AIF 和 AIFF，路径相对于 `Mods/CardVoices/`。可分别指定出场、进化、攻击、进化后攻击、破坏、进化后破坏及普通/进化技能语音；详细格式见 [CardMaster 指南](Mods/CardMaster/README.md#为卡牌指定本地语音)。
 - 游戏内导出卡牌数据时会把卡牌类型写入 `intArrayFields.Tribe`；例如士兵为 `[2]`、机械为 `[7]`。
 
 项目已提供以下扩展：

@@ -19,6 +19,7 @@ namespace Shadowbus
         public static readonly string CardMasterPath = Path.Combine(ModPath, "CardMaster");
         public static readonly string CardMasterReferencePath = Path.Combine(CardMasterPath, "Reference");
         public static readonly string CardImagePath = Path.Combine(ModPath, "CardImages");
+        public static readonly string CardVoicePath = Path.Combine(ModPath, "CardVoices");
         public static readonly string AIDataPath = Path.Combine(ModPath, "AIData");
         public static readonly string AIDeckPath = Path.Combine(AIDataPath, "deck");
         public static readonly string AIStylePath = Path.Combine(AIDataPath, "style");
@@ -38,6 +39,7 @@ namespace Shadowbus
             Directory.CreateDirectory(TwoPickPath);
             Directory.CreateDirectory(CardMasterPath);
             Directory.CreateDirectory(CardImagePath);
+            Directory.CreateDirectory(CardVoicePath);
             Directory.CreateDirectory(AIDataPath);
             Directory.CreateDirectory(AIDeckPath);
             Directory.CreateDirectory(AIStylePath);

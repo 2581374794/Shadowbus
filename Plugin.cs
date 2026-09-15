@@ -196,6 +196,14 @@ public class Plugin : BaseUnityPlugin
             Harmony.CreateAndPatchAll(typeof(CardMasterPatcher));
             try
             {
+                Harmony.CreateAndPatchAll(typeof(LocalCardVoicePatches));
+            }
+            catch (System.Exception exception)
+            {
+                Logger.LogError($"[CardVoice] FAILED to apply local card voice patches: {exception}");
+            }
+            try
+            {
                 // Isolated: a reference dump must never block the card master.
                 Harmony.CreateAndPatchAll(typeof(CardSkillExporter));
             }
@@ -316,6 +324,7 @@ public class Plugin : BaseUnityPlugin
 
     private void OnDestroy()
     {
+        LocalCardVoicePatches.Clear();
         LLMAITurnController.CancelAll("plugin_destroyed");
         Server.OnlineRuntime.Shutdown();
     }

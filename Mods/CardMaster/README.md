@@ -58,6 +58,44 @@ ResourceCardId   = 卡图、材质和资源文件使用的资源键
 - 这个示例把闪卡的 `ResourceCardId` 单独设为 `999991001`；如果同时制作普通版，普通版必须使用另一个资源 ID，才能保证动态效果只出现在闪卡记录上。若只制作一条独立闪卡记录，可让它的 `NormalCardId` 继续指向自身。
 - 若多个不同效果来源绑定到同一个 `ResourceCardId`，插件会禁用该资源 ID 的效果覆盖并输出警告。需要不同效果时，为各闪卡使用不同的资源 ID。
 
+### 为卡牌指定本地语音
+
+`voiceFiles` 是 Shadowbus 的 CardMaster 补丁字段。音频文件放在游戏目录的 `Mods/CardVoices/` 下，配置中填写相对于该目录的路径：
+
+```json
+{
+  "newCard": true,
+  "cardId": 999991010,
+  "templateCardId": 100011010,
+  "voiceFiles": {
+    "play": "my_card/play.mp3",
+    "evolve": "my_card/evolve.wav",
+    "attack": "my_card/attack.ogg",
+    "evolvedAttack": "my_card/attack_evolved.ogg",
+    "destroy": "my_card/destroy.mp3",
+    "evolvedDestroy": "my_card/destroy_evolved.mp3",
+    "skills": ["my_card/skill_1.mp3", ""],
+    "evolvedSkills": ["my_card/skill_1_evolved.mp3", ""]
+  }
+}
+```
+
+| 字段 | 对应语音 |
+| --- | --- |
+| `play` | 卡牌打出或随从登场语音，对应 `PlayVoice`。 |
+| `evolve` | 进化语音，对应 `EvoVoice`。 |
+| `attack` / `evolvedAttack` | 进化前/后的攻击语音，共同写入 `AtkVoice` 的两种形态。 |
+| `destroy` / `evolvedDestroy` | 进化前/后的破坏语音，共同写入 `DestroyVoice` 的两种形态。 |
+| `skills` / `evolvedSkills` | 进化前/后的技能语音列表，共同写入 `SkillVoice`。数组下标必须与卡牌的技能下标对齐；不需要语音的位置填写空字符串。 |
+
+- 支持 `.wav`、`.mp3`、`.ogg`、`.aif` 和 `.aiff`；FLAC、AAC 等格式需要先转换。
+- 可以使用子目录，但不能使用绝对路径或 `..` 离开 `CardVoices` 目录。
+- 省略某个字段时保留 `stringChangeFields` 修改后的值或模板卡原值；本地语音与这些保留的原版语音可以混用。把字段写成空字符串，或把技能列表写成空数组，则清除对应语音。
+- `voiceFiles` 在普通字符串补丁之后应用，因此同一条补丁中它优先于 `stringChangeFields.PlayVoice/EvoVoice/AtkVoice/DestroyVoice/SkillVoice`。
+- 修改已有卡牌时，本地语音与其他 CardMaster 字段一样同步应用到普通版和闪卡版。新增的普通版和闪卡版是两条独立记录时，应在各自条目中配置 `voiceFiles`。
+- 游戏会在 CardMaster 热重载后预加载音频。卡牌详情页的语音试听、战斗中的出场/进化/攻击/破坏/技能触发都会使用本地文件，并跟随游戏的语音音量和静音设置。
+- 文件不存在、格式不支持或解码失败时，对应语音保持静音，并在 BepInEx 日志中输出一次 `[CardVoice]` 警告。
+
 ## 三、官方普通版/闪卡版关系
 
 官方数据通常有两条记录。假设普通版是 `A`，闪卡版是 `B`：

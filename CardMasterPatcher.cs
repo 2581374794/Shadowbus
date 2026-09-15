@@ -30,6 +30,9 @@ namespace Shadowbus
         // Optional. A normal or foil CardId from the original game whose foil
         // material is used as this card's visual-effect template.
         public int? foilEffectCardId;
+        // Optional local audio files under Mods/CardVoices. These override only
+        // the voice slots explicitly present in the object.
+        public CardVoiceFilePatch voiceFiles;
         public Dictionary<string, bool> boolFields = [];
         public Dictionary<string, int> intFields = [];
         public Dictionary<string, int[]> intArrayFields = [];
@@ -635,6 +638,7 @@ namespace Shadowbus
             masterDict.Clear();
             CustomLocalization.Clear();
             ClearFoilEffectRegistry();
+            LocalCardVoicePatches.Clear();
             foreach (var kvp in CardParameterBackup)
             {
                 masterDict.Add(kvp.Key,kvp.Value.Clone());
@@ -865,6 +869,10 @@ namespace Shadowbus
                             }
 
                             patch.PatchTemplate(variant, preserveVariantIdentity: true);
+                            LocalCardVoicePatches.ApplyVoiceFiles(
+                                variant,
+                                patch.voiceFiles,
+                                $"{pat.Name}:{variant.CardId}");
                             if (patch.foilEffectCardId.HasValue)
                             {
                                 foilEffectRequests.Add(new FoilEffectRequest
@@ -918,6 +926,11 @@ namespace Shadowbus
                                 newCard.FoilCardId = patch.cardId;
                             }
 
+                            LocalCardVoicePatches.ApplyVoiceFiles(
+                                newCard,
+                                patch.voiceFiles,
+                                $"{pat.Name}:{newCard.CardId}");
+
                             masterDict.Add(patch.cardId, newCard);
                             if (patch.foilEffectCardId.HasValue)
                             {
@@ -933,6 +946,7 @@ namespace Shadowbus
             }
 
             BuildFoilEffectRegistry(master, foilEffectRequests);
+            LocalCardVoicePatches.BeginPreload();
 
             Data.Load.data.UserCardList.Clear();
             var all = master.GetAllCardIds();
@@ -968,6 +982,7 @@ namespace Shadowbus
             Cute.ResourcesManager __instance,
             ref List<string> rogueAssetList)
         {
+            LocalCardVoicePatches.RemoveLocalVoiceResourcePaths(rogueAssetList);
             if (rogueAssetList == null || rogueAssetList.Count == 0 ||
                 SourceBundleResourcesByTargetBundleResourceId.Count == 0)
             {
