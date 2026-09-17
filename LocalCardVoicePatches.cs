@@ -1,93 +1,105 @@
-using HarmonyLib;
+﻿using HarmonyLib;
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using System.Runtime.CompilerServices;
 using UnityEngine;
-using UnityEngine.Networking;
 using Wizard;
 using Wizard.Battle.View;
 
 namespace Shadowbus
 {
     /// <summary>
-    /// Local files for the voice slots exposed by CardParameter. Null fields
-    /// preserve the current value; an empty string or array clears that slot.
+    /// 卡牌语音文件补丁：把卡自己文件夹里的本地音频当这张卡的语音来播放。
+    /// 每个字段都是相对卡文件夹的路径，留空表示该时点不覆盖。
     /// </summary>
-    public sealed class CardVoiceFilePatch
+    public class CardVoiceFilePatch
     {
+        /// <summary>出场语音。</summary>
         public string play;
+        /// <summary>进化语音。</summary>
         public string evolve;
+        /// <summary>攻击语音。</summary>
         public string attack;
+        /// <summary>进化后攻击语音。</summary>
         public string evolvedAttack;
+        /// <summary>被破坏语音。</summary>
         public string destroy;
+        /// <summary>进化后被破坏语音。</summary>
         public string evolvedDestroy;
+        /// <summary>技能语音，按顺序对应技能槽位。</summary>
         public string[] skills;
+        /// <summary>进化后技能语音。</summary>
         public string[] evolvedSkills;
     }
 
     /// <summary>
-    /// Card voices normally use CRI ACB cue sheets. Local WAV/MP3/etc. files
-    /// are loaded as Unity AudioClips and substituted only for generated cues.
+    /// 本地卡牌语音。游戏只为卡牌自己的语音库加载 ACB，本地音频不在其中，
+    /// 所以这里自己维护一套：
+    ///   · ApplyVoiceFiles 把补丁里的文件路径登记进 AssetsByCue，
+    ///     并写出这个卡牌会去查找的 cue 名；
+    ///   · BattleCardView / SoundMgr 的补丁在播放前拦截，命中本地 cue 就自己播；
+    ///   · 音频在预加载阶段解好、按当前音量缩放好并固定住，播放时只剩一次系统调用。
+    ///
+    /// 为什么不用 Unity 的音频：这个工程的 Unity 音频在项目设置里就是关掉的
+    /// （游戏音频全部由 CRIWARE/ADX2 原生输出），日志里会看到
+    /// "Audio system is disabled" 和 "AudioClip.SetData failed"。
+    /// 所以本地音频统一走 Windows 原生输出（见 NativeWavPlayer），只有 WAV 能播。
     /// </summary>
     public static class LocalCardVoicePatches
     {
+        private sealed class LocalVoiceAsset
+        {
+            public string RelativePath;
+            public string FullPath;
+            public AudioType AudioType;
+            public bool IsLoading;
+            public bool HasFailed;
+            /// <summary>预缩放、已固定的原生音频缓冲。</summary>
+            public NativeWavClip NativeClip;
+        }
+
         private static readonly Dictionary<string, AudioType> SupportedAudioTypes =
             new Dictionary<string, AudioType>(StringComparer.OrdinalIgnoreCase)
             {
-                [".wav"] = AudioType.WAV,
-                [".mp3"] = AudioType.MPEG,
-                [".ogg"] = AudioType.OGGVORBIS,
-                [".aif"] = AudioType.AIFF,
-                [".aiff"] = AudioType.AIFF
+                { ".wav", AudioType.WAV },
+                { ".mp3", AudioType.MPEG },
+                { ".ogg", AudioType.OGGVORBIS },
+                { ".aif", AudioType.AIFF },
+                { ".aiff", AudioType.AIFF }
             };
 
         private static readonly Dictionary<string, LocalVoiceAsset> AssetsByPath =
             new Dictionary<string, LocalVoiceAsset>(StringComparer.OrdinalIgnoreCase);
         private static readonly Dictionary<string, LocalVoiceAsset> AssetsByCue =
             new Dictionary<string, LocalVoiceAsset>(StringComparer.OrdinalIgnoreCase);
+        // 被本地音频接管的 cue sheet 名。游戏的资源加载列表里没有这些 ACB，
+        // 所以要按名字把它们剔出去，否则加载会失败。
         private static readonly HashSet<string> LocalCueSheetIds =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static readonly HashSet<string> Warnings =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        private static readonly ConditionalWeakTable<BattleCardView, AudioSource>
-            BattleSources = new ConditionalWeakTable<BattleCardView, AudioSource>();
-        private static readonly List<WeakReference> KnownSources = new List<WeakReference>();
-        private static readonly Dictionary<AudioSource, PendingPlayback> PendingBySource =
-            new Dictionary<AudioSource, PendingPlayback>();
-
-        private static AudioSource GlobalSource;
+        // 音频还没准备好时被请求过的 cue，准备好之后补播。
+        private static readonly HashSet<LocalVoiceAsset> PendingAssets = [];
+        // 每次 CardMaster 重载都会 +1，用来丢弃仍在加载中的上一次结果。
         private static int RegistryGeneration;
 
-        private sealed class LocalVoiceAsset
-        {
-            public string RelativePath;
-            public string FullPath;
-            public AudioType AudioType;
-            public AudioClip Clip;
-            public bool IsLoading;
-            public bool HasFailed;
-        }
-
-        private sealed class PendingPlayback
-        {
-            public LocalVoiceAsset Asset;
-            public int Generation;
-        }
-
+        /// <summary>
+        /// CardMaster 重载时清空全部状态，并释放已加载的音频。
+        /// </summary>
         public static void Clear()
         {
             RegistryGeneration++;
-            StopAllLocalVoices();
-            PendingBySource.Clear();
+            NativeWavPlayer.Stop();
+            PendingAssets.Clear();
 
             foreach (LocalVoiceAsset asset in AssetsByPath.Values)
             {
-                if (asset.Clip != null)
+                if (asset.NativeClip != null)
                 {
-                    UnityEngine.Object.Destroy(asset.Clip);
+                    asset.NativeClip.Dispose();
+                    asset.NativeClip = null;
                 }
             }
 
@@ -97,167 +109,186 @@ namespace Shadowbus
             Warnings.Clear();
         }
 
+        /// <summary>
+        /// 把补丁声明的本地语音文件写入卡牌对应的语音字段。
+        /// sourceLabel 只用于日志，形如 "补丁文件名:卡号"。
+        /// cardFolder 是这张卡自己的文件夹（Mods/CardMaster/&lt;卡文件夹&gt;），
+        /// 所有语音路径都相对于它。
+        /// 补丁里没写某个时点时，会去卡文件夹里找约定文件名（play.wav / attack.wav ...），
+        /// 所以卡文件夹放齐了音频就可以完全不写 voiceFiles；名字不叫约定名时才需要写。
+        /// </summary>
         public static void ApplyVoiceFiles(
             CardParameter card,
-            CardVoiceFilePatch files,
-            string sourceLabel)
+            CardVoiceFilePatch patch,
+            string sourceLabel,
+            string cardFolder)
         {
-            if (card == null || files == null)
+            if (card == null)
+            {
+                return;
+            }
+
+            string play = ResolveVoiceSource(patch?.play, cardFolder, "play");
+            string evolve = ResolveVoiceSource(patch?.evolve, cardFolder, "evolve");
+            string attack = ResolveVoiceSource(patch?.attack, cardFolder, "attack");
+            string evolvedAttack = ResolveVoiceSource(patch?.evolvedAttack, cardFolder, "attack_evolved");
+            string destroy = ResolveVoiceSource(patch?.destroy, cardFolder, "destroy");
+            string evolvedDestroy = ResolveVoiceSource(patch?.evolvedDestroy, cardFolder, "destroy_evolved");
+            string[] skills = patch?.skills;
+            string[] evolvedSkills = patch?.evolvedSkills;
+
+            if (play == null && evolve == null && attack == null && evolvedAttack == null &&
+                destroy == null && evolvedDestroy == null && skills == null && evolvedSkills == null)
             {
                 return;
             }
 
             string cueSheetId = GetExistingVoiceCueSheetId(card);
-            bool usesVirtualCueSheet = string.IsNullOrEmpty(cueSheetId);
-            if (usesVirtualCueSheet)
+            // True when the card had no voice bank of its own, so the id below is one we
+            // made up ("sbv<cardId>"). Only invented ids join LocalCueSheetIds: the game
+            // has no ACB for them and would fail to load one, whereas a reused real id
+            // still has its own bank that other cues depend on.
+            bool inventedCueSheet = string.IsNullOrEmpty(cueSheetId);
+            if (inventedCueSheet)
             {
-                cueSheetId = $"sbv{card.CardId}";
+                cueSheetId = string.Format("sbv{0}", card.CardId);
             }
 
-            if (files.play != null)
+            if (play != null)
             {
                 card.PlayVoice = RegisterVoiceFile(
-                    card.CardId,
-                    cueSheetId,
-                    usesVirtualCueSheet,
-                    "play",
-                    files.play,
-                    sourceLabel);
+                    card.CardId, cueSheetId, inventedCueSheet, "play", play, sourceLabel, cardFolder);
             }
 
-            if (files.evolve != null)
+            if (evolve != null)
             {
                 card.EvoVoice = RegisterVoiceFile(
-                    card.CardId,
-                    cueSheetId,
-                    usesVirtualCueSheet,
-                    "evolve",
-                    files.evolve,
-                    sourceLabel);
+                    card.CardId, cueSheetId, inventedCueSheet, "evolve", evolve, sourceLabel, cardFolder);
             }
 
-            if (files.attack != null || files.evolvedAttack != null)
+            if (attack != null || evolvedAttack != null)
             {
                 card.AtkVoice = MergeVoicePair(
                     card.AtkVoice,
-                    files.attack != null,
+                    attack != null,
                     RegisterOptionalVoiceFile(
-                        card.CardId,
-                        cueSheetId,
-                        usesVirtualCueSheet,
-                        "attack",
-                        files.attack,
-                        sourceLabel),
-                    files.evolvedAttack != null,
+                        card.CardId, cueSheetId, inventedCueSheet, "attack", attack, sourceLabel, cardFolder),
+                    evolvedAttack != null,
                     RegisterOptionalVoiceFile(
-                        card.CardId,
-                        cueSheetId,
-                        usesVirtualCueSheet,
-                        "attack_evolved",
-                        files.evolvedAttack,
-                        sourceLabel));
+                        card.CardId, cueSheetId, inventedCueSheet, "attack_evolved", evolvedAttack, sourceLabel, cardFolder));
             }
 
-            if (files.destroy != null || files.evolvedDestroy != null)
+            if (destroy != null || evolvedDestroy != null)
             {
                 card.DestroyVoice = MergeVoicePair(
                     card.DestroyVoice,
-                    files.destroy != null,
+                    destroy != null,
                     RegisterOptionalVoiceFile(
-                        card.CardId,
-                        cueSheetId,
-                        usesVirtualCueSheet,
-                        "destroy",
-                        files.destroy,
-                        sourceLabel),
-                    files.evolvedDestroy != null,
+                        card.CardId, cueSheetId, inventedCueSheet, "destroy", destroy, sourceLabel, cardFolder),
+                    evolvedDestroy != null,
                     RegisterOptionalVoiceFile(
-                        card.CardId,
-                        cueSheetId,
-                        usesVirtualCueSheet,
-                        "destroy_evolved",
-                        files.evolvedDestroy,
-                        sourceLabel));
+                        card.CardId, cueSheetId, inventedCueSheet, "destroy_evolved", evolvedDestroy, sourceLabel, cardFolder));
             }
 
-            if (files.skills != null || files.evolvedSkills != null)
+            if (skills != null || evolvedSkills != null)
             {
                 card.SkillVoice = MergeVoicePair(
                     card.SkillVoice,
-                    files.skills != null,
+                    skills != null,
                     RegisterVoiceFileList(
-                        card.CardId,
-                        cueSheetId,
-                        usesVirtualCueSheet,
-                        "skill",
-                        files.skills,
-                        sourceLabel),
-                    files.evolvedSkills != null,
+                        card.CardId, cueSheetId, inventedCueSheet, "skill", skills, sourceLabel, cardFolder),
+                    evolvedSkills != null,
                     RegisterVoiceFileList(
-                        card.CardId,
-                        cueSheetId,
-                        usesVirtualCueSheet,
-                        "skill_evolved",
-                        files.evolvedSkills,
-                        sourceLabel));
+                        card.CardId, cueSheetId, inventedCueSheet, "skill_evolved", evolvedSkills, sourceLabel, cardFolder));
             }
         }
 
+        /// <summary>
+        /// 取某个时点要用的音频路径：补丁里声明了就用声明的；
+        /// 没声明时看卡文件夹里有没有约定文件名（如 play.wav），有就自动用上。
+        /// 都没有返回 null，表示这个时点不覆盖。
+        /// </summary>
+        private static string ResolveVoiceSource(string declared, string cardFolder, string form)
+        {
+            if (!string.IsNullOrWhiteSpace(declared))
+            {
+                return declared;
+            }
+
+            if (string.IsNullOrEmpty(cardFolder))
+            {
+                return null;
+            }
+
+            string conventional = form + ".wav";
+            return File.Exists(Path.Combine(cardFolder, conventional)) ? conventional : null;
+        }
+
+        /// <summary>
+        /// 在全部补丁应用完之后调用，把所有登记过但还没加载的音频排进加载队列。
+        /// </summary>
         public static void BeginPreload()
         {
             if (Plugin.Instance == null)
             {
-                WarnOnce("missing-plugin", "[CardVoice] Cannot preload local card voices: plugin instance is unavailable.");
+                WarnOnce(
+                    "missing-plugin",
+                    "[CardVoice] Cannot preload local card voices: plugin instance is unavailable.");
                 return;
             }
+
+            // 预热 winmm：第一次 PlaySound 要初始化音频设备，会有几十毫秒开销。
+            // 现在放一段听不见的静音先把它做掉，真正播放时就不会顿。
+            NativeWavPlayer.WarmUp();
 
             int generation = RegistryGeneration;
             foreach (LocalVoiceAsset asset in AssetsByPath.Values)
             {
-                if (!asset.IsLoading && !asset.HasFailed && asset.Clip == null)
+                if (asset.IsLoading || asset.HasFailed || asset.NativeClip != null)
                 {
-                    asset.IsLoading = true;
-                    Plugin.Instance.StartCoroutine(LoadAudioClip(asset, generation));
+                    continue;
                 }
+
+                asset.IsLoading = true;
+                Plugin.Instance.StartCoroutine(PrepareAsset(asset, generation));
             }
         }
 
-        public static void RemoveLocalVoiceResourcePaths(List<string> resourcePaths)
+        /// <summary>
+        /// 从资源加载列表中剔除本地 cue sheet：它们没有对应的 ACB 文件。
+        /// </summary>
+        public static void RemoveLocalVoiceResourcePaths(List<string> paths)
         {
-            if (resourcePaths == null || resourcePaths.Count == 0 || LocalCueSheetIds.Count == 0)
+            if (paths == null || paths.Count == 0 || LocalCueSheetIds.Count == 0)
             {
                 return;
             }
 
-            resourcePaths.RemoveAll(IsLocalVoiceCueSheet);
+            paths.RemoveAll(IsLocalVoiceCueSheet);
         }
 
         private static string RegisterOptionalVoiceFile(
             int cardId,
             string cueSheetId,
-            bool usesVirtualCueSheet,
-            string slot,
+            bool inventedCueSheet,
+            string form,
             string relativePath,
-            string sourceLabel)
+            string sourceLabel,
+            string cardFolder)
         {
-            return relativePath == null
-                ? null
-                : RegisterVoiceFile(
-                    cardId,
-                    cueSheetId,
-                    usesVirtualCueSheet,
-                    slot,
-                    relativePath,
-                    sourceLabel);
+            return relativePath != null
+                ? RegisterVoiceFile(cardId, cueSheetId, inventedCueSheet, form, relativePath, sourceLabel, cardFolder)
+                : null;
         }
 
         private static string RegisterVoiceFileList(
             int cardId,
             string cueSheetId,
-            bool usesVirtualCueSheet,
-            string slot,
+            bool inventedCueSheet,
+            string form,
             IReadOnlyList<string> relativePaths,
-            string sourceLabel)
+            string sourceLabel,
+            string cardFolder)
         {
             if (relativePaths == null || relativePaths.Count == 0)
             {
@@ -265,45 +296,48 @@ namespace Shadowbus
             }
 
             string[] cues = new string[relativePaths.Count];
-            for (int index = 0; index < relativePaths.Count; index++)
+            for (int i = 0; i < relativePaths.Count; i++)
             {
-                cues[index] = RegisterVoiceFile(
-                    cardId,
-                    cueSheetId,
-                    usesVirtualCueSheet,
-                    slot + index,
-                    relativePaths[index],
-                    sourceLabel);
+                cues[i] = RegisterVoiceFile(
+                    cardId, cueSheetId, inventedCueSheet, form + i, relativePaths[i], sourceLabel, cardFolder);
             }
+
             return string.Join(",", cues);
         }
 
+        /// <summary>
+        /// 登记一个本地音频文件，返回该卡牌字段应写入的 cue 名。失败时返回空串。
+        /// </summary>
         private static string RegisterVoiceFile(
             int cardId,
             string cueSheetId,
-            bool usesVirtualCueSheet,
-            string slot,
+            bool inventedCueSheet,
+            string form,
             string relativePath,
-            string sourceLabel)
+            string sourceLabel,
+            string cardFolder)
         {
             if (string.IsNullOrWhiteSpace(relativePath))
             {
                 return string.Empty;
             }
 
-            if (!TryResolveVoicePath(relativePath, out string fullPath, out AudioType audioType, out string error))
+            if (!TryResolveVoicePath(
+                    relativePath, cardFolder, out string fullPath, out AudioType audioType, out string error))
             {
                 WarnOnce(
-                    $"invalid:{sourceLabel}:{slot}:{relativePath}",
-                    $"[CardVoice] {sourceLabel} {slot}: {error}");
+                    string.Concat("invalid:", sourceLabel, ":", form, ":", relativePath),
+                    string.Concat("[CardVoice] ", sourceLabel, " ", form, ": ", error));
                 return string.Empty;
             }
 
             if (!File.Exists(fullPath))
             {
                 WarnOnce(
-                    $"missing:{fullPath}",
-                    $"[CardVoice] {sourceLabel} {slot}: file not found under Mods/CardVoices: {relativePath}");
+                    "missing:" + fullPath,
+                    string.Concat(
+                        "[CardVoice] ", sourceLabel, " ", form, ": file not found: ", relativePath,
+                        " (relative to the card folder)"));
                 return string.Empty;
             }
 
@@ -318,18 +352,26 @@ namespace Shadowbus
                 AssetsByPath.Add(fullPath, asset);
             }
 
-            string cue = $"{cueSheetId}_shadowbus_{cardId}_{slot}";
-            AssetsByCue[cue] = asset;
-            if (usesVirtualCueSheet)
+            string cueName = string.Format("{0}_shadowbus_{1}_{2}", cueSheetId, cardId, form);
+            // 登记的 key 必须和查询时用同一套归一化：游戏会把 cue 名拼成 "vo_<字段值>"，
+            // 查询侧用 NormalizeCueName 去掉这个前缀，这里若原样存下去就对不上了。
+            AssetsByCue[NormalizeCueName(cueName)] = asset;
+
+            if (inventedCueSheet)
             {
                 LocalCueSheetIds.Add(cueSheetId);
             }
-            return cue;
+
+            return cueName;
         }
 
+        /// <summary>
+        /// 从卡牌现有的语音字段里推断它原本使用的 cue sheet 名。
+        /// 找不到时返回 null，调用方会改用自建名。
+        /// </summary>
         private static string GetExistingVoiceCueSheetId(CardParameter card)
         {
-            string[] voiceGroups =
+            string[] sources =
             {
                 GetVoiceForm(card.PlayVoice, 0),
                 GetVoiceForm(card.EvoVoice, 0),
@@ -341,95 +383,84 @@ namespace Shadowbus
                 GetVoiceForm(card.SkillVoice, 1)
             };
 
-            foreach (string voiceGroup in voiceGroups)
+            for (int i = 0; i < sources.Length; i++)
             {
-                if (string.IsNullOrEmpty(voiceGroup))
+                string source = sources[i];
+                if (string.IsNullOrEmpty(source))
                 {
                     continue;
                 }
 
-                foreach (string entry in voiceGroup.Split(','))
+                string[] entries = source.Split(',');
+                for (int j = 0; j < entries.Length; j++)
                 {
-                    string voice = entry;
-                    int waitTimeIndex = voice.IndexOf('{');
-                    if (waitTimeIndex >= 0)
+                    string entry = entries[j];
+                    int braceIndex = entry.IndexOf('{');
+                    if (braceIndex >= 0)
                     {
-                        voice = voice.Substring(0, waitTimeIndex);
+                        // 形如 "vo_123456_1{skill}" 的写法，取花括号之前的部分。
+                        entry = entry.Substring(0, braceIndex).Trim();
                     }
-                    voice = voice.Trim();
-                    if (string.IsNullOrEmpty(voice) ||
-                        string.Equals(voice, "none", StringComparison.OrdinalIgnoreCase))
+
+                    if (string.IsNullOrEmpty(entry) ||
+                        string.Equals(entry, "none", StringComparison.OrdinalIgnoreCase))
                     {
                         continue;
                     }
 
-                    int separatorIndex = voice.IndexOf('_');
-                    return separatorIndex > 0
-                        ? voice.Substring(0, separatorIndex)
-                        : voice;
+                    int underscore = entry.IndexOf('_');
+                    return underscore > 0 ? entry.Substring(0, underscore) : entry;
                 }
             }
 
             return null;
         }
 
-        private static string GetVoiceForm(string value, int formIndex)
+        /// <summary>
+        /// 取语音字段的普通/进化两种形态。"a//b" 里 0 是普通，1 是进化。
+        /// </summary>
+        private static string GetVoiceForm(string voice, int index)
         {
-            if (string.IsNullOrEmpty(value))
+            if (string.IsNullOrEmpty(voice))
             {
                 return string.Empty;
             }
 
-            string[] forms = value.Split(new[] { "//" }, StringSplitOptions.None);
-            return formIndex < forms.Length ? forms[formIndex] : string.Empty;
+            string[] forms = voice.Split(new[] { "//" }, StringSplitOptions.None);
+            return index >= forms.Length ? string.Empty : forms[index];
         }
 
+        /// <summary>
+        /// 把相对路径解析成卡文件夹下的绝对路径并校验音频格式。
+        /// 路径不允许是绝对路径，也不允许跳出卡文件夹。
+        /// </summary>
         private static bool TryResolveVoicePath(
             string relativePath,
+            string cardFolder,
             out string fullPath,
             out AudioType audioType,
             out string error)
         {
             fullPath = null;
-            audioType = AudioType.UNKNOWN;
+            audioType = 0;
             error = null;
 
-            try
+            string extension = Path.GetExtension(relativePath);
+            if (!SupportedAudioTypes.TryGetValue(extension, out audioType))
             {
-                if (Path.IsPathRooted(relativePath))
-                {
-                    error = "the path must be relative to Mods/CardVoices";
-                    return false;
-                }
-
-                string extension = Path.GetExtension(relativePath);
-                if (!SupportedAudioTypes.TryGetValue(extension, out audioType))
-                {
-                    error = $"unsupported audio extension '{extension}'; use WAV, MP3, OGG, AIF or AIFF";
-                    return false;
-                }
-
-                string root = Path.GetFullPath(PathHelper.CardVoicePath);
-                string rootPrefix = root.TrimEnd(
-                    Path.DirectorySeparatorChar,
-                    Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-                fullPath = Path.GetFullPath(Path.Combine(root, relativePath));
-                if (!fullPath.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
-                {
-                    error = "the path leaves Mods/CardVoices";
-                    fullPath = null;
-                    return false;
-                }
-            }
-            catch (Exception exception)
-            {
-                error = $"invalid path ({exception.Message})";
+                error = string.Concat(
+                    "unsupported audio extension '", extension,
+                    "'; use WAV, MP3, OGG, AIF or AIFF");
                 return false;
             }
 
-            return true;
+            return ModCardAssets.TryResolveRelativePath(
+                relativePath, cardFolder, out fullPath, out error);
         }
 
+        /// <summary>
+        /// 合并普通/进化两个形态的替换结果，保留未替换的那一侧。
+        /// </summary>
         private static string MergeVoicePair(
             string current,
             bool replaceNormal,
@@ -437,153 +468,127 @@ namespace Shadowbus
             bool replaceEvolved,
             string evolvedReplacement)
         {
-            string[] currentParts = (current ?? string.Empty).Split(
-                new[] { "//" },
-                StringSplitOptions.None);
-            string normal = replaceNormal ? normalReplacement ?? string.Empty : currentParts[0];
+            string[] forms = (current ?? string.Empty).Split(new[] { "//" }, StringSplitOptions.None);
+
+            string normal = replaceNormal ? normalReplacement ?? string.Empty : forms[0];
             string evolved = replaceEvolved
                 ? evolvedReplacement ?? string.Empty
-                : currentParts.Length > 1 ? currentParts[1] : string.Empty;
-            return replaceEvolved || currentParts.Length > 1
-                ? normal + "//" + evolved
-                : normal;
+                : (forms.Length > 1 ? forms[1] : string.Empty);
+
+            if (!replaceEvolved && forms.Length <= 1)
+            {
+                return normal;
+            }
+
+            return normal + "//" + evolved;
         }
 
-        private static IEnumerator LoadAudioClip(LocalVoiceAsset asset, int generation)
+        /// <summary>
+        /// 预加载阶段把本地音频准备好：读文件、解 WAV、按当前音量缩放、固定缓冲。
+        /// 播放那一帧就只剩一次 PlaySound，不会卡住出牌动画。
+        /// generation 与当前值不一致时说明期间发生过重载，直接丢弃结果。
+        /// </summary>
+        private static IEnumerator PrepareAsset(LocalVoiceAsset asset, int generation)
         {
-            UnityWebRequest request;
-            try
-            {
-                request = UnityWebRequestMultimedia.GetAudioClip(
-                    new Uri(asset.FullPath).AbsoluteUri,
-                    asset.AudioType);
-            }
-            catch (Exception exception)
-            {
-                asset.IsLoading = false;
-                asset.HasFailed = true;
-                WarnOnce(
-                    $"load:{asset.FullPath}",
-                    $"[CardVoice] Failed to open '{asset.RelativePath}': {exception.Message}");
-                RemovePending(asset);
-                yield break;
-            }
-
-            DownloadHandlerAudioClip handler = request.downloadHandler as DownloadHandlerAudioClip;
-            if (handler != null)
-            {
-                handler.streamAudio = false;
-            }
-
-            UnityWebRequestAsyncOperation operation;
-            try
-            {
-                operation = request.SendWebRequest();
-            }
-            catch (Exception exception)
-            {
-                asset.IsLoading = false;
-                asset.HasFailed = true;
-                WarnOnce(
-                    $"load:{asset.FullPath}",
-                    $"[CardVoice] Failed to load '{asset.RelativePath}': {exception.Message}");
-                RemovePending(asset);
-                request.Dispose();
-                yield break;
-            }
-
-            yield return operation;
+            // 让出一帧，避免在一帧里把整批音频都解完。
+            yield return null;
 
             if (generation != RegistryGeneration)
             {
-                request.Dispose();
                 yield break;
             }
 
             asset.IsLoading = false;
-            if (request.result != UnityWebRequest.Result.Success)
+
+            if (!NativeWavPlayer.IsSupported)
             {
                 asset.HasFailed = true;
                 WarnOnce(
-                    $"load:{asset.FullPath}",
-                    $"[CardVoice] Failed to load '{asset.RelativePath}': {request.error}");
-                RemovePending(asset);
-                request.Dispose();
+                    "platform:" + asset.FullPath,
+                    "[CardVoice] Local card voices need Windows native playback; " +
+                    "this platform is not supported, so '" + asset.RelativePath + "' stays silent.");
+                PendingAssets.Remove(asset);
                 yield break;
             }
 
-            try
+            if (asset.AudioType != AudioType.WAV)
             {
-                asset.Clip = DownloadHandlerAudioClip.GetContent(request);
-                if (asset.Clip == null)
-                {
-                    asset.HasFailed = true;
-                    WarnOnce(
-                        $"decode:{asset.FullPath}",
-                        $"[CardVoice] Failed to decode '{asset.RelativePath}'.");
-                    RemovePending(asset);
-                }
-                else
-                {
-                    asset.Clip.name = "Shadowbus.CardVoice." + Path.GetFileName(asset.RelativePath);
-                    PlayPending(asset, generation);
-                }
+                // 压缩格式没法自己解，而 Unity 的音频在本工程里是关掉的，试也没用。
+                asset.HasFailed = true;
+                WarnOnce(
+                    "format:" + asset.RelativePath,
+                    string.Concat(
+                        "[CardVoice] '", asset.RelativePath, "' is not a WAV. This game has Unity ",
+                        "audio disabled, so only WAV can be played — re-encode it as 16-bit PCM WAV."));
+                PendingAssets.Remove(asset);
+                yield break;
             }
-            catch (Exception exception)
+
+            string readError;
+            byte[] raw = WavDecoder.ReadAllBytes(asset.FullPath, out readError);
+            if (raw == null)
             {
                 asset.HasFailed = true;
                 WarnOnce(
-                    $"decode:{asset.FullPath}",
-                    $"[CardVoice] Failed to decode '{asset.RelativePath}': {exception.Message}");
-                RemovePending(asset);
+                    "read:" + asset.FullPath,
+                    string.Concat(
+                        "[CardVoice] Failed to read '", asset.RelativePath, "': ", readError));
+                PendingAssets.Remove(asset);
+                yield break;
             }
-            request.Dispose();
+
+            string prepareError;
+            NativeWavClip nativeClip = NativeWavPlayer.Prepare(raw, GetVoiceVolumeSafe(), out prepareError);
+            if (nativeClip == null)
+            {
+                asset.HasFailed = true;
+                WarnOnce(
+                    "decode:" + asset.FullPath,
+                    string.Concat(
+                        "[CardVoice] Failed to decode '", asset.RelativePath, "': ", prepareError));
+                PendingAssets.Remove(asset);
+                yield break;
+            }
+
+            asset.NativeClip = nativeClip;
+            asset.HasFailed = false;
+
+            if (PendingAssets.Remove(asset))
+            {
+                // 这期间已经有人请求过它了，补播。
+                PlayNativeVoice(asset);
+            }
         }
 
-        private static bool TryPlayLocalVoice(string cueName, AudioSource source)
+
+        /// <summary>
+        /// 播放本地语音。返回 false 表示不是本地 cue，调用方应继续走原逻辑；
+        /// 返回 true 表示已经接管（包括音频还在准备、已经失败等情况）。
+        /// </summary>
+        private static bool TryPlayLocalVoice(string cueName)
         {
-            string cue = NormalizeCueName(cueName);
-            if (!AssetsByCue.TryGetValue(cue, out LocalVoiceAsset asset))
+            string key = NormalizeCueName(cueName);
+            if (!AssetsByCue.TryGetValue(key, out LocalVoiceAsset asset))
             {
                 return false;
             }
 
-            if (source == null)
+            if (asset.NativeClip != null)
             {
-                WarnOnce("missing-source", "[CardVoice] Cannot play a local card voice: AudioSource is unavailable.");
-                return true;
+                PlayNativeVoice(asset);
             }
+            else if (!asset.HasFailed && !asset.IsLoading)
+            {
+                // 还没准备好：登记下来，PrepareAsset 完成时会补播。
+                PendingAssets.Add(asset);
 
-            if (IsRejectingNewSound())
-            {
-                return true;
-            }
-
-            source.Stop();
-            PendingBySource.Remove(source);
-            if (asset.Clip != null)
-            {
-                PlaySource(source, asset.Clip);
-            }
-            else if (!asset.HasFailed)
-            {
-                PendingBySource[source] = new PendingPlayback
-                {
-                    Asset = asset,
-                    Generation = RegistryGeneration
-                };
-                if (!asset.IsLoading && Plugin.Instance != null)
+                if (Plugin.Instance != null)
                 {
                     asset.IsLoading = true;
-                    Plugin.Instance.StartCoroutine(LoadAudioClip(asset, RegistryGeneration));
-                }
-                else if (!asset.IsLoading)
-                {
-                    asset.HasFailed = true;
-                    PendingBySource.Remove(source);
-                    WarnOnce("missing-plugin", "[CardVoice] Cannot load local card voices: plugin instance is unavailable.");
+                    Plugin.Instance.StartCoroutine(PrepareAsset(asset, RegistryGeneration));
                 }
             }
+
             return true;
         }
 
@@ -592,6 +597,59 @@ namespace Shadowbus
             return AssetsByCue.ContainsKey(NormalizeCueName(cueName));
         }
 
+        /// <summary>
+        /// 走 winmm 原生播放（Unity 音频不可用时的回退）。
+        /// 音量没有通道可调，所以在样本上预先缩放；静音时不发声。
+        /// </summary>
+        private static void PlayNativeVoice(LocalVoiceAsset asset)
+        {
+            if (IsRejectingNewSound())
+            {
+                return;
+            }
+
+            float volume = GetVoiceVolumeSafe();
+            bool muted = IsVoiceMutedSafe();
+            NativeWavPlayer.Play(asset.NativeClip, volume, muted);
+        }
+
+        private static float GetVoiceVolumeSafe()
+        {
+            try
+            {
+                SoundMgr soundMgr = GameMgr.GetIns()?.GetSoundMgr();
+                if (soundMgr != null)
+                {
+                    return soundMgr.GetVoiceVolume();
+                }
+            }
+            catch (Exception)
+            {
+            }
+
+            return 1f;
+        }
+
+        private static bool IsVoiceMutedSafe()
+        {
+            try
+            {
+                SoundMgr soundMgr = GameMgr.GetIns()?.GetSoundMgr();
+                if (soundMgr != null)
+                {
+                    return soundMgr.IsVoiceMuted();
+                }
+            }
+            catch (Exception)
+            {
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// 游戏查找 cue 时会带 "vo_" 前缀，登记时没有，这里统一去掉。
+        /// </summary>
         private static string NormalizeCueName(string cueName)
         {
             if (string.IsNullOrEmpty(cueName))
@@ -604,6 +662,10 @@ namespace Shadowbus
                 : cueName;
         }
 
+        /// <summary>
+        /// 判断一个资源路径是不是被本地语音接管的 cue sheet。
+        /// 传入的可能是 "v/vo_xxx.acb" 这类路径，所以先取文件名再去掉扩展名。
+        /// </summary>
         private static bool IsLocalVoiceCueSheet(string path)
         {
             if (string.IsNullOrEmpty(path))
@@ -612,89 +674,23 @@ namespace Shadowbus
             }
 
             string name = path.Replace('\\', '/');
-            int slashIndex = name.LastIndexOf('/');
-            if (slashIndex >= 0)
+            int separator = name.LastIndexOf('/');
+            if (separator >= 0)
             {
-                name = name.Substring(slashIndex + 1);
+                name = name.Substring(separator + 1);
             }
+
             if (name.EndsWith(".acb", StringComparison.OrdinalIgnoreCase))
             {
                 name = name.Substring(0, name.Length - 4);
             }
+
             if (name.StartsWith("vo_", StringComparison.OrdinalIgnoreCase))
             {
                 name = name.Substring(3);
             }
+
             return LocalCueSheetIds.Contains(name);
-        }
-
-        private static AudioSource GetBattleSource(BattleCardView view)
-        {
-            if (view == null || view.GameObject == null)
-            {
-                return null;
-            }
-
-            return BattleSources.GetValue(view, key => CreateSource(key.GameObject));
-        }
-
-        private static AudioSource GetGlobalSource()
-        {
-            if (GlobalSource == null && Plugin.Instance != null)
-            {
-                GlobalSource = CreateSource(Plugin.Instance.gameObject);
-            }
-            return GlobalSource;
-        }
-
-        private static AudioSource CreateSource(GameObject owner)
-        {
-            if (owner == null)
-            {
-                return null;
-            }
-
-            AudioSource source = owner.AddComponent<AudioSource>();
-            source.playOnAwake = false;
-            source.loop = false;
-            source.spatialBlend = 0f;
-            ConfigureSource(source);
-            KnownSources.Add(new WeakReference(source));
-            return source;
-        }
-
-        private static void PlaySource(AudioSource source, AudioClip clip)
-        {
-            if (source == null || clip == null || IsRejectingNewSound())
-            {
-                return;
-            }
-
-            ConfigureSource(source);
-            source.clip = clip;
-            source.Play();
-        }
-
-        private static void ConfigureSource(AudioSource source)
-        {
-            if (source == null)
-            {
-                return;
-            }
-
-            try
-            {
-                SoundMgr soundMgr = GameMgr.GetIns()?.GetSoundMgr();
-                if (soundMgr != null)
-                {
-                    source.volume = soundMgr.GetVoiceVolume();
-                    source.mute = soundMgr.IsVoiceMuted();
-                }
-            }
-            catch (Exception)
-            {
-                source.volume = 1f;
-            }
         }
 
         private static bool IsRejectingNewSound()
@@ -702,95 +698,16 @@ namespace Shadowbus
             try
             {
                 SoundMgr soundMgr = GameMgr.GetIns()?.GetSoundMgr();
-                return soundMgr != null && soundMgr.IsRejectNewSound();
+                if (soundMgr != null)
+                {
+                    return soundMgr.IsRejectNewSound();
+                }
             }
             catch (Exception)
             {
-                return false;
             }
-        }
 
-        private static void PlayPending(LocalVoiceAsset asset, int generation)
-        {
-            foreach (KeyValuePair<AudioSource, PendingPlayback> pair in
-                PendingBySource.ToList())
-            {
-                if (pair.Key == null || pair.Value.Generation != generation)
-                {
-                    PendingBySource.Remove(pair.Key);
-                    continue;
-                }
-                if (ReferenceEquals(pair.Value.Asset, asset))
-                {
-                    PendingBySource.Remove(pair.Key);
-                    PlaySource(pair.Key, asset.Clip);
-                }
-            }
-        }
-
-        private static void RemovePending(LocalVoiceAsset asset)
-        {
-            foreach (KeyValuePair<AudioSource, PendingPlayback> pair in
-                PendingBySource.Where(pair => ReferenceEquals(pair.Value.Asset, asset)).ToList())
-            {
-                PendingBySource.Remove(pair.Key);
-            }
-        }
-
-        private static void StopAllLocalVoices()
-        {
-            for (int index = KnownSources.Count - 1; index >= 0; index--)
-            {
-                AudioSource source = KnownSources[index].Target as AudioSource;
-                if (source == null)
-                {
-                    KnownSources.RemoveAt(index);
-                    continue;
-                }
-                source.Stop();
-            }
-        }
-
-        private static bool IsAnyLocalVoicePlaying()
-        {
-            for (int index = KnownSources.Count - 1; index >= 0; index--)
-            {
-                AudioSource source = KnownSources[index].Target as AudioSource;
-                if (source == null)
-                {
-                    KnownSources.RemoveAt(index);
-                    continue;
-                }
-                if (source.isPlaying)
-                {
-                    return true;
-                }
-            }
             return false;
-        }
-
-        private static void UpdateLocalVoiceVolume(float volume)
-        {
-            ForEachSource(source => source.volume = volume);
-        }
-
-        private static void UpdateLocalVoiceMute(bool muted)
-        {
-            ForEachSource(source => source.mute = muted);
-        }
-
-        private static void ForEachSource(Action<AudioSource> action)
-        {
-            for (int index = KnownSources.Count - 1; index >= 0; index--)
-            {
-                AudioSource source = KnownSources[index].Target as AudioSource;
-                if (source == null)
-                {
-                    KnownSources.RemoveAt(index);
-                    continue;
-                }
-                action(source);
-            }
         }
 
         private static void WarnOnce(string key, string message)
@@ -801,76 +718,56 @@ namespace Shadowbus
             }
         }
 
+        // 注意：下面这些 Prefix/Postfix 的「实参」形参名由 Harmony 按**参数名**与游戏方法
+        // 的元数据匹配，名字对不上会抛 Parameter "xxx" not found 并导致整条 patch 挂不上。
+        // 因此它们必须逐字等于 Assembly-CSharp 里的形参名（哪怕拼写不规范），不要为了
+        // 好看而改写。改动用 _reverse/ParamDump.exe 核对：
+        //   ParamDump.exe <Assembly-CSharp.dll> <方法名清单>
         [HarmonyPatch(typeof(BattleCardView), nameof(BattleCardView.PlayVoice))]
         [HarmonyPrefix]
-        public static bool BattleCardView_PlayVoice_Prefix(
-            BattleCardView __instance,
-            string voiceName)
+        public static bool BattleCardView_PlayVoice_Prefix(string voiceName)
         {
-            if (!HasLocalVoiceCue(voiceName))
-            {
-                return true;
-            }
-            return !TryPlayLocalVoice(voiceName, GetBattleSource(__instance));
+            return !TryPlayLocalVoice(voiceName);
         }
 
         [HarmonyPatch(typeof(BattleCardView), nameof(BattleCardView.StopVoice))]
         [HarmonyPostfix]
-        public static void BattleCardView_StopVoice_Postfix(BattleCardView __instance)
+        public static void BattleCardView_StopVoice_Postfix()
         {
-            if (__instance == null || !BattleSources.TryGetValue(__instance, out AudioSource source))
-            {
-                return;
-            }
-            if (source != null)
-            {
-                source.Stop();
-                PendingBySource.Remove(source);
-            }
+            NativeWavPlayer.Stop();
         }
 
         [HarmonyPatch(typeof(SoundMgr), nameof(SoundMgr.PlayVoiceScenario))]
         [HarmonyPrefix]
-        public static bool SoundMgr_PlayVoiceScenario_Prefix(
-            SoundMgr __instance,
-            string cuename,
-            float fadeout)
+        public static bool SoundMgr_PlayVoiceScenario_Prefix(SoundMgr __instance, string cuename, float fadeout)
         {
             if (!HasLocalVoiceCue(cuename))
             {
-                if (GlobalSource != null)
-                {
-                    GlobalSource.Stop();
-                    PendingBySource.Remove(GlobalSource);
-                }
+                // 剧情语音要开口了，先掐掉正在播的卡牌语音，免得叠在一起。
+                NativeWavPlayer.Stop();
                 return true;
             }
 
-            // Voice.PlayScenario normally stops the previous CRI voice before
-            // advancing to another source. Preserve that behavior when the
-            // replacement itself bypasses Voice.PlayScenario.
             __instance.StopVoiceAll(fadeout);
-            return !TryPlayLocalVoice(cuename, GetGlobalSource());
+            return !TryPlayLocalVoice(cuename);
         }
 
-        [HarmonyPatch(typeof(SoundMgr), nameof(SoundMgr.LoadVoice), new Type[] { typeof(string), typeof(Action) })]
+        [HarmonyPatch(typeof(SoundMgr), nameof(SoundMgr.LoadVoice), new[] { typeof(string), typeof(Action) })]
         [HarmonyPrefix]
-        public static bool SoundMgr_LoadVoice_Prefix(
-            string cueSheet,
-            Action onLoaded,
-            ref string __result)
+        public static bool SoundMgr_LoadVoice_Prefix(string cueSheet, Action onLoaded, ref string __result)
         {
             if (!IsLocalVoiceCueSheet(cueSheet))
             {
                 return true;
             }
 
+            // 本地 cue sheet 没有对应的 ACB，直接当成已加载。
             __result = cueSheet;
             onLoaded?.Invoke();
             return false;
         }
 
-        [HarmonyPatch(typeof(SoundMgr), nameof(SoundMgr.UnloadVoice), new Type[] { typeof(string) })]
+        [HarmonyPatch(typeof(SoundMgr), nameof(SoundMgr.UnloadVoice), new[] { typeof(string) })]
         [HarmonyPrefix]
         public static bool SoundMgr_UnloadVoice_Prefix(string cueSheet)
         {
@@ -881,41 +778,21 @@ namespace Shadowbus
         [HarmonyPostfix]
         public static void SoundMgr_StopVoice_Postfix()
         {
-            AudioSource source = GlobalSource;
-            if (source != null)
-            {
-                source.Stop();
-                PendingBySource.Remove(source);
-            }
+            NativeWavPlayer.Stop();
         }
 
         [HarmonyPatch(typeof(SoundMgr), nameof(SoundMgr.StopVoiceAll))]
         [HarmonyPostfix]
         public static void SoundMgr_StopVoiceAll_Postfix()
         {
-            StopAllLocalVoices();
-            PendingBySource.Clear();
+            NativeWavPlayer.Stop();
         }
 
         [HarmonyPatch(typeof(SoundMgr), nameof(SoundMgr.IsVoicePlaying))]
         [HarmonyPostfix]
         public static void SoundMgr_IsVoicePlaying_Postfix(ref bool __result)
         {
-            __result = __result || IsAnyLocalVoicePlaying();
-        }
-
-        [HarmonyPatch(typeof(SoundMgr), nameof(SoundMgr.SetVoiceVolume))]
-        [HarmonyPostfix]
-        public static void SoundMgr_SetVoiceVolume_Postfix(float prm)
-        {
-            UpdateLocalVoiceVolume(prm);
-        }
-
-        [HarmonyPatch(typeof(SoundMgr), nameof(SoundMgr.VoiceMute))]
-        [HarmonyPostfix]
-        public static void SoundMgr_VoiceMute_Postfix(bool isMute)
-        {
-            UpdateLocalVoiceMute(isMute);
+            __result = __result || NativeWavPlayer.IsPlaying;
         }
     }
 }

@@ -581,6 +581,15 @@ namespace Shadowbus
                 yield return directory + "vo_" + fileWithExtension;
             }
 
+            // 卡牌语音的库名是 cue 名去掉末尾的 "_<数字>"：cue "vo_122031020_1" 实际存在
+            // v/vo_122031020.acb 里，而这个库名本身没有 "_1" 那份文件。剧情语音（例如
+            // "vo_01001_000_001"）有同名文件，上面那条已经命中，这里多试的一个不存在也无害。
+            string bankStem = TryGetVoiceBankStem(fileName);
+            if (bankStem != null)
+            {
+                yield return directory + bankStem + extension;
+            }
+
             string alternateDirectory = normalizedPath.StartsWith("v/t/", StringComparison.OrdinalIgnoreCase)
                 ? "v/"
                 : "v/t/";
@@ -589,6 +598,34 @@ namespace Shadowbus
             {
                 yield return alternateDirectory + "vo_" + fileWithExtension;
             }
+
+            if (bankStem != null)
+            {
+                yield return alternateDirectory + bankStem + extension;
+            }
+        }
+
+        /// <summary>
+        /// 把 "vo_122031020_1" 这样的 cue 名还原成库名 "vo_122031020"。
+        /// 末尾不是 "_数字" 时返回 null。
+        /// </summary>
+        private static string TryGetVoiceBankStem(string fileName)
+        {
+            int lastUnderscore = fileName.LastIndexOf('_');
+            if (lastUnderscore <= 0 || lastUnderscore >= fileName.Length - 1)
+            {
+                return null;
+            }
+
+            for (int i = lastUnderscore + 1; i < fileName.Length; i++)
+            {
+                if (fileName[i] < '0' || fileName[i] > '9')
+                {
+                    return null;
+                }
+            }
+
+            return fileName.Substring(0, lastUnderscore);
         }
 
         [HarmonyPatch(
