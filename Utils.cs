@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
 
@@ -47,17 +47,9 @@ namespace Shadowbus
 
         private static string ResolveExternalTexturePath(int id, bool isEvolution)
         {
-            string normalPath = Path.Combine(PathHelper.CardImagePath, $"{id}.png");
-            if (isEvolution)
-            {
-                string evolutionPath = Path.Combine(PathHelper.CardImagePath, $"{id}_evo.png");
-                if (File.Exists(evolutionPath))
-                {
-                    return evolutionPath;
-                }
-            }
-
-            return File.Exists(normalPath) ? normalPath : null;
+            // 先在卡自己的文件夹（Mods/CardMaster/<卡文件夹>）里找 card.png / card_evo.png，
+            // 再回退到旧的 Mods/CardImages/<资源卡号>.png。
+            return ModCardAssets.ResolveImagePath(id, isEvolution);
         }
 
         public static void PrintAllComponents(MonoBehaviour mb)

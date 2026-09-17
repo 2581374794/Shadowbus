@@ -1,4 +1,4 @@
-﻿using BepInEx;
+using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using BepInEx.Unity.Mono;
@@ -9,7 +9,7 @@ using UnityEngine;
 
 namespace Shadowbus;
 
-[BepInPlugin("08c8e386-a794-442f-a98c-aec65a183898", "GeorgesZebit.Shadowbus", "2.5.3")]
+[BepInPlugin("08c8e386-a794-442f-a98c-aec65a183898", "GeorgesZebit.Shadowbus", "2.5.5")]
 public class Plugin : BaseUnityPlugin
 {
     public static new ManualLogSource Logger;
@@ -276,6 +276,9 @@ public class Plugin : BaseUnityPlugin
             Harmony.CreateAndPatchAll(typeof(MirrorResidentEffectPatcher));
             Harmony.CreateAndPatchAll(typeof(StoryOfflinePatches));
             Harmony.CreateAndPatchAll(typeof(LanguageVoicePatches));
+            Harmony.CreateAndPatchAll(typeof(LocalCardVoicePatches));
+            Harmony.CreateAndPatchAll(typeof(BattleVfxGuards));
+            Harmony.CreateAndPatchAll(typeof(HomeMenuPatches));
             Harmony.CreateAndPatchAll(typeof(DeckFormatUI));
             Harmony.CreateAndPatchAll(typeof(RoomRuleSelectDialogCreatePatch));
             Harmony.CreateAndPatchAll(typeof(RoomRuleSelectDialogInitializePatch));
@@ -316,6 +319,7 @@ public class Plugin : BaseUnityPlugin
 
     private void OnDestroy()
     {
+        LocalCardVoicePatches.Clear();
         LLMAITurnController.CancelAll("plugin_destroyed");
         Server.OnlineRuntime.Shutdown();
     }

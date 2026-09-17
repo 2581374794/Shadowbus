@@ -36,7 +36,7 @@ namespace Shadowbus
                 }
 
                 int patchFileCount = Directory.Exists(Plugin.CardMasterPath)
-                    ? Directory.GetFiles(Plugin.CardMasterPath, "*.json", SearchOption.TopDirectoryOnly).Length
+                    ? Directory.GetFiles(Plugin.CardMasterPath, "*.json", SearchOption.AllDirectories).Length
                     : 0;
                 int cardCountBefore = master.GetAllCardIds().Count;
 
