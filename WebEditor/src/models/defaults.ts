@@ -76,6 +76,9 @@ export const newCardPatch = (): CardMasterPatch => ({
   // Optional: an empty object preserves the template's attack presentation.
   // Values are populated when a card is exported from the game or explicitly edited.
   attackEffectFields: {},
+  // Optional and left out until used: extraVoiceIds, imageFiles and voiceFiles point at
+  // files inside the card's own folder (Mods/CardMaster/<folder>/), so a patch that
+  // declares none of them keeps them out of the saved json.
 });
 
 export const newFormat = (id = "new_format"): CustomFormat => ({

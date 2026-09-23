@@ -27,6 +27,7 @@ import { writeFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fail as failWith, field, integer as parseInteger, kilobytes, readCsv } from "./lib/csv.mjs";
+import { gameRootNotFoundMessage, resolveGameRoot } from "./lib/game-root.mjs";
 
 const SCRIPT = "build-card-reference";
 const fail = (message) => failWith(SCRIPT, message);
@@ -35,9 +36,24 @@ const integer = (text, label, lineNumber) => parseInteger(SCRIPT, text, label, l
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const webEditorRoot = resolve(scriptDirectory, "..");
 const outputPath = resolve(webEditorRoot, "src/data/cardReference.generated.ts");
-const gameRoot = resolve(webEditorRoot, "../../../../SteamLibrary/steamapps/common/Shadowverse");
-const defaultMasterPath = resolve(gameRoot, "CardMaster_Default_backup.csv");
-const defaultNamesPath = resolve(gameRoot, "Mods/CardMaster/Reference/card_names.csv");
+
+/** 只在没给 CSV 路径时才去找游戏目录，找不到就报清楚。 */
+function defaultGameRoot() {
+  const { root, tried } = resolveGameRoot();
+  if (!root) {
+    fail(gameRootNotFoundMessage(tried));
+  }
+
+  return root;
+}
+
+function defaultMasterPath() {
+  return resolve(defaultGameRoot(), "CardMaster_Default_backup.csv");
+}
+
+function defaultNamesPath() {
+  return resolve(defaultGameRoot(), "Mods/CardMaster/Reference/card_names.csv");
+}
 
 /** Kept in sync with src/data/cards.ts; the master dump predates user patches so it should hold none. */
 const CUSTOM_CARD_ID_MIN = 999990000;
@@ -110,8 +126,8 @@ const EVOLUTION_TWINS = {
   effectTime: "evoEffectTime",
 };
 
-const masterPath = process.argv[2] ? resolve(process.argv[2]) : defaultMasterPath;
-const namesPath = process.argv[3] ? resolve(process.argv[3]) : defaultNamesPath;
+const masterPath = process.argv[2] ? resolve(process.argv[2]) : defaultMasterPath();
+const namesPath = process.argv[3] ? resolve(process.argv[3]) : defaultNamesPath();
 
 const master = readCsv(SCRIPT, masterPath, ["card_id", "is_foil", "rarity", "TribeNameId", ...Object.values(MASTER_SOURCE)]);
 const names = readCsv(SCRIPT, namesPath, ["card_id", "skill_description"]);

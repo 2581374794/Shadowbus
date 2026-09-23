@@ -369,3 +369,6 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# 本机游戏目录（Shadowbus.csproj 存在时才会导入）
+Shadowverse.local.props

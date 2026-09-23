@@ -197,6 +197,7 @@ code { color: #175cd3; font-family: "Cascadia Code", Consolas, monospace; font-s
 .skill-group { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
 .skill-group-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
 .skill-source-alert { margin-bottom: 14px; }
+.foil-companion-alert { margin-top: 8px; }
 .skill-dsl-import .ant-tag { margin-inline-end: 4px; }
 .skill-dsl-preview { padding: 8px 10px; background: #fcfcfd; border: 1px solid #eaecf0; border-radius: 7px; }
 .skill-dsl-preview dl { display: flex; flex-direction: column; gap: 3px; margin: 6px 0 0; }

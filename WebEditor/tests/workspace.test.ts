@@ -2,8 +2,10 @@
 import { describe, expect, it } from "vitest";
 import { unzipSync } from "fflate";
 import { ImportedWorkspaceAdapter } from "../src/workspace/workspace";
+import { scanWorkspace } from "../src/workspace/scanner";
 
 const decode = (value: Uint8Array) => new TextDecoder().decode(value);
+const empty = new Uint8Array();
 
 describe("导入工作区", () => {
   it("编辑文本时保持无关二进制文件逐字节不变", async () => {
@@ -43,5 +45,30 @@ describe("导入工作区", () => {
       "BossRush/old/ai/style/a.csv",
       "BossRush/old/bossrush.json",
     ]);
+  });
+});
+
+describe("扫描 CardMaster 文件", () => {
+  const scan = (paths: string[]) => scanWorkspace(new ImportedWorkspaceAdapter("Mods", paths.map((path) => ({ path, data: empty, modified: false }))));
+
+  it("同时收录卡文件夹里的 json 和根目录的散装 json", async () => {
+    const files = await scan([
+      // 2.5.5 起一张 mod 卡有自己的一层文件夹，夹里可以有多个 json
+      "CardMaster/我的卡/我的卡.json",
+      "CardMaster/我的卡/闪卡.json",
+      // 旧写法：json 直接放在 CardMaster 根目录
+      "CardMaster/散装.json",
+      "CardMaster/Reference/card_names.csv",
+      "CardMaster/Reference/extra.json",
+      // 卡文件夹只允许一层，再深就不是扫描范围
+      "CardMaster/我的卡/子目录/更深.json",
+      "Format/standard.json",
+    ]);
+    expect([...files.cardmaster].sort()).toEqual([
+      "CardMaster/散装.json",
+      "CardMaster/我的卡/我的卡.json",
+      "CardMaster/我的卡/闪卡.json",
+    ].sort());
+    expect(files.format).toEqual(["Format/standard.json"]);
   });
 });

@@ -1,4 +1,4 @@
-﻿using HarmonyLib;
+using HarmonyLib;
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -60,6 +60,9 @@ namespace Shadowbus
             public NativeWavClip NativeClip;
         }
 
+        // 只有 WAV 能真正播出来：这个工程的 Unity 音频是关掉的，MP3/OGG/AIF 没法交给 Unity 解码。
+        // 这里仍然保留那几个扩展名，是为了让它们走到「只支持 WAV」的明确提示，
+        // 而不是报一句含糊的「不支持的扩展名」。
         private static readonly Dictionary<string, AudioType> SupportedAudioTypes =
             new Dictionary<string, AudioType>(StringComparer.OrdinalIgnoreCase)
             {
@@ -450,7 +453,7 @@ namespace Shadowbus
             {
                 error = string.Concat(
                     "unsupported audio extension '", extension,
-                    "'; use WAV, MP3, OGG, AIF or AIFF");
+                    "'; use 16-bit PCM WAV (this build can only play WAV)");
                 return false;
             }
 

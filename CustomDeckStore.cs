@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using Wizard;
 
 namespace Shadowbus
 {
@@ -209,6 +210,7 @@ namespace Shadowbus
                         throw new InvalidDataException("Required deck fields are missing.");
                     }
                     EnsureFormatId(deck);
+                    DropUnknownCards(file, deck);
                     loadedDecks.Add(deck);
                     existingDeckNos.Add(deck["deck_no"].ToInt());
                     hasEmptyDeck |= deck["card_id_array"].Count == 0;
@@ -235,6 +237,120 @@ namespace Shadowbus
             }
 
             return ToDeckList(loadedDecks);
+        }
+
+        /// <summary>已经报过「牌组里有不存在的卡号」的牌组（按卡号集合去重，免得每次读盘都刷屏）。</summary>
+        private static readonly HashSet<string> ReportedUnknownCards = new HashSet<string>();
+
+        /// <summary>
+        /// 牌组里引用了**当前卡表里已经不存在的卡号**时，游戏那条链是直接解引用的：
+        ///
+        ///   DeckData.ParseCardIdList → UIBase_CardManager.SortIDList
+        ///   → orderby new ComparableCard(card.CardId, …)   // card == null → NullReferenceException
+        ///
+        /// 典型场景：自制卡的 json 被删掉/改名（比如把某个卡文件夹删了），旧牌组还存着它的卡号。
+        /// 结果是**整份本地牌组都注入不进去**（DeckInfoTask 直接报错、牌组列表打不开）。
+        /// 这里在交给游戏之前把这些卡号剔掉，并打一行日志说清是哪份牌组、少了哪些卡号 ——
+        /// 牌组还能打开编辑，只是少了几张已经没了的卡。
+        /// </summary>
+        private static void DropUnknownCards(string file, JsonData deck)
+        {
+            try
+            {
+                JsonData cardIds = deck["card_id_array"];
+                if (cardIds == null || !cardIds.IsArray || cardIds.Count == 0)
+                {
+                    return;
+                }
+
+                List<int> unknown = null;
+                var kept = new List<int>(cardIds.Count);
+                for (int i = 0; i < cardIds.Count; i++)
+                {
+                    int cardId = cardIds[i].ToInt();
+                    if (CardExists(cardId))
+                    {
+                        kept.Add(cardId);
+                    }
+                    else
+                    {
+                        (unknown ??= []).Add(cardId);
+                    }
+                }
+
+                if (unknown == null)
+                {
+                    return;
+                }
+
+                deck["card_id_array"] = ToJsonArray(kept);
+                unknown.Sort();
+                string key = string.Join(",", unknown.Distinct());
+                if (!ReportedUnknownCards.Add(key))
+                {
+                    return;
+                }
+
+                string name = deck.Keys.Contains("deck_name") ? deck["deck_name"].ToString() : null;
+                int deckNo = deck.Keys.Contains("deck_no") ? deck["deck_no"].ToInt() : 0;
+                Plugin.Logger.LogWarning(
+                    $"[CustomFormats] deck {deckNo}" +
+                    (string.IsNullOrEmpty(name) ? "" : $" '{name}'") +
+                    $" ({Path.GetFileName(file)}) uses {unknown.Count} card id(s) that are not in the card master: " +
+                    $"{string.Join(", ", unknown.Distinct())} — they were removed so the deck list can load. " +
+                    "Put the card files back (Mods/CardMaster/<卡文件夹>/) or fix/delete this deck.");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning($"[CustomFormats] could not check {file} for unknown cards: {ex.Message}");
+            }
+        }
+
+        /// <summary>这张卡号在游戏当前的两套卡表里能不能查到（查不到才会被剔掉，保守处理）。</summary>
+        private static bool CardExists(int cardId)
+        {
+            if (cardId <= 0)
+            {
+                return false;
+            }
+
+            try
+            {
+                CardMaster def = CardMaster.GetInstance(CardMaster.CardMasterId.Default);
+                if (def != null && def.GetCardParameterFromId(cardId) != null)
+                {
+                    return true;
+                }
+            }
+            catch (Exception)
+            {
+            }
+
+            try
+            {
+                CardMaster battle = CardMaster.GetInstanceForBattle();
+                if (battle != null && battle.GetCardParameterFromId(cardId) != null)
+                {
+                    return true;
+                }
+            }
+            catch (Exception)
+            {
+            }
+
+            return false;
+        }
+
+        private static JsonData ToJsonArray(IEnumerable<int> values)
+        {
+            JsonData array = new JsonData();
+            array.SetJsonType(JsonType.Array);
+            foreach (int value in values)
+            {
+                array.Add(value);
+            }
+
+            return array;
         }
 
         internal static IEnumerable<string> EnumerateDeckFiles()

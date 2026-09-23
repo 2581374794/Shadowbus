@@ -156,16 +156,20 @@ FoilCardId   = B
 ]
 ```
 
-如果闪卡需要独立卡图，把第二条记录的 `ResourceCardId` 改为另一个资源键，例如 `999991001`，并放置：
+如果闪卡需要独立卡图，把第二条记录的 `ResourceCardId` 改为另一个资源键，例如 `999991001`，并在这张卡的文件夹里各放一套图：
 
 ```text
-Mods/CardImages/999991000.png
-Mods/CardImages/999991000_evo.png
-Mods/CardImages/999991001.png
-Mods/CardImages/999991001_evo.png
+Mods/CardMaster/我的卡/
+├─ 我的卡.json
+├─ card.png          普通版
+├─ card_evo.png      普通版进化图
+├─ foil.png          闪卡版（用 imageFiles 声明）
+└─ foil_evo.png      闪卡版进化图
 ```
 
-如果没有 `_evo.png`，进化状态会回退使用普通卡图。
+同一张卡的两条记录若共用一个文件夹，约定名 `card.png` 会被两条记录共用，所以要分开就用 `imageFiles` 各自声明文件名，或者用 `<资源卡号>.png` 这种按卡号命名的写法。没有进化图时，进化状态会回退使用普通卡图。
+
+> 2.5.5 起资源统一放在卡自己的文件夹里，`Mods/CardImages/`、`Mods/CardVoices/` 已经不再创建也不再读取。完整的目录与命名规则见 `mod卡教程[2.5.5]/mod卡教程.md`。
 
 ## 六、只有普通版、不制作独立闪卡
 
@@ -222,10 +226,11 @@ WebEditor 也会使用内置卡表解析官方 CardId；打开当前 CardMaster 
 2. `NormalCardId` 和 `FoilCardId` 是否都指向真实存在的记录。
 3. 闪卡记录是否真的设置了 `IsFoil=true`。
 4. 普通版和闪卡版的 `BaseCardId` 是否一致。
-5. `ResourceCardId` 是否与 `Mods/CardImages` 文件名一致。
-6. 进化图是否使用 `<ResourceCardId>_evo.png` 命名。
+5. 卡图是否放在这张卡自己的文件夹里（`Mods/CardMaster/<卡文件夹>/`），文件名与 `imageFiles` 声明或约定名 `card.png` 对得上。
+6. 进化图是否叫 `card_evo.png`（或 `imageFiles.evolved` 指定的名字）；没放会回退用普通卡图。
 7. 是否误把 `templateCardId` 当成了新卡的最终 `CardId`。
 8. 是否复制了官方 `CardHashId`，导致外部编码冲突。
+9. 卡图时有时无、或者改一下卡牌数量才出现：那是「取卡面时那张卡所属的资源包还没进内存」。插件会在卡面拿不到材质时按需把包拉起来（每个包只发一次请求），并且**等加载回调确认之后再重试**，不会再像以前那样一发请求就记成"试过了"、导致那张卡一直空到界面重画。如果仍然反复出现，先看日志里有没有 `[Perf] loadArtBundle(...) took ... ms` 与 `asset not found`，再把 `Player.log` 发给维护者。
 
 ## 九、CardId 的常见数字规则（非强制约定）
 

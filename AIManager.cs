@@ -9,12 +9,15 @@ using System.Linq;
 using System.Text.RegularExpressions;
 using UnityEngine;
 using Wizard;
+using Wizard.Dialog.Setting;
 
 namespace Shadowbus
 {
     internal sealed class CustomPracticeButtonLabelGuard : MonoBehaviour
     {
-        private const string CustomLabelText = "自定义卡组";
+        private const string CustomLabelText = "自定义对手";
+
+        internal const string Label = CustomLabelText;
         private UILabel _label;
 
         public void Initialize(UILabel label)
@@ -46,6 +49,11 @@ namespace Shadowbus
     public class AIManager
     {
         private const string CustomPracticeButtonName = "ShadowbusCustomPracticeButton";
+
+        // 配置页按钮（CustomPracticeSetupWindow.SetButtonSelected）用的就是这一对精灵，
+        // 它们是设置页那种蓝色；设置页 ItemButton 模板自带的精灵名不一定是这套。
+        private const string BlueButtonNormalSprite = "btn_common_01_m_off";
+        private const string BlueButtonPressedSprite = "btn_common_01_m_on";
         private static bool _loadingOriginalPracticeDeckAssets;
 
         // Master key prefix of the AI data that Shadowbus registers from local CSV files.
@@ -113,6 +121,12 @@ namespace Shadowbus
             public int EnemyClassId;
             public int PlayerClassId;
             public ClassCharacterMasterData Leader;
+            /// <summary>显式指定敌方主战者（剧情 AI 用；0 = 用 Leader）。</summary>
+            public int EnemyCharaId;
+            /// <summary>显式指定敌方卡表（剧情 AI 用；null/空 = 用 Deck 选的卡组）。</summary>
+            public List<int> EnemyDeckCardIds;
+            /// <summary>剧情 AI 的 story_ai_setting id（0 = 不是剧情 AI）；用来反查篇章，选对章节表情表。</summary>
+            public int StoryAiId;
             public PracticeAISettingData AIPreset;
             public PracticeAISettingData PlayerAIPreset;
             public string LocalDeckCsvPath;
@@ -165,6 +179,13 @@ namespace Shadowbus
         }
 
         private static CustomPracticeSession ActiveCustomPracticeSession;
+
+        /// <summary>
+        /// 当前自定义练习的敌方职业（0 = 没有进行中的自定义练习）。
+        /// 回放录制要用：离线局没有服务器下发的职业，只能从我们自己的起局参数里拿。
+        /// </summary>
+        internal static int CurrentEnemyClassId =>
+            ActiveCustomPracticeSession != null ? ActiveCustomPracticeSession.EnemyClassId : 0;
 
         // Set while the practice retry flow is starting a rematch the player just picked a deck
         // for. The session snapshot still holds the deck the first battle was set up with, and
@@ -220,23 +241,22 @@ namespace Shadowbus
             try
             {
                 ResourcesManager resourcesManager = Toolbox.ResourcesManager;
+
+                // 位置：法师（class 3）与龙族（class 4）两个职业按钮的中点，往上一个按钮高度。
+                Vector3 customGridPosition = ResolveCustomPracticeGridPosition(__instance);
+
+                // 样式：用设置页那个蓝色按钮（OptionSettingPrefab.m_itemButton），
+                // 而不是原来克隆的职业选择方块。拿不到模板时退回旧的克隆方式。
+                if (TryCreateBlueCustomPracticeButton(__instance, customButtonParent, customGridPosition))
+                {
+                    return;
+                }
+
                 GameObject buttonObject = NGUITools.AddChild(
                     customButtonParent.gameObject,
                     __instance._classButtonParts.gameObject);
                 buttonObject.name = CustomPracticeButtonName;
                 buttonObject.SetActive(true);
-
-                Transform topRightClassButton = __instance._classSelectionButtonList
-                    .Where(classButton => classButton != null)
-                    .Select(classButton => classButton.transform)
-                    .OrderByDescending(buttonTransform => buttonTransform.localPosition.x)
-                    .ThenByDescending(buttonTransform => buttonTransform.localPosition.y)
-                    .First();
-                Vector3 customGridPosition = topRightClassButton.localPosition +
-                    new Vector3(
-                        __instance._classButtonGrid.cellWidth,
-                        __instance._classButtonGrid.cellHeight,
-                        0f);
                 buttonObject.transform.position = __instance._classButtonGrid.transform.TransformPoint(customGridPosition);
 
                 ClassSelectionButton button = buttonObject.GetComponent<ClassSelectionButton>();
@@ -271,13 +291,158 @@ namespace Shadowbus
                 buttonObject.AddComponent<CustomPracticeButtonLabelGuard>().Initialize(button._usedLabel);
 
                 Plugin.Logger.LogInfo(
-                    $"[AIManager] Added the custom practice button outside the class grid: " +
-                    $"localPosition={buttonObject.transform.localPosition}.");
+                    $"[AIManager] Added the custom practice button outside the class grid " +
+                    $"(fallback style): localPosition={buttonObject.transform.localPosition}.");
             }
             catch (Exception exception)
             {
                 Plugin.Logger.LogError($"[AIManager] Failed to add the custom practice button.\n{exception}");
             }
+        }
+
+        /// <summary>
+        /// 入口按钮该放的位置：法师（class 3）与龙族（class 4）两个职业按钮的中点，
+        /// 再往上一个按钮高度。找不到这两个职业时退回「最右上角按钮的右上一格」。
+        /// 返回的是职业按钮网格的局部坐标（调用方用 grid.TransformPoint 换算）。
+        /// </summary>
+        private static Vector3 ResolveCustomPracticeGridPosition(ClassSelectionPage page)
+        {
+            float cellWidth = page._classButtonGrid != null ? page._classButtonGrid.cellWidth : 105f;
+            float cellHeight = page._classButtonGrid != null ? page._classButtonGrid.cellHeight : 90f;
+
+            List<ClassSelectionButton> buttons = page._classSelectionButtonList?
+                .Where(classButton => classButton != null)
+                .ToList() ?? new List<ClassSelectionButton>();
+
+            ClassSelectionButton witch = FindClassButton(buttons, 3);
+            ClassSelectionButton dragon = FindClassButton(buttons, 4);
+            if (witch != null && dragon != null)
+            {
+                Vector3 witchPosition = witch.transform.localPosition;
+                Vector3 dragonPosition = dragon.transform.localPosition;
+                return new Vector3(
+                    (witchPosition.x + dragonPosition.x) * 0.5f,
+                    Mathf.Max(witchPosition.y, dragonPosition.y) + cellHeight,
+                    0f);
+            }
+
+            Transform topRight = buttons
+                .Select(classButton => classButton.transform)
+                .OrderByDescending(buttonTransform => buttonTransform.localPosition.x)
+                .ThenByDescending(buttonTransform => buttonTransform.localPosition.y)
+                .FirstOrDefault();
+            return topRight != null
+                ? topRight.localPosition + new Vector3(cellWidth, cellHeight, 0f)
+                : Vector3.zero;
+        }
+
+        private static ClassSelectionButton FindClassButton(
+            List<ClassSelectionButton> buttons,
+            int classId)
+        {
+            return buttons.FirstOrDefault(classButton =>
+                classButton.ClassCharacterMasterData != null &&
+                classButton.ClassCharacterMasterData.class_id == classId);
+        }
+
+        /// <summary>
+        /// 用设置页的蓝色按钮模板做一个长方形入口按钮，构造方式与配置页
+        /// `CustomPracticeSetupWindow.CreateNativeButton` 完全一致（那套按钮的颜色是对的）。
+        /// 模板拿不到时返回 false，由调用方走旧的克隆方式。
+        /// </summary>
+        private static bool TryCreateBlueCustomPracticeButton(
+            ClassSelectionPage page,
+            Transform parent,
+            Vector3 gridPosition)
+        {
+            SettingBase settingTemplate = UIManager.GetInstance()?.OptionSettingPrefab;
+            if (settingTemplate == null || settingTemplate.m_itemButton == null)
+            {
+                return false;
+            }
+
+            GameObject buttonObject = NGUITools.AddChild(parent.gameObject, settingTemplate.m_itemButton);
+            buttonObject.name = CustomPracticeButtonName;
+            buttonObject.transform.position = page._classButtonGrid.transform.TransformPoint(gridPosition);
+            buttonObject.transform.localScale = Vector3.one;
+            buttonObject.SetActive(true);
+
+            ItemButton item = buttonObject.GetComponent<ItemButton>();
+            if (item == null || item._button == null || item._sprite == null || item._label == null)
+            {
+                // 模板结构跟预期不一样：拆掉重建，交给调用方走旧的克隆方式，别在这里抛。
+                Plugin.Logger.LogWarning(
+                    "[AIManager] The option-setting button template is missing the expected parts " +
+                    $"(ItemButton={item != null}, button={(item != null && item._button != null)}, " +
+                    $"sprite={(item != null && item._sprite != null)}, label={(item != null && item._label != null)}); " +
+                    "falling back to the plain cloned class button.");
+                UnityEngine.Object.Destroy(buttonObject);
+                return false;
+            }
+
+            item.SetActive_SeparatorLine(false);
+            item.SetActive_SpriteOnButton(false);
+            if (item._subLabel != null)
+            {
+                item._subLabel.gameObject.SetActive(false);
+            }
+
+            int fontSize = Mathf.Max(12, item._label.fontSize);
+            int width = Mathf.RoundToInt((fontSize * (CustomPracticeButtonLabelGuard.Label.Length + 0.6f) + 16) * 1.05f);
+            int height = Mathf.RoundToInt(Mathf.Max(36, fontSize + 18) * 1.05f);
+
+            item._sprite.ResetAnchors();
+            item._sprite.pivot = UIWidget.Pivot.Center;
+            item._sprite.transform.localPosition = Vector3.zero;
+            item._sprite.SetDimensions(width, height);
+
+            item._label.ResetAnchors();
+            item._label.pivot = UIWidget.Pivot.Center;
+            item._label.alignment = NGUIText.Alignment.Center;
+            item._label.overflowMethod = UILabel.Overflow.ShrinkContent;
+            item._label.SetDimensions(width - 12, height - 4);
+            item._label.transform.localPosition = Vector3.zero;
+            item.SetValue(CustomPracticeButtonLabelGuard.Label);
+            if (item._collider != null)
+            {
+                item._collider.size = new Vector3(width, height, item._collider.size.z);
+            }
+
+            UIButton blueButton = item._button;
+            // 和配置页一样显式指定精灵：设置页那个 ItemButton 模板自带的精灵不一定是
+            // 这套蓝色（上一版「保留模板精灵」结果颜色反而不对），这两个名字才是蓝色按钮。
+            blueButton.normalSprite = BlueButtonNormalSprite;
+            blueButton.hoverSprite = BlueButtonNormalSprite;
+            blueButton.pressedSprite = BlueButtonPressedSprite;
+            UISprite buttonSprite = blueButton.GetComponent<UISprite>() ??
+                                    blueButton.GetComponentInChildren<UISprite>(true);
+            if (buttonSprite != null)
+            {
+                buttonSprite.spriteName = BlueButtonNormalSprite;
+            }
+
+            blueButton.isEnabled = true;
+            blueButton.onClick.Clear();
+            blueButton.onClick.Add(new EventDelegate(delegate
+            {
+                GameMgr.GetIns().GetSoundMgr().PlaySe(Se.TYPE.SYS_COMMON_BUTTON, false);
+                ShowDeckSelection(page);
+            }));
+
+            // 再挂一个 UIEventListener：万一 ItemButton 的 onClick 被别处清掉，
+            // 这个入口也还能点开（上次出现过「点了没反应」）。
+            UIEventListener.Get(buttonObject).onClick = delegate
+            {
+                GameMgr.GetIns().GetSoundMgr().PlaySe(Se.TYPE.SYS_COMMON_BUTTON, false);
+                ShowDeckSelection(page);
+            };
+
+            buttonObject.AddComponent<CustomPracticeButtonLabelGuard>().Initialize(item._label);
+
+            Plugin.Logger.LogInfo(
+                $"[AIManager] Added the blue custom practice button at grid position {gridPosition} " +
+                $"(size {width}x{height}, font {fontSize}, sprite '{BlueButtonNormalSprite}').");
+            return true;
         }
 
         private static void ShowDeckSelection(ClassSelectionPage page)
@@ -864,10 +1029,33 @@ namespace Shadowbus
             {
                 PracticeDualAI.ClearConfiguration();
                 int classId = settings.EnemyClassId;
-                List<int> deckCardIds = settings.Deck.GetCardIdList().ToList();
+                // 剧情 AI 会连卡表一起接管（否则官方 AI 数据对应的卡组和实际牌组对不上）。
+                List<int> deckCardIds = settings.EnemyDeckCardIds != null && settings.EnemyDeckCardIds.Count > 0
+                    ? new List<int>(settings.EnemyDeckCardIds)
+                    : settings.Deck.GetCardIdList().ToList();
                 PracticeData practiceData = GetPracticeData(classId);
                 int fieldId = practiceData?.Battle3dFieldId ?? 1;
-                string leaderVoiceId = ResolveLeaderVoiceId(settings.Leader);
+
+                // 剧情 AI 可以显式指定敌方主战者（剧情敌方主战者不是「已拥有主战者」，
+                // 在主战者栏里选不到），所以这里优先用它。
+                ClassCharacterMasterData enemyLeader = settings.Leader;
+                if (settings.EnemyCharaId > 0)
+                {
+                    ClassCharacterMasterData storyLeader =
+                        GameMgr.GetIns().GetDataMgr().GetCharaPrmByCharaId(settings.EnemyCharaId);
+                    if (storyLeader != null)
+                    {
+                        enemyLeader = storyLeader;
+                    }
+                    else
+                    {
+                        Plugin.Logger.LogWarning(
+                            $"[AIManager] Enemy chara {settings.EnemyCharaId} is not in the local chara master; " +
+                            $"falling back to the selected leader {settings.Leader?.chara_id}.");
+                    }
+                }
+
+                string leaderVoiceId = ResolveLeaderVoiceId(enemyLeader);
 
                 UIManager.GetInstance().createInSceneCenterLoading(false, false, true, null);
                 DataMgr dataMgr = GameMgr.GetIns().GetDataMgr();
@@ -881,7 +1069,42 @@ namespace Shadowbus
                 {
                     dataMgr.SetCurrentDeckData(playerDeckCardIds);
                 }
-                dataMgr.SetEnemyCharaId(settings.Leader.chara_id);
+                dataMgr.SetEnemyCharaId(enemyLeader.chara_id);
+
+                // 剧情 AI：让双方都用官方那一张「章节表情表」。官方把剧情用的脸/动作/语音/台词
+                // 做成了 emote_chara_<皮肤>_<篇章变体>.csv；不设 emotion id 会读通用占位表
+                // （动作列为空 → 回落 idle，文本用的是不存在的通用 id → 界面显示原始 id）。
+                // 篇章由剧情 AI id 反查（官方 story_ai_setting id 就是 section/class/chapter 编出来的）。
+                if (settings.StoryAiId > 0)
+                {
+                    int storyArc = StoryAiEmoteVariants.ResolveSectionForAiId(settings.StoryAiId);
+                    if (storyArc > 0)
+                    {
+                        string enemyEmotionId =
+                            StoryAiEmoteVariants.ResolveEmotionId(enemyLeader.chara_id, storyArc);
+                        if (!string.IsNullOrEmpty(enemyEmotionId))
+                        {
+                            dataMgr.SetEnemyEmotionId(enemyEmotionId);
+                        }
+
+                        int playerSkinId = dataMgr.GetPlayerSkinId();
+                        int playerVariation = StoryAiEmoteVariants.ResolveVariation(playerSkinId, storyArc);
+                        string playerEmotionId = playerVariation > 0
+                            ? $"{playerSkinId}_{playerVariation}"
+                            : playerSkinId.ToString();
+                        dataMgr.SetPlayerEmotionId(playerEmotionId);
+
+                        Plugin.Logger.LogInfo(
+                            $"[AIManager] Story AI {settings.StoryAiId} belongs to section {storyArc}: " +
+                            $"emotion tables enemy='{enemyEmotionId}', player='{playerEmotionId}'.");
+                    }
+                    else
+                    {
+                        Plugin.Logger.LogWarning(
+                            $"[AIManager] Story AI {settings.StoryAiId} could not be mapped to a section; " +
+                            "the default emote table is used (missing lines will show their raw id).");
+                    }
+                }
 
                 int playerClassId = settings.PlayerClassId >= 1 && settings.PlayerClassId <= 8
                     ? settings.PlayerClassId
@@ -925,7 +1148,7 @@ namespace Shadowbus
                                 "ai/" + Data.Master.AIDeckFileNameList.GetFileName(settings.AIPreset.DeckId);
                             string styleAIKey = RegisterLocalStyleCsv(settings.LocalStyleCsvPath) ??
                                 "ai/" + Data.Master.AIStyleFileNameList.GetFileName(settings.AIPreset.StyleId);
-                            string emoteAIKey = RegisterLocalEmoteCsv(settings.LocalEmoteCsvPath, leaderVoiceId, settings.Leader) ??
+                            string emoteAIKey = RegisterLocalEmoteCsv(settings.LocalEmoteCsvPath, leaderVoiceId, enemyLeader) ??
                                 "ai/" + Data.Master.AIEmoteFileNameList.GetFileName(settings.AIPreset.EmoteId);
 
                             ClassCharacterMasterData playerLeader = dataMgr.GetCharaPrmByClassId(playerClassId, true);
@@ -985,7 +1208,7 @@ namespace Shadowbus
                                 EnemyDeck = deckCardIds.ToList(),
                                 PlayerDeck = playerDeckCardIds.ToList(),
                                 EnemyClassId = classId,
-                                EnemyCharaId = settings.Leader.chara_id,
+                                EnemyCharaId = enemyLeader.chara_id,
                                 Difficulty = -1,
                                 LogicLevel = settings.LogicLevel,
                                 MaxLife = settings.MaxLife,
@@ -1013,7 +1236,7 @@ namespace Shadowbus
 
                             Plugin.Logger.LogInfo(
                                 $"[AIManager] Starting custom practice: deck='{settings.Deck.GetDeckName()}', " +
-                                $"class={classId}, leader={settings.Leader.chara_id}, skin={settings.Leader.skin_id}, " +
+                                $"class={classId}, leader={enemyLeader.chara_id}, skin={enemyLeader.skin_id}, " +
                                 $"leaderVoiceId='{leaderVoiceId}', logic={settings.LogicLevel}, " +
                                 $"maxLife={settings.MaxLife}, deckAI='{deckAIKey}', styleAI='{styleAIKey}', " +
                                 $"emoteAI='{emoteAIKey}', llmAI={settings.EnableLLMAI}, playerAI={settings.EnablePlayerAI}, " +

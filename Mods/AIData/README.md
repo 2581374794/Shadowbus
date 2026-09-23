@@ -15,6 +15,30 @@ CSV 需要使用原作对应文件的列格式，并保留第一行表头（加�
 
 完整语法说明见 [Docs/AI_CSV_Guide.md](../../Docs/AI_CSV_Guide.md)。
 
+## 这里是给玩家写模组用的
+
+`Mods/AIData/{deck,style,emote}` 只放**玩家自己**的 CSV。官方数据一律放在**资源目录**里，
+两者不要混：
+
+| 位置 | 内容 | 谁维护 |
+| --- | --- | --- |
+| `Mods/AIData/{deck,style,emote}/` | 玩家自制的 AI 牌组 / 风格 / 表情 | 玩家（本目录） |
+| `<资源根>/story_ai/{deck,style,emote}/` | 从游戏本体导出的**官方**剧情敌方 AI 数据 | 游戏资源（随资源目录分发） |
+
+剧情脚本对战的 `_ai` 段引用文件名时，**先查 `Mods/AIData`，查不到再查资源目录的官方那份**
+（详见 `Mods/StorySpecialBattles/README.md`），所以同名文件可以用 Mods 覆盖官方数据。
+
+官方那份数据可以用仓库外的 `_tools/export_story_ai.py`（配套 `_tools/unityfs_extract.py`
+解 UnityFS + LZ4 资源包）随时重新导出/刷新，输出到 `<资源根>/story_ai`：
+
+```powershell
+python D:\Games\Shadowbus\_tools\export_story_ai.py
+# 可选：python export_story_ai.py <资源根目录> <输出目录>
+```
+
+导出结果已和游戏自己导出的 `Mods/BossRush/Reference/{deck,style,emote}` 逐字节比对过
+（同名文件 SHA256 全部一致）。
+
 ## Emote CSV
 
 每行固定六列：

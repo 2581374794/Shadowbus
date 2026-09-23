@@ -90,6 +90,54 @@ export interface CardMasterPatch extends JsonRecord {
   stringArrayFields: Record<string, string[]>;
   localizationFields: Record<string, string>;
   attackEffectFields: AttackEffectFields;
+  /**
+   * Original-game voice ids this card borrows, as written in the master voice
+   * columns (`"125641030_4"`); only the part before the first `_` matters, because
+   * that is how the game derives the bank `v/vo_<cardId>.acb`. Numbers are read as
+   * strings. Omitted when the card borrows nothing.
+   */
+  extraVoiceIds?: string[];
+  /** Local artwork inside the card's own folder; omitted when nothing is declared. */
+  imageFiles?: CardImageFiles;
+  /** Local audio inside the card's own folder; omitted when nothing is declared. */
+  voiceFiles?: CardVoiceFiles;
+}
+
+/**
+ * `CardImageFilePatch`: free file names relative to the card's own folder
+ * (`Mods/CardMaster/<folder>/`). A missing `evolved` reuses `normal`, and a missing
+ * `normal` falls back to the folder's conventional `card.png`.
+ */
+export interface CardImageFiles extends JsonRecord {
+  /** Normal face. */
+  normal?: string;
+  /** Evolved face. */
+  evolved?: string;
+}
+
+/**
+ * `CardVoiceFilePatch`: free file names relative to the card's own folder, or a
+ * path inside it. A slot left out keeps the template card's voice; a folder that
+ * uses the conventional names (`play.wav`, `evolve.wav`, `attack.wav`,
+ * `attack_evolved.wav`, `destroy.wav`, `destroy_evolved.wav`) needs no declaration.
+ */
+export interface CardVoiceFiles extends JsonRecord {
+  /** Played when the card enters the field. */
+  play?: string;
+  /** Played on evolution. */
+  evolve?: string;
+  /** Played when attacking. */
+  attack?: string;
+  /** Played when the evolved card attacks. */
+  evolvedAttack?: string;
+  /** Played when destroyed. */
+  destroy?: string;
+  /** Played when the evolved card is destroyed. */
+  evolvedDestroy?: string;
+  /** One file per skill slot, in the order of the six skill fields. */
+  skills?: string[];
+  /** The same, for the evolved form's skill slots. */
+  evolvedSkills?: string[];
 }
 
 /** Normal and evolved attack presentation data stored by CardParameter.AttackEffectParameter. */

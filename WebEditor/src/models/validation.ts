@@ -2,6 +2,7 @@ import type { BossRushPackage, CardMasterPatch, CsvDocument, CustomFormat, TwoPi
 import { isCustomCardId, normalizeCardId, type CardCatalog } from "../data/cards";
 import { skillFieldShapes, type SkillFieldSource } from "./skills";
 import { deckBaseHeaders, emoteHeaders, styleHeaders } from "./csv";
+import { relativePathProblem, voiceFileKeys, voiceFileListKeys } from "./cardAssets";
 
 const error = (path: string, message: string): ValidationIssue => ({ severity: "error", path, message });
 const warning = (path: string, message: string): ValidationIssue => ({ severity: "warning", path, message });
@@ -90,14 +91,90 @@ function skillFieldIssues(path: string, map: string, fields: Record<string, stri
   return issues;
 }
 
-export function validateCardMaster(value: CardMasterPatch[], cards?: CardCatalog): ValidationIssue[] {
+/**
+ * A `newCard` patch that does not declare `"IsFoil": true` is paired by the plugin
+ * with a foil record it derives itself (CardMasterPatcher.TryAddFoilCompanion): the
+ * template's own foil version is cloned into `cardId + 1`, so `FoilCardId` never has
+ * to be written by hand. The derivation is skipped — with nothing but a log line —
+ * when `cardId + 1` is already claimed, either by another patch in the same load or
+ * by a card the master already holds, which is what this reports.
+ *
+ * An explicit `IsFoil: true` means the author is pairing the two records by hand, so
+ * no companion is derived and nothing is reported. Only the open file is readable
+ * here, so the claim check covers this document plus the bundled catalog, not the
+ * other CardMaster files of the mod.
+ */
+function foilCompanionIssue(patch: CardMasterPatch, index: number, claimed: ReadonlyMap<number, number>, cards?: CardCatalog): ValidationIssue | null {
+  if (!patch.newCard || patch.cardId <= 0 || patch.boolFields?.IsFoil === true) return null;
+  const foilId = patch.cardId + 1;
+  const owner = claimed.get(foilId);
+  if (owner != null && owner !== index) {
+    return warning(`[${index}].cardId`, `卡号 ${foilId} 已被本文件的第 ${owner + 1} 项占用，闪卡版会自动跳过。只写普通版时请为这张卡预留 cardId + 1 这个空号。`);
+  }
+  // The bundled catalog lists complete cards only, so an exact hit is an id the
+  // master already holds. A foil fallback (末位 1 → base) is not an exact hit.
+  if (cards?.get(foilId)?.id === foilId) {
+    return warning(`[${index}].cardId`, `卡号 ${foilId} 已被游戏原版卡占用，闪卡版会自动跳过。请换一个未被占用的卡号，或显式写 "IsFoil": true 手工配对两张记录。`);
+  }
+  return null;
+}
+
+/**
+ * `extraVoiceIds` borrows another card's voice bank. The game cuts each id at the
+ * first `_` and loads `v/vo_<bank>.acb` (VoiceDictionaries.GetVoiceIDBeforeUnderBar),
+ * so an entry whose bank part is not a number can never resolve.
+ */
+function extraVoiceIssues(patch: CardMasterPatch, index: number): ValidationIssue[] {
+  const ids = patch.extraVoiceIds;
+  if (!Array.isArray(ids) || !ids.length) return [];
+  const unusable = ids.map((id) => String(id).trim()).filter((id) => !/^\d+$/.test(id.split("_")[0]));
+  if (!unusable.length) return [];
+  return [warning(`[${index}].extraVoiceIds`, `借用语音 ID ${unusable.join("、")} 的卡号部分不是数字，游戏会去找 v/vo_<卡号>.acb 并加载失败。请填写原版语音列里的 ID，例如 125641030_4。`)];
+}
+
+/**
+ * Local artwork and audio are only ever looked for inside the folder that holds the
+ * card's json, so every declared value is a path relative to that folder. The plugin
+ * refuses a rooted path and one that walks out of the folder (ModCardAssets.
+ * TryResolveRelativePath), and a json sitting directly in `CardMaster/` has no folder
+ * at all — in both cases the card loads without its artwork or voice.
+ */
+function cardAssetIssues(patch: CardMasterPatch, index: number, filePath?: string): ValidationIssue[] {
+  const declared: [string, string][] = [];
+  if (patch.imageFiles?.normal) declared.push([`[${index}].imageFiles.normal`, patch.imageFiles.normal]);
+  if (patch.imageFiles?.evolved) declared.push([`[${index}].imageFiles.evolved`, patch.imageFiles.evolved]);
+  for (const key of voiceFileKeys) {
+    const item = patch.voiceFiles?.[key];
+    if (item) declared.push([`[${index}].voiceFiles.${key}`, item]);
+  }
+  for (const key of voiceFileListKeys) {
+    (patch.voiceFiles?.[key] ?? []).forEach((item, slot) => { if (item) declared.push([`[${index}].voiceFiles.${key}[${slot}]`, item]); });
+  }
+  const issues = declared.flatMap(([fieldPath, item]) => {
+    const problem = relativePathProblem(item);
+    return problem ? [error(fieldPath, `「${item}」${problem}`)] : [];
+  });
+  if (declared.length && filePath && /^cardmaster\/[^/]+\.json$/i.test(filePath.replaceAll("\\", "/"))) {
+    issues.push(warning(`[${index}]`, "这份 json 直接在 CardMaster 根目录，没有自己的卡文件夹，声明的本地卡图与语音不会被加载。请把 json 移进 Mods/CardMaster/<卡文件夹>/。"));
+  }
+  return issues;
+}
+
+export function validateCardMaster(value: CardMasterPatch[], cards?: CardCatalog, path?: string): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const newIds = new Set<number>();
+  // Every card id a patch in this document asks for, exactly as the plugin collects
+  // them (CardMasterPatcher.requestedNewCardIds): an explicitly written foil record
+  // wins over a generated one, so a claimed id is what stops the derivation.
+  const claimedIds = new Map<number, number>();
+  value.forEach((patch, index) => { if (patch.newCard && patch.cardId > 0) claimedIds.set(patch.cardId, index); });
   value.forEach((patch, index) => {
     if (patch.templateCardId <= 0) issues.push(error(`[${index}].templateCardId`, "模板卡 ID 必须大于 0。"));
     if (patch.newCard && patch.cardId <= 0) issues.push(error(`[${index}].cardId`, "新卡 ID 必须大于 0。"));
     if (patch.newCard && newIds.has(patch.cardId)) issues.push(error(`[${index}].cardId`, "同一文件中存在重复的新卡 ID。"));
     if (patch.newCard) newIds.add(patch.cardId);
+    const foilIssue = foilCompanionIssue(patch, index, claimedIds, cards);
+    if (foilIssue) issues.push(foilIssue);
     if (patch.foilEffectCardId != null) {
       const sourceId = normalizeCardId(patch.foilEffectCardId);
       const sourcePath = `[${index}].foilEffectCardId`;
@@ -120,6 +197,8 @@ export function validateCardMaster(value: CardMasterPatch[], cards?: CardCatalog
     if (skillFieldShapes(patch.stringChangeFields, "change").length && skillFieldShapes(patch.stringAppendFields, "append").length) {
       issues.push(warning(`[${index}]`, "技能字段同时写在 stringChangeFields 和 stringAppendFields 中。游戏会先整体替换再追加，编辑器只结构化编辑前者；建议合并到一处。"));
     }
+    issues.push(...extraVoiceIssues(patch, index));
+    issues.push(...cardAssetIssues(patch, index, path));
   });
   issues.push(...unknownCardIssues(cards, "templateCardId", "模板卡", value.map((patch) => patch.templateCardId)));
   issues.push(...unknownCardIssues(cards, "foilEffectCardId", "闪卡效果来源卡", value.flatMap((patch) => patch.foilEffectCardId == null ? [] : [patch.foilEffectCardId])));

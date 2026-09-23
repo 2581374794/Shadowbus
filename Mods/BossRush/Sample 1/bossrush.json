@@ -14,7 +14,9 @@
       "skill": "(skill:draw)(timing:self_turn_start)(condition:{me.inplay.class.turn}=1)(target:character=me&target=deck&card_type=all&random_count=1)(option:none)(preprocess:remove_after_action=(count=1))",
       "special_ability_desc": "Increase maximum life by 5, recover 5 life, and draw 1 extra card on turn 1.",
       "max_life_change": 5,
-      "life_change": 5
+      "life_change": 5,
+      "special_ability_desc_chs": "最大生命值 +5，回复 5 点生命，并在第 1 回合额外抽 1 张牌。",
+      "special_ability_desc_cht": "最大生命值 +5，回復 5 點生命，並在第 1 回合額外抽 1 張牌。"
     },
     {
       "ability_id": 100011020,
@@ -22,7 +24,9 @@
       "skill": "(skill:draw)(timing:self_turn_start)(condition:{me.inplay.class.turn}=1)(target:character=me&target=deck&card_type=all&random_count=1)(option:none)(preprocess:remove_after_action=(count=1))",
       "special_ability_desc": "At the start of your first turn, draw 1 card.",
       "max_life_change": 0,
-      "life_change": 0
+      "life_change": 0,
+      "special_ability_desc_chs": "第 1 回合开始时，抽 1 张牌。",
+      "special_ability_desc_cht": "第 1 回合開始時，抽 1 張牌。"
     },
     {
       "ability_id": 100012010,
@@ -30,7 +34,9 @@
       "skill": "(skill:draw)(timing:self_turn_start)(condition:{me.inplay.class.turn}=1)(target:character=me&target=deck&card_type=all&random_count=2)(option:none)(preprocess:remove_after_action=(count=1))",
       "special_ability_desc": "At the start of your first turn, draw 2 cards.",
       "max_life_change": 0,
-      "life_change": 0
+      "life_change": 0,
+      "special_ability_desc_chs": "第 1 回合开始时，抽 2 张牌。",
+      "special_ability_desc_cht": "第 1 回合開始時，抽 2 張牌。"
     },
     {
       "ability_id": 100011030,
@@ -38,7 +44,9 @@
       "skill": "(skill:possess_ep_modifier)(timing:self_turn_start)(condition:{me.usable_ep}<=0&&evolvable_turn=true)(target:character=me&target=inplay&card_type=class)(option:add_ep=1)(preprocess:remove_after_action=(count=1))(effect_path:btl_ep_cure_1)(se_path:se_btl_ep_cure_1)(effect_move_type:DIRECT_EPPANEL_SELF)(engine_type:SHURIKEN)(effect_time:0.5)(effect_target_type:single)",
       "special_ability_desc": "Once per battle, recover 1 EP at the start of your turn when you have no usable EP.",
       "max_life_change": 0,
-      "life_change": 0
+      "life_change": 0,
+      "special_ability_desc_chs": "每场对战 1 次，当自己没有可用 EP 时，在自己回合开始时回复 1 点 EP。",
+      "special_ability_desc_cht": "每場對戰 1 次，當自己沒有可用 EP 時，在自己回合開始時回復 1 點 EP。"
     },
     {
       "ability_id": 100011040,
@@ -46,7 +54,9 @@
       "skill": "(skill:possess_ep_modifier)(timing:self_turn_start)(condition:{me.usable_ep}<=0&&evolvable_turn=true)(target:character=me&target=inplay&card_type=class)(option:add_ep=2)(preprocess:remove_after_action=(count=1))(effect_path:btl_ep_cure_1)(se_path:se_btl_ep_cure_1)(effect_move_type:DIRECT_EPPANEL_SELF)(engine_type:SHURIKEN)(effect_time:0.5)(effect_target_type:single)",
       "special_ability_desc": "Once per battle, recover 2 EP at the start of your turn when you have no usable EP.",
       "max_life_change": 0,
-      "life_change": 0
+      "life_change": 0,
+      "special_ability_desc_chs": "每场对战 1 次，当自己没有可用 EP 时，在自己回合开始时回复 2 点 EP。",
+      "special_ability_desc_cht": "每場對戰 1 次，當自己沒有可用 EP 時，在自己回合開始時回復 2 點 EP。"
     },
     {
       "ability_id": 100011050,
@@ -54,7 +64,9 @@
       "skill": "(skill:draw)(timing:self_turn_start)(condition:{me.inplay.class.turn}=1)(target:character=me&target=deck&card_type=all&random_count=1)(option:none)(preprocess:remove_after_action=(count=1)),(skill:possess_ep_modifier)(timing:self_turn_start)(condition:{me.usable_ep}<=0&&evolvable_turn=true)(target:character=me&target=inplay&card_type=class)(option:add_ep=1)(preprocess:remove_after_action=(count=1))(effect_path:btl_ep_cure_1)(se_path:se_btl_ep_cure_1)(effect_move_type:DIRECT_EPPANEL_SELF)(engine_type:SHURIKEN)(effect_time:0.5)(effect_target_type:single)",
       "special_ability_desc": "Draw 1 extra card on turn 1 and recover 1 EP once when depleted.",
       "max_life_change": 0,
-      "life_change": 0
+      "life_change": 0,
+      "special_ability_desc_chs": "第 1 回合额外抽 1 张牌；EP 用尽时回复 1 点 EP（每场对战 1 次）。",
+      "special_ability_desc_cht": "第 1 回合額外抽 1 張牌；EP 用盡時回復 1 點 EP（每場對戰 1 次）。"
     },
     {
       "ability_id": 107813031,

@@ -290,7 +290,7 @@ namespace Shadowbus
                 : $"第 {_bossIndex + 1} 战";
             ClassCharacterMasterData defaultLeader = _allLeaders.FirstOrDefault(leader => leader.chara_id == _defaultCharaId);
             string defaultName = defaultLeader?.chara_name ?? $"chara {_defaultCharaId}";
-            return $"{position}：{boss.Name}　配置默认主战者：{defaultName}（{_defaultCharaId}）";
+            return $"{position}：{boss.LocalizedName}　配置默认主战者：{defaultName}（{_defaultCharaId}）";
         }
 
         private void CreateClassButtons()

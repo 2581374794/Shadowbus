@@ -1,0 +1,243 @@
+[
+  {
+    "newCard": true,
+    "cardId": 999991000,
+    "templateCardId": 100011010,
+    "intFields": {
+      "Cost": 3,
+      "Atk": 2,
+      "Life": 3,
+      "EvoAtk": 4,
+      "EvoLife": 5,
+      "ResourceCardId": 999991000
+    },
+    "localizationFields": {
+      "CardName": "我的第一张卡（最小可用卡）"
+    }
+  },
+  {
+    "newCard": true,
+    "cardId": 999991010,
+    "templateCardId": 100011010,
+    "normalArtCardId": 999000010,
+    "normalArtFromEvolved": false,
+    "evolutionArtCardId": 999000011,
+    "evolutionArtFromEvolved": true,
+    "spellArtCardId": 999000020,
+    "spellArtFromEvolved": false,
+    "foilEffectCardId": 999000001,
+    "boolFields": {
+      "IsFoil": false
+    },
+    "intFields": {
+      "CharType": 1,
+      "Clan": 2,
+      "Cost": 5,
+      "Atk": 3,
+      "Life": 4,
+      "EvoAtk": 5,
+      "EvoLife": 6,
+      "ChantCount": 0,
+      "Rarity": 2,
+      "BaseCardId": 999991010,
+      "NormalCardId": 999991010,
+      "FoilCardId": 999991011,
+      "ResourceCardId": 999991010
+    },
+    "floatFields": {
+      "SummonTime": 0.8,
+      "EvolTime": 0.8
+    },
+    "intArrayFields": {
+      "Tribe": [
+        2
+      ]
+    },
+    "stringChangeFields": {},
+    "stringAppendFields": {
+      "Skill": ",draw",
+      "SkillTiming": ",when_activate",
+      "SkillCondition": ",character=me",
+      "SkillTarget": ",character=me&target=deck&card_type=all&random_count=1",
+      "SkillOption": ",none",
+      "SkillPreprocess": ",use_pp=1"
+    },
+    "stringArrayFields": {
+      "SkillEffectPath": [
+        "btl_other_up"
+      ],
+      "SkillSe": [
+        "se_btl_other_up"
+      ]
+    },
+    "localizationFields": {
+      "CardName": "示例卡名",
+      "TribeName": "示例类型",
+      "Description": "示例能力文本",
+      "EvoDescription": "示例进化能力文本",
+      "SkillDescription": "启动（1PP）：抽 1 张牌。",
+      "EvoSkillDescription": "示例进化技能说明",
+      "FlavorText": "示例背景文本"
+    },
+    "extraVoiceIds": [
+      999000030,
+      999000040
+    ],
+    "imageFiles": {
+      "normal": "示例卡面.png",
+      "evolved": "示例卡面_进化.png"
+    },
+    "voiceFiles": {
+      "play": "登场.wav",
+      "evolve": "进化.mp3",
+      "attack": "攻击.wav",
+      "evolvedAttack": "进化攻击.wav",
+      "destroy": "破坏.wav",
+      "evolvedDestroy": "进化破坏.wav",
+      "skills": [
+        "技能1.wav"
+      ],
+      "evolvedSkills": [
+        "进化技能1.wav"
+      ]
+    },
+    "attackEffectFields": {
+      "effectPath": [
+        "示例特效路径",
+        "示例进化特效路径"
+      ],
+      "se": [
+        "示例音效路径",
+        "示例进化音效路径"
+      ],
+      "moveType": [
+        "DIRECT",
+        "DIRECT"
+      ],
+      "effectEnginType": [
+        "SHURIKEN",
+        "SHURIKEN"
+      ],
+      "time": [
+        0.5,
+        0.5
+      ]
+    }
+  },
+  {
+    "newCard": true,
+    "cardId": 999991020,
+    "templateCardId": 100011010,
+    "intFields": {
+      "CharType": 4,
+      "Clan": 2,
+      "Cost": 3,
+      "Atk": 0,
+      "Life": 0,
+      "EvoAtk": 0,
+      "EvoLife": 0,
+      "ChantCount": 0,
+      "Rarity": 2,
+      "ResourceCardId": 999991020,
+      "BaseCardId": 999991020,
+      "NormalCardId": 999991020,
+      "FoilCardId": 999991021
+    },
+    "stringChangeFields": {
+      "Skill": "damage",
+      "SkillTiming": "when_play",
+      "SkillCondition": "none",
+      "SkillTarget": "character=op&target=inplay&card_type=unit&random_count=1",
+      "SkillOption": "damage=3",
+      "SkillPreprocess": "none"
+    },
+    "localizationFields": {
+      "CardName": "示例咒术",
+      "Description": "对对方随机 1 个随从造成 3 点伤害。",
+      "SkillDescription": "对对方随机 1 个随从造成 3 点伤害。"
+    },
+    "imageFiles": {
+      "normal": "咒术卡面.png"
+    },
+    "voiceFiles": {
+      "play": "咒术登场.wav"
+    }
+  },
+  {
+    "newCard": true,
+    "cardId": 999991030,
+    "templateCardId": 100011010,
+    "intFields": {
+      "CharType": 2,
+      "Clan": 2,
+      "Cost": 2,
+      "Atk": 0,
+      "Life": 0,
+      "EvoAtk": 0,
+      "EvoLife": 0,
+      "ChantCount": 0,
+      "Rarity": 2,
+      "ResourceCardId": 999991030,
+      "BaseCardId": 999991030,
+      "NormalCardId": 999991030,
+      "FoilCardId": 999991031
+    },
+    "stringChangeFields": {
+      "Skill": "damage",
+      "SkillTiming": "when_summon_other",
+      "SkillCondition": "character=me&target=summoned_card&card_type=unit",
+      "SkillTarget": "character=op&target=inplay&card_type=unit&random_count=1",
+      "SkillOption": "damage=1",
+      "SkillPreprocess": "none",
+      "SkillIcon": "induction"
+    },
+    "localizationFields": {
+      "CardName": "示例魔法阵",
+      "Description": "每当你的随从登场，对对方随机 1 个随从造成 1 点伤害。",
+      "SkillDescription": "每当你的随从登场，对对方随机 1 个随从造成 1 点伤害。"
+    },
+    "imageFiles": {
+      "normal": "魔法阵卡面.png"
+    }
+  },
+  {
+    "newCard": true,
+    "cardId": 999991040,
+    "templateCardId": 100011010,
+    "intFields": {
+      "CharType": 3,
+      "Clan": 2,
+      "Cost": 4,
+      "Atk": 0,
+      "Life": 0,
+      "EvoAtk": 0,
+      "EvoLife": 0,
+      "ChantCount": 2,
+      "Rarity": 3,
+      "ResourceCardId": 999991040,
+      "BaseCardId": 999991040,
+      "NormalCardId": 999991040,
+      "FoilCardId": 999991041
+    },
+    "stringChangeFields": {
+      "Skill": "draw",
+      "SkillTiming": "when_destroy",
+      "SkillCondition": "none",
+      "SkillTarget": "character=me&target=deck&card_type=all&random_count=2",
+      "SkillOption": "none",
+      "SkillPreprocess": "none"
+    },
+    "localizationFields": {
+      "CardName": "示例倒计时魔法阵",
+      "Description": "倒计时 2：谢幕曲 抽 2 张牌。",
+      "SkillDescription": "倒计时 2：谢幕曲 抽 2 张牌。"
+    },
+    "imageFiles": {
+      "normal": "倒计时魔法阵卡面.png"
+    },
+    "voiceFiles": {
+      "play": "魔法阵登场.wav",
+      "destroy": "魔法阵消失.wav"
+    }
+  }
+]

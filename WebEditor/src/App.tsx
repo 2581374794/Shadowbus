@@ -58,7 +58,7 @@ function serializeDocument(document: LoadedDocument) {
 
 function validateDocument(document: LoadedDocument, cards: CardCatalog): ValidationIssue[] {
   if (document.module === "bossrush") return validateBossRush(document.value as BossRushPackage, cards);
-  if (document.module === "cardmaster") return validateCardMaster(document.value as CardMasterPatch[], cards);
+  if (document.module === "cardmaster") return validateCardMaster(document.value as CardMasterPatch[], cards, document.path);
   if (document.module === "format") return validateFormat(document.value as CustomFormat, cards);
   if (document.module === "twopick") return validateTwoPick(document.value as TwoPickRule, cards);
   if (document.module === "aidata") return validateCsv(document.value as CsvDocument, document.csvType!);

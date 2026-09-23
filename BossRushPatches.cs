@@ -1,10 +1,11 @@
-using HarmonyLib;
-using Cute;
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
+using Cute;
+using HarmonyLib;
 using UnityEngine;
 using Wizard;
 using Wizard.Dialog.Setting;
@@ -37,7 +38,7 @@ namespace Shadowbus
                 SetPrivateProperty(
                     questOpenInfo,
                     nameof(QuestOpenInfo.QuestPanelBandText),
-                    BossRushOfflineData.CurrentPackage?.DisplayName ?? "BossRush");
+                    BossRushOfflineData.CurrentPackage?.LocalizedDisplayName ?? "BossRush");
                 SetPrivateProperty(
                     questOpenInfo,
                     nameof(QuestOpenInfo.EndTime),
@@ -85,9 +86,110 @@ namespace Shadowbus
             }
         }
 
-        private static void ApplyQuestCardTexture(MyPageCardPanel questCard)
+        /// <summary>
+        /// 本地 BossRush 没有期限（离线 QuestInfoTask 报的是一个十年的时间窗），
+        /// 而 My Page 的「任务」卡会用 <c>QuestOpenInfo.EndTime</c> 去填
+        /// <c>MyPage_0048</c>＝「{0}まで」，也就是一个根本不存在的截止日期。
+        /// 与其显示一个假期限，不如整块去掉。
+        /// </summary>
+        [HarmonyPatch(typeof(MyPageItemSoroPlay), nameof(MyPageItemSoroPlay.Show))]
+        [HarmonyPostfix]
+        private static void MyPageItemSoroPlay_Show_RemoveQuestEndTime_Postfix(MyPageItemSoroPlay __instance)
         {
-            if (questCard.Texture == null)
+            if (!BossRushOfflineData.IsActive)
+            {
+                return;
+            }
+
+            try
+            {
+                if (AccessTools.Field(typeof(MyPageItemSoroPlay), "_questEndTimeLabel")?
+                        .GetValue(__instance) is UILabel endTimeLabel)
+                {
+                    endTimeLabel.text = string.Empty;
+                }
+
+                if (AccessTools.Field(typeof(MyPageItemSoroPlay), "_questEndTimeRoot")?
+                        .GetValue(__instance) is GameObject endTimeRoot)
+                {
+                    endTimeRoot.SetActive(false);
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[BossRush] Failed to remove the Quest end time: {exception.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 任务选择页顶部那行同样来自离线 QuestInfoTask 的时间窗（<c>Quest_0007</c>，
+        /// 即「活动时间」）。本地 BossRush 没有活动期，所以整行留空。
+        /// <c>SetupLayout</c> 紧跟在任务回调填完标签之后调用，是唯一入口；
+        /// 那两枚任务按钮也在这里一起收掉。
+        /// </summary>
+        [HarmonyPatch(typeof(QuestSelectionPage), "SetupLayout")]
+        [HarmonyPostfix]
+        private static void QuestSelectionPage_SetupLayout_RemovePeriod_Postfix(QuestSelectionPage __instance)
+        {
+            if (!BossRushOfflineData.IsActive)
+            {
+                return;
+            }
+
+            try
+            {
+                if (AccessTools.Field(typeof(QuestSelectionPage), "_periodLabel")?
+                        .GetValue(__instance) is UILabel periodLabel)
+                {
+                    periodLabel.text = string.Empty;
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[BossRush] Failed to remove the quest period label: {exception.Message}");
+            }
+
+            HideQuestPageMissionButtons(__instance);
+        }
+
+        /// <summary>
+        /// 任务选择页右下角那两个按钮（也就是 BossRush 入口所在的那一页）本地没有意义：
+        ///
+        ///   · <c>_questConfirmButton</c> →「单人挑战任务」一览（<c>QuestAllConfirmDialog</c>
+        ///     → <c>QuestMissionInfoTask</c>）；
+        ///   · <c>_pointConfirmButton</c> →「确认报酬」（<c>QuestPointConfirmDialog</c>
+        ///     → <c>QuestPointInfoTask</c>）。
+        ///
+        /// 两者拿的都是服务端数据，点了要么弹空表、要么直接报「復号化に失敗しました」。
+        /// 只做 <c>SetActive(false)</c>；<c>SetupLayout</c> 与 <c>SelectBossRushButton</c>
+        /// 各收一次（选中入口时原版会重排按钮）。
+        /// </summary>
+        private static void HideQuestPageMissionButtons(QuestSelectionPage page)
+        {
+            if (page == null || !BossRushOfflineData.IsActive)
+            {
+                return;
+            }
+
+            int hidden = 0;
+            foreach (string fieldName in new[] { "_questConfirmButton", "_pointConfirmButton" })
+            {
+                if (AccessTools.Field(typeof(QuestSelectionPage), fieldName)?.GetValue(page) is UIButton button &&
+                    button.gameObject.activeSelf)
+                {
+                    button.gameObject.SetActive(false);
+                    hidden++;
+                }
+            }
+
+            if (hidden > 0)
+            {
+                Plugin.Logger.LogInfo($"[BossRush] Removed {hidden} quest-page mission button(s).");
+            }
+        }
+
+        private static void ApplyQuestCardTexture(MyPageCardPanel questCard)
+        {            if (questCard.Texture == null)
             {
                 return;
             }
@@ -150,7 +252,7 @@ namespace Shadowbus
             SetPrivateProperty(
                 questOpenInfo,
                 nameof(QuestOpenInfo.QuestPanelBandText),
-                BossRushOfflineData.CurrentPackage?.DisplayName ?? "BossRush");
+                BossRushOfflineData.CurrentPackage?.LocalizedDisplayName ?? "BossRush");
             SetPrivateProperty(
                 questOpenInfo,
                 nameof(QuestOpenInfo.EndTime),
@@ -230,10 +332,11 @@ namespace Shadowbus
         [HarmonyPostfix]
         private static void QuestEventBossRushButton_SetNameLabel_Postfix(QuestEventBossRushButton __instance)
         {
+            // 入口卡的上行：保持原版行为（显示本地包名），不做「大赛模式入口」那套改造。
             UILabel label = AccessTools.Field(typeof(QuestEventBossRushButton), "_nameLabel")?.GetValue(__instance) as UILabel;
             if (label != null && BossRushOfflineData.CurrentPackage != null)
             {
-                label.text = BossRushOfflineData.CurrentPackage.DisplayName;
+                label.text = BossRushOfflineData.CurrentPackage.LocalizedDisplayName;
             }
         }
 
@@ -241,9 +344,13 @@ namespace Shadowbus
         [HarmonyPostfix]
         private static void QuestEventBossRushButton_SetRewardStatusLabel_Postfix(QuestEventBossRushButton __instance)
         {
+            // 入口卡的下行：保持原版行为（BossRush_0013/0014/0015 三段奖励说明）。
             UILabel label = AccessTools.Field(typeof(QuestEventBossRushButton), "_rewardStatusLabel")?.GetValue(__instance) as UILabel;
             BossRushState state = BossRushOfflineData.GetState();
-            if (label == null || state == null) return;
+            if (label == null || state == null)
+            {
+                return;
+            }
 
             string textId = state.IsFinished
                 ? "BossRush_0015"
@@ -264,6 +371,8 @@ namespace Shadowbus
                 bool hasDeck = state.PlayerDeckCardIds != null && state.PlayerDeckCardIds.Count > 0;
                 label.text = Data.SystemText.Get(hasDeck ? "BossRush_0008" : "BossRush_0009");
             }
+
+            HideQuestPageMissionButtons(__instance);
         }
 
         [HarmonyPatch(typeof(QuestBossRushRegisterDeckTask), nameof(QuestBossRushRegisterDeckTask.SetParameter))]
@@ -315,7 +424,7 @@ namespace Shadowbus
                 return false;
             }
 
-            List<string> labels = packages.Select(package => package.DisplayName + " [" + package.Id + "]").ToList();
+            List<string> labels = packages.Select(package => package.LocalizedDisplayName + " [" + package.Id + "]").ToList();
             int selected = Math.Max(0, packages.ToList().FindIndex(package => package == BossRushOfflineData.CurrentPackage));
             DrumrollDialog.Create(labels, selected, null, null, index =>
             {
@@ -359,7 +468,7 @@ namespace Shadowbus
             };
             UIManager.GetInstance().CreateTopBar(
                 __instance.gameObject,
-                package.DisplayName,
+                package.LocalizedDisplayName,
                 UIManager.ViewScene.QuestSelectionPage,
                 false,
                 changeViewSceneParam,
@@ -372,7 +481,7 @@ namespace Shadowbus
         private static bool BossRushLobby_OnClickDetailButton_Prefix()
         {
             BossRushPackage package = BossRushOfflineData.CurrentPackage;
-            if (package == null || string.IsNullOrWhiteSpace(package.DetailText))
+            if (package == null || string.IsNullOrWhiteSpace(package.LocalizedDetailText))
             {
                 return true;
             }
@@ -380,8 +489,8 @@ namespace Shadowbus
             GameMgr.GetIns().GetSoundMgr().PlaySe(Se.TYPE.SYS_BTN_DECIDE, false);
             DialogBase dialog = UIManager.GetInstance().CreateDialogClose(false, false);
             dialog.SetSize(DialogBase.Size.L);
-            dialog.SetTitleLabel(package.DetailTitle);
-            dialog.SetText(package.DetailText, true);
+            dialog.SetTitleLabel(package.LocalizedDetailTitle);
+            dialog.SetText(package.LocalizedDetailText, true);
             dialog.SetButtonLayout(DialogBase.ButtonLayout.OkBtn);
             return false;
         }
@@ -513,6 +622,78 @@ namespace Shadowbus
             catch (Exception exception)
             {
                 Plugin.Logger.LogWarning($"[BossRush] Could not add the leader selection button: {exception.Message}");
+            }
+
+            try
+            {
+                HideLocalBossRushButtonsAndDescriptions(__instance);
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[BossRush] Could not hide the stock lobby buttons: {exception.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 本地 BossRush 大厅里这几样东西没有意义（都是服务端活动才有的）：
+        ///
+        ///   · <c>_stageSelectButton</c>「单人挑战任务」—— 本地关卡表由 <c>bossrush.json</c> 决定，
+        ///     点它只会去要服务端的关卡列表；
+        ///   · <c>_receiveRewardButton</c> + <c>_receiveRewardText</c>「确认报酬」—— 离线一律「没有报酬」；
+        ///   · <c>_winTitleLabel</c> / <c>_winRewardLabel</c>——「通关后可获得专属报酬」
+        ///     「胜利后可获得点数。」这类活动说明。
+        ///
+        /// 只做 <c>SetActive(false)</c> / 清空文字，不动布局，也不碰任何逻辑。
+        /// </summary>
+        private static void HideLocalBossRushButtonsAndDescriptions(BossRushLobby lobby)
+        {
+            if (lobby == null || !BossRushOfflineData.IsActive)
+            {
+                return;
+            }
+
+            int hidden = 0;
+            List<string> resolved = new List<string>();
+            List<string> missing = new List<string>();
+            foreach (string fieldName in new[] { "_stageSelectButton", "_receiveRewardButton" })
+            {
+                object raw = AccessTools.Field(typeof(BossRushLobby), fieldName)?.GetValue(lobby);
+                if (!(raw is UIButton button))
+                {
+                    missing.Add(fieldName);
+                    continue;
+                }
+
+                resolved.Add(fieldName);
+                if (button.gameObject.activeSelf)
+                {
+                    button.gameObject.SetActive(false);
+                    hidden++;
+                }
+            }
+
+            foreach (string fieldName in new[] { "_winTitleLabel", "_winRewardLabel", "_receiveRewardText" })
+            {
+                object raw = AccessTools.Field(typeof(BossRushLobby), fieldName)?.GetValue(lobby);
+                if (!(raw is UILabel label))
+                {
+                    missing.Add(fieldName);
+                    continue;
+                }
+
+                resolved.Add(fieldName);
+                if (!string.IsNullOrEmpty(label.text))
+                {
+                    label.text = string.Empty;
+                    hidden++;
+                }
+            }
+
+            if (hidden > 0 || missing.Count > 0)
+            {
+                Plugin.Logger.LogInfo(
+                    $"[BossRush] Lobby cleanup: hid {hidden} item(s); resolved [{string.Join(", ", resolved)}]" +
+                    (missing.Count > 0 ? $"; NOT FOUND [{string.Join(", ", missing)}]" : string.Empty));
             }
         }
 
@@ -696,6 +877,17 @@ namespace Shadowbus
             if (!BossRushOfflineData.IsActive)
             {
                 return;
+            }
+
+            // 这一处跑�?Initialize 之后（大厅每次刷新都会走到），原版可能把刚才藏掉的按�?
+            // 又打�?了，�?以在这里再收�?次；隐藏�?��幂等�?
+            try
+            {
+                HideLocalBossRushButtonsAndDescriptions(__instance);
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[BossRush] Could not hide the stock lobby buttons: {exception.Message}");
             }
 
             try

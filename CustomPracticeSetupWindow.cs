@@ -28,6 +28,34 @@ namespace Shadowbus
             public string Path;
         }
 
+        /// <summary>
+        /// 一条官方剧情敌方 AI：master 的 story_ai_setting 一行，加上从资源目录导出的
+        /// 那三份 CSV 的本地路径（找不到就走 master 里的 AI 资源）。
+        /// Setting 为 null 的那条是固定的「无」，用来取消剧情 AI 模式。
+        /// </summary>
+        private sealed class StoryAiChoice
+        {
+            public StoryAISettingData Setting;
+            public string DeckName;
+            public string DeckCsvPath;
+            public string StyleCsvPath;
+            public string EmoteCsvPath;
+            /// <summary>敌方主战者。从表情表的 voice_id 前缀推出来（500211_003_100 -> 500211）。</summary>
+            public int EnemyCharaId;
+            /// <summary>敌方职业 = 敌方主战者的职业，必须与主战者一致，否则会构筑出空牌组。</summary>
+            public int EnemyClassId;
+            /// <summary>官方牌组展开后的卡表（40 张），用来真正接管敌方卡组。</summary>
+            public List<int> DeckCardIds;
+
+            public string Label => Setting == null
+                ? "无（自定义对手AI数据）"
+                : string.Format(
+                    "AI {0} · {1} · 逻辑 {2}",
+                    Setting.EnemyAiId,
+                    string.IsNullOrEmpty(DeckName) ? "未知牌组" : DeckName,
+                    Setting.LogicLevel);
+        }
+
         private DialogBase _dialog;
         private ClassSelectionPage _page;
         private List<AIManager.CustomPracticeDeckChoice> _decks;
@@ -40,27 +68,31 @@ namespace Shadowbus
         private int _leaderIndex;
         private int _leaderPageIndex;
         private List<AIPresetChoice> _presets;
-        private List<AIPresetChoice> _playerPresets;
         private int _presetIndex;
-        private int _playerPresetIndex;
         private List<CsvChoice> _deckCsvChoices;
         private List<CsvChoice> _styleCsvChoices;
         private List<CsvChoice> _emoteCsvChoices;
         private int _deckCsvIndex;
         private int _styleCsvIndex;
         private int _emoteCsvIndex;
-        private int _playerDeckCsvIndex;
-        private int _playerStyleCsvIndex;
-        private int _playerEmoteCsvIndex;
         private int _logicLevel;
         private int _maxLife;
         private bool _enableLLMAI;
-        private bool _enablePlayerAI;
-        private bool _playerAIUseLocalCsv;
         private bool _isStarting;
         private bool _updatingLifeSlider;
         private bool _isDestroyed;
         private int _leaderBuildVersion;
+
+        // Initialize 会先跑 SelectDeck/SelectPlayerDeck 再跑 BuildNativeUi，所以在那之前
+        // 任何刷新 UI 的调用都必须是无副作用的。踩过一次坑：早期版本在这里抛 NRE，
+        // 整个对话框构建失败、按钮点了没反应。
+        private bool _uiReady;
+
+        // 「剧情 AI」：直接用官方那一套剧情敌方 AI（Resources/story_ai 里导出的 CSV）。
+        // 与自定义 AI（卡组 / 原作预设 / 三份 CSV）以及 AI 逻辑互斥：选了剧情 AI，
+        // 那两组都变暗；列表第一项是固定的「无」，选它就能取消。
+        private List<StoryAiChoice> _storyAiChoices;
+        private int _storyAiIndex;
 
         private GameObject _contentRoot;
         private GameObject _leaderStripRoot;
@@ -73,15 +105,11 @@ namespace Shadowbus
         private UIButton _deckButton;
         private UIButton _playerDeckButton;
         private UIButton _presetButton;
-        private UIButton _playerPresetButton;
         private UIButton _deckCsvButton;
         private UIButton _styleCsvButton;
         private UIButton _emoteCsvButton;
-        private UIButton _playerDeckCsvButton;
-        private UIButton _playerStyleCsvButton;
-        private UIButton _playerEmoteCsvButton;
         private UIButton _llmAIButton;
-        private UIButton _playerAIButton;
+        private UIButton _storyAiButton;
         private readonly List<UIButton> _classButtons = new List<UIButton>();
         private readonly List<UIButton> _logicButtons = new List<UIButton>();
         private readonly List<SelectRandomSkinButton> _leaderButtons = new List<SelectRandomSkinButton>();
@@ -101,8 +129,6 @@ namespace Shadowbus
             _logicLevel = 2;
             _maxLife = 20;
             _enableLLMAI = LLMAITurnController.DefaultEnabled;
-            _enablePlayerAI = false;
-            _playerAIUseLocalCsv = false;
 
             try
             {
@@ -191,136 +217,189 @@ namespace Shadowbus
                 throw new InvalidOperationException("SelectRandomSkinDialog component is unavailable.");
             }
 
-            CreateSectionHeader("对手设置", new Vector3(-500f, 190f, 0f));
-            CreateSectionHeader("对手 AI 数据", new Vector3(20f, 190f, 0f), 300);
-            _llmAIButton = CreateNativeButton(
-                string.Empty,
-                new Vector3(425f, 190f, 0f),
-                150,
-                34,
-                ToggleLLMAI);
-
-            CreateLabel("卡组", new Vector3(-470f, 142f, 0f), 90, 34, 18, NGUIText.Alignment.Left);
-            _deckButton = CreateNativeButton(
-                string.Empty,
-                new Vector3(-210f, 142f, 0f),
-                320,
-                38,
-                OpenDeckDialog);
-
-            CreateLabel("原作预设", new Vector3(30f, 142f, 0f), 130, 34, 18, NGUIText.Alignment.Left);
-            _presetButton = CreateNativeButton(
-                string.Empty,
-                new Vector3(330f, 142f, 0f),
-                350,
-                38,
-                OpenPresetDialog);
-
-            CreateLabel("Deck CSV", new Vector3(30f, 96f, 0f), 130, 32, 17, NGUIText.Alignment.Left);
-            _deckCsvButton = CreateNativeButton(
-                string.Empty,
-                new Vector3(330f, 96f, 0f),
-                350,
-                38,
-                () => OpenCsvDialog("选择 Deck CSV", _deckCsvChoices, _deckCsvIndex, index => _deckCsvIndex = index));
-
-            CreateLabel("Style CSV", new Vector3(30f, 52f, 0f), 130, 32, 17, NGUIText.Alignment.Left);
-            _styleCsvButton = CreateNativeButton(
-                string.Empty,
-                new Vector3(330f, 52f, 0f),
-                350,
-                38,
-                () => OpenCsvDialog("选择 Style CSV", _styleCsvChoices, _styleCsvIndex, index => _styleCsvIndex = index));
-
-            CreateLabel("Emote CSV", new Vector3(30f, 8f, 0f), 130, 32, 17, NGUIText.Alignment.Left);
-            _emoteCsvButton = CreateNativeButton(
-                string.Empty,
-                new Vector3(330f, 8f, 0f),
-                350,
-                38,
-                () => OpenCsvDialog("选择 Emote CSV", _emoteCsvChoices, _emoteCsvIndex, index => _emoteCsvIndex = index));
-
-            CreateLabel("我方 AI 数据", new Vector3(30f, -34f, 0f), 220, 30, 17, NGUIText.Alignment.Left);
-            CreateLabel("Deck CSV", new Vector3(30f, -68f, 0f), 130, 30, 16, NGUIText.Alignment.Left);
-            _playerDeckCsvButton = CreateNativeButton(
-                string.Empty,
-                new Vector3(330f, -68f, 0f),
-                350,
-                36,
-                () => OpenCsvDialog("选择我方 Deck CSV", _deckCsvChoices, _playerDeckCsvIndex, index => _playerDeckCsvIndex = index));
-
-            CreateLabel("Style CSV", new Vector3(30f, -108f, 0f), 130, 30, 16, NGUIText.Alignment.Left);
-            _playerStyleCsvButton = CreateNativeButton(
-                string.Empty,
-                new Vector3(330f, -108f, 0f),
-                350,
-                36,
-                () => OpenCsvDialog("选择我方 Style CSV", _styleCsvChoices, _playerStyleCsvIndex, index => _playerStyleCsvIndex = index));
-
-            CreateLabel("Emote CSV", new Vector3(30f, -148f, 0f), 130, 30, 16, NGUIText.Alignment.Left);
-            _playerEmoteCsvButton = CreateNativeButton(
-                string.Empty,
-                new Vector3(330f, -148f, 0f),
-                350,
-                36,
-                () => OpenCsvDialog("选择我方 Emote CSV", _emoteCsvChoices, _playerEmoteCsvIndex, index => _playerEmoteCsvIndex = index));
-
-            CreateLabel("职业", new Vector3(-470f, 102f, 0f), 120, 32, 19, NGUIText.Alignment.Left);
-            CreateClassButtons();
-
-            CreateLabel("AI 逻辑", new Vector3(-470f, -4f, 0f), 120, 32, 19, NGUIText.Alignment.Left);
-            CreateLogicButtons();
-
-            CreateLabel("我方卡组", new Vector3(-470f, -68f, 0f), 120, 30, 17, NGUIText.Alignment.Left);
+            // 整页分两栏：
+            //   左 = 「我方设置」→ 我方卡组 ；「对手设置」→ 选择剧情AI / 生命上限 / 对手皮肤职业 + 职业按钮
+            //   右 = LLM AI ；「自定义对手 AI 数据」→ 对手卡组 / 选择官方预设AI / AI 逻辑 /
+            //        牌组 / 风格 / 表情 CSV ，最下面 刷新 CSV。
+            CreateSectionHeader("我方设置", new Vector3(-500f, 190f, 0f));
+            CreateLabel("我方卡组", new Vector3(-500f, 142f, 0f), 95, 34, 18, NGUIText.Alignment.Left);
             _playerDeckButton = CreateNativeButton(
                 string.Empty,
-                new Vector3(-210f, -68f, 0f),
-                320,
-                36,
+                new Vector3(-240f, 142f, 0f),
+                300,
+                38,
                 OpenPlayerDeckDialog);
 
-            CreateLabel("我方原作预设", new Vector3(-470f, -106f, 0f), 150, 30, 17, NGUIText.Alignment.Left);
-            _playerPresetButton = CreateNativeButton(
-                string.Empty,
-                new Vector3(-210f, -106f, 0f),
-                320,
-                36,
-                OpenPlayerPresetDialog);
+            CreateSectionHeader("对手设置", new Vector3(-500f, 96f, 0f));
 
-            CreateLabel("我方 AI", new Vector3(-470f, -144f, 0f), 120, 30, 17, NGUIText.Alignment.Left);
-            _playerAIButton = CreateNativeButton(
+            // 「选择剧情AI」排在「对手设置」下面第一栏。
+            // 标签宽度必须 <= 110：按钮左沿在 -390，标签框再宽就会压到按钮下面被盖住。
+            // 再往左挪 1.5 个字号（27）让文字和按钮之间留出空隙。
+            CreateLabel("选择剧情AI", new Vector3(-527f, 48f, 0f), 110, 34, 18, NGUIText.Alignment.Left);
+            _storyAiButton = CreateNativeButton(
                 string.Empty,
-                new Vector3(-210f, -144f, 0f),
-                320,
-                36,
-                TogglePlayerAI);
+                new Vector3(-240f, 48f, 0f),
+                300,
+                38,
+                OpenStoryAiDialog);
 
+            // 「对手卡组」已移到右栏（与左栏「我方卡组」同一水平线），这里放「生命上限」，
+            // 「对手皮肤职业」+ 8 个职业按钮整体下移到滑块下面。
             _lifeSlider = NGUITools.AddChild(_contentRoot, _settingTemplate.m_itemSlider).GetComponent<ItemSlider>();
             _lifeSlider.name = "MaxLifeSlider";
-            _lifeSlider.transform.localPosition = new Vector3(-270f, -184f, 0f);
+            _lifeSlider.transform.localPosition = new Vector3(-270f, 2f, 0f);
             _lifeSlider.transform.localScale = new Vector3(ColumnScale, ColumnScale, 1f);
             _lifeSlider.SetTitleLabel("生命上限");
             _lifeSlider.SetActive_SeparatorLine(false);
             _lifeSlider.m_slider.numberOfSteps = 100;
             _lifeSlider.AddChangeCallback(OnLifeSliderChanged);
 
-            CreateNativeButton("刷新 CSV", new Vector3(390f, -188f, 0f), 150, 36, RefreshCsvChoicesAndControls);
+            // 「对手皮肤职业」比原来的「职业」长两个字，标签框左移并加宽，避免被职业按钮挡住
+            // （第一个职业按钮覆盖 -398 起，文字必须止步于 -400 之前）。
+            CreateLabel("对手皮肤职业", new Vector3(-515f, -50f, 0f), 115, 32, 18, NGUIText.Alignment.Left);
+            CreateClassButtons();
 
-            CreateSectionHeader("主战者", new Vector3(-500f, -218f, 0f), 1000);
+            // 右栏第一、二行：LLM AI 与大标题整体上移，让大标题和左栏「我方设置」同一水平线。
+            _llmAIButton = CreateNativeButton(
+                string.Empty,
+                new Vector3(390f, 234f, 0f),
+                190,
+                34,
+                ToggleLLMAI);
+
+            CreateSectionHeader("自定义对手 AI 数据", new Vector3(20f, 190f, 0f), 480);
+
+            // 从左侧移过来的「对手卡组」，与「我方卡组」同高（142）。
+            CreateLabel("对手卡组", new Vector3(20f, 142f, 0f), 95, 34, 18, NGUIText.Alignment.Left);
+            _deckButton = CreateNativeButton(
+                string.Empty,
+                new Vector3(335f, 142f, 0f),
+                300,
+                38,
+                OpenDeckDialog);
+
+            // 「选择官方预设AI」与我方卡组按钮同尺寸（300x38），长预设名才不会被迫缩小字号。
+            // 按你的要求左移的是**标签框**（不是按钮）：标签 x 20 -> 2，按钮仍在 335。
+            CreateLabel("选择官方预设AI", new Vector3(2f, 96f, 0f), 160, 34, 18, NGUIText.Alignment.Left);
+            _presetButton = CreateNativeButton(
+                string.Empty,
+                new Vector3(335f, 96f, 0f),
+                300,
+                38,
+                OpenPresetDialog);
+
+            // AI 逻辑：弱 / 中 / 强 直接放在这一行右边，不另起一行，且三个按钮的整体
+            // 横向范围与上面那些按钮一致（215..405）。
+            CreateLabel("AI 逻辑", new Vector3(20f, 52f, 0f), 130, 32, 17, NGUIText.Alignment.Left);
+            CreateLogicButtons();
+
+            CreateLabel("牌组 CSV", new Vector3(20f, 8f, 0f), 130, 32, 17, NGUIText.Alignment.Left);
+            _deckCsvButton = CreateNativeButton(
+                string.Empty,
+                new Vector3(310f, 8f, 0f),
+                190,
+                38,
+                () => OpenCsvDialog("选择牌组 CSV", _deckCsvChoices, _deckCsvIndex, index => _deckCsvIndex = index));
+
+            CreateLabel("风格 CSV", new Vector3(20f, -36f, 0f), 130, 32, 17, NGUIText.Alignment.Left);
+            _styleCsvButton = CreateNativeButton(
+                string.Empty,
+                new Vector3(310f, -36f, 0f),
+                190,
+                38,
+                () => OpenCsvDialog("选择风格 CSV", _styleCsvChoices, _styleCsvIndex, index => _styleCsvIndex = index));
+
+            CreateLabel("表情 CSV", new Vector3(20f, -80f, 0f), 130, 32, 17, NGUIText.Alignment.Left);
+            _emoteCsvButton = CreateNativeButton(
+                string.Empty,
+                new Vector3(310f, -80f, 0f),
+                190,
+                38,
+                () => OpenCsvDialog("选择表情 CSV", _emoteCsvChoices, _emoteCsvIndex, index => _emoteCsvIndex = index));
+
+            CreateNativeButton("刷新 CSV", new Vector3(425f, -124f, 0f), 120, 32, RefreshCsvChoicesAndControls);
+
+            // 主战者标题往上收，标题与下方名字之间拉开距离。
+            CreateSectionHeader("对手皮肤", new Vector3(-500f, -174f, 0f), 1000);
             _leaderStripRoot = new GameObject("LeaderStrip");
             _leaderStripRoot.transform.parent = _contentRoot.transform;
-            _leaderStripRoot.transform.localPosition = new Vector3(0f, -254f, 0f);
+            _leaderStripRoot.transform.localPosition = new Vector3(0f, -222f, 0f);
             _leaderStripRoot.transform.localScale = Vector3.one;
             _leaderStripRoot.layer = _contentRoot.layer;
 
             CreateLeaderPageButtons();
-            _leaderNameLabel = CreateLabel(string.Empty, new Vector3(0f, -296f, 0f), 520, 26, 15, NGUIText.Alignment.Center);
-            _leaderPageLabel = CreateLabel(string.Empty, new Vector3(445f, -218f, 0f), 100, 26, 14, NGUIText.Alignment.Right);
-            _validationLabel = CreateLabel(string.Empty, new Vector3(0f, -296f, 0f), 900, 26, 14, NGUIText.Alignment.Center);
+            // 名字往下让开主战者列表，页码跟着标题一起上移。
+            _leaderNameLabel = CreateLabel(string.Empty, new Vector3(0f, -268f, 0f), 520, 26, 15, NGUIText.Alignment.Center);
+            _leaderPageLabel = CreateLabel(string.Empty, new Vector3(445f, -174f, 0f), 100, 26, 14, NGUIText.Alignment.Right);
+            // 校验/LLM 报错放页面最上方：放底部会压住主战者名字。
+            _validationLabel = CreateLabel(string.Empty, new Vector3(0f, 260f, 0f), 900, 26, 14, NGUIText.Alignment.Center);
             _validationLabel.color = new Color(1f, 0.72f, 0.72f, 1f);
 
             _dialog.SetObj(_contentRoot, Vector3.zero);
             _contentRoot.transform.localScale = new Vector3(0.80f, 0.80f, 1f);
+            _uiReady = true;
+
+            LoadStoryAiChoices();
+            DeduplicateTitleLabel();
+        }
+
+        /// <summary>
+        /// 顶部标题只保留一个。这个对话框的标题在打开时（AIManager）已经设过一次，
+        /// 若 prefab 里还带一份自己的标题文本，页面上就会出现两个「自定义练习」。
+        /// 这里把除 DialogBase.titleLabel 以外、文字与标题相同的标签清空。
+        /// </summary>
+        private void DeduplicateTitleLabel()
+        {
+            try
+            {
+                string title = _dialog.GetTitleLabelStr();
+                if (string.IsNullOrEmpty(title))
+                {
+                    return;
+                }
+
+                UILabel keep = _dialog.titleLabel;
+                int cleared = 0;
+                foreach (UILabel label in _dialog.GetComponentsInChildren<UILabel>(true))
+                {
+                    if (label == null || label == keep)
+                    {
+                        continue;
+                    }
+
+                    if (string.Equals(label.text, title, StringComparison.Ordinal))
+                    {
+                        label.text = string.Empty;
+                        cleared++;
+                    }
+                }
+
+                // 也可能有第二份在职业选择页那一层（对话框换 Size 会重建自己的标题）。
+                if (_page != null)
+                {
+                    foreach (UILabel label in _page.GetComponentsInChildren<UILabel>(true))
+                    {
+                        if (label == null ||
+                            string.Equals(label.text, title, StringComparison.Ordinal) == false)
+                        {
+                            continue;
+                        }
+
+                        label.text = string.Empty;
+                        cleared++;
+                    }
+                }
+
+                if (cleared > 0)
+                {
+                    Plugin.Logger.LogInfo(
+                        $"[AIManager] Cleared {cleared} duplicated title label(s) reading '{title}'.");
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[AIManager] Could not deduplicate the dialog title: {exception.Message}");
+            }
         }
 
         private void CreateSectionHeader(string text, Vector3 position, int width = 470)
@@ -376,8 +455,8 @@ namespace Shadowbus
             for (int i = 0; i < names.Length; i++)
             {
                 int classId = i + 1;
-                float x = -420f + i % 4 * 105f;
-                float y = 76f - i / 4 * 42f;
+                float x = -350f + i % 4 * 100f;
+                float y = -50f - i / 4 * 42f;
                 UIButton button = CreateNativeButton(
                     names[i],
                     new Vector3(x, y, 0f),
@@ -396,8 +475,8 @@ namespace Shadowbus
                 int logicLevel = i;
                 UIButton button = CreateNativeButton(
                     labels[i],
-                    new Vector3(-385f + i * 116f, -31f, 0f),
-                    108,
+                    new Vector3(245f + i * 65f, 52f, 0f),
+                    60,
                     36,
                     () =>
                     {
@@ -452,6 +531,11 @@ namespace Shadowbus
 
         private static void SetButtonSelected(UIButton button, bool selected)
         {
+            if (button == null)
+            {
+                return;
+            }
+
             string normalSprite = selected ? "btn_common_02_m_off" : "btn_common_01_m_off";
             string pressedSprite = selected ? "btn_common_02_m_on" : "btn_common_01_m_on";
             button.normalSprite = normalSprite;
@@ -468,12 +552,12 @@ namespace Shadowbus
         {
             _leaderPreviousButton = CloneLeaderPageButton(
                 _skinDialogTemplate._btnNextPage,
-                new Vector3(-485f, -254f, 0f),
+                new Vector3(-485f, -232f, 0f),
                 true,
                 ShowPreviousLeaderPage);
             _leaderNextButton = CloneLeaderPageButton(
                 _skinDialogTemplate._btnNextPage,
-                new Vector3(485f, -254f, 0f),
+                new Vector3(485f, -232f, 0f),
                 false,
                 ShowNextLeaderPage);
         }
@@ -502,6 +586,7 @@ namespace Shadowbus
         private void SelectDeck(int index, bool refreshControls = true)
         {
             _deckIndex = Mathf.Clamp(index, 0, _decks.Count - 1);
+            ClearStoryAiSelection();
             AIManager.CustomPracticeDeckChoice choice = _decks[_deckIndex];
             SelectClass(choice.EnemyClassId, refreshControls);
             if (choice.OriginalAIPreset != null)
@@ -521,28 +606,16 @@ namespace Shadowbus
             if (_playerDecks == null || _playerDecks.Count == 0)
             {
                 _playerClassId = Mathf.Clamp(GameMgr.GetIns().GetDataMgr().GetPlayerClassId(), 1, 8);
-                RebuildPlayerPresets();
                 return;
             }
 
             _playerDeckIndex = Mathf.Clamp(index, 0, _playerDecks.Count - 1);
             AIManager.CustomPracticeDeckChoice choice = _playerDecks[_playerDeckIndex];
             _playerClassId = Mathf.Clamp(choice.EnemyClassId, 1, 8);
-            RebuildPlayerPresets();
-            if (choice.OriginalAIPreset != null)
-            {
-                int presetIndex = FindPresetIndex(_playerPresets, choice.OriginalAIPreset);
-                if (presetIndex >= 0)
-                {
-                    _playerPresetIndex = presetIndex;
-                }
-            }
 
             if (refreshControls && _contentRoot != null)
             {
                 UpdatePlayerDeckButton();
-                UpdatePlayerPresetButton();
-                UpdatePlayerAIControls();
             }
         }
 
@@ -596,7 +669,7 @@ namespace Shadowbus
                 Format.Unlimited,
                 DeckAttributeType.CustomDeck);
             DeckSelectUIDialog deckSelector = DeckSelectUIDialog.Create(
-                "选择我方 AI 卡组",
+                "选择我方卡组",
                 new DeckGroupListData(deckGroup),
                 Format.Unlimited,
                 DeckSelectUIDialog.eFormatChangeUIType.SingleFormat,
@@ -678,7 +751,7 @@ namespace Shadowbus
             _presets = settings.Select((setting, index) => new AIPresetChoice
             {
                 Setting = setting,
-                Label = $"原作预设 {index + 1}  [{GetDeckFileName(setting)}]"
+                Label = $"官方预设 {index + 1}  [{GetDeckFileName(setting)}]"
             }).ToList();
 
             _presetIndex = settings.FindIndex(setting => setting.Difficulty == 1);
@@ -690,27 +763,6 @@ namespace Shadowbus
             if (_presets.Count > 0)
             {
                 ApplyPresetDefaults(_presets[_presetIndex].Setting);
-            }
-        }
-
-        private void RebuildPlayerPresets()
-        {
-            List<PracticeAISettingData> settings = Data.Master.PracticeAISettingList?
-                .GetSettingDataTable()?
-                .Where(setting => setting.ClassId == _playerClassId)
-                .OrderBy(setting => setting.Difficulty)
-                .ToList() ?? new List<PracticeAISettingData>();
-
-            _playerPresets = settings.Select((setting, index) => new AIPresetChoice
-            {
-                Setting = setting,
-                Label = $"原作预设 {index + 1}  [{GetDeckFileName(setting)}]"
-            }).ToList();
-
-            _playerPresetIndex = settings.FindIndex(setting => setting.Difficulty == 1);
-            if (_playerPresetIndex < 0)
-            {
-                _playerPresetIndex = 0;
             }
         }
 
@@ -737,6 +789,7 @@ namespace Shadowbus
             }
 
             _presetIndex = Mathf.Clamp(index, 0, _presets.Count - 1);
+            ClearStoryAiSelection();
             ApplyPresetDefaults(_presets[_presetIndex].Setting);
             UpdateLogicButtons();
             UpdateLifeSlider();
@@ -752,36 +805,10 @@ namespace Shadowbus
             }
 
             OpenListDialog(
-                "选择原作 AI 预设",
+                "选择官方 AI 预设",
                 _presets.Select(choice => choice.Label).ToList(),
                 _presetIndex,
                 SelectPreset);
-        }
-
-        private void SelectPlayerPreset(int index)
-        {
-            if (_playerPresets == null || _playerPresets.Count == 0)
-            {
-                return;
-            }
-
-            _playerPresetIndex = Mathf.Clamp(index, 0, _playerPresets.Count - 1);
-            UpdatePlayerPresetButton();
-            ClearValidation();
-        }
-
-        private void OpenPlayerPresetDialog()
-        {
-            if (_playerPresets == null || _playerPresets.Count == 0)
-            {
-                return;
-            }
-
-            OpenListDialog(
-                "选择我方原作 AI 预设",
-                _playerPresets.Select(choice => choice.Label).ToList(),
-                _playerPresetIndex,
-                SelectPlayerPreset);
         }
 
         private void OpenCsvDialog(
@@ -802,6 +829,7 @@ namespace Shadowbus
                 index =>
                 {
                     onSelect(index);
+                    ClearStoryAiSelection(false);
                     RefreshCsvControls();
                     ClearValidation();
                 });
@@ -864,9 +892,6 @@ namespace Shadowbus
             string selectedDeckPath = GetSelectedPath(_deckCsvChoices, _deckCsvIndex);
             string selectedStylePath = GetSelectedPath(_styleCsvChoices, _styleCsvIndex);
             string selectedEmotePath = GetSelectedPath(_emoteCsvChoices, _emoteCsvIndex);
-            string selectedPlayerDeckPath = GetSelectedPath(_deckCsvChoices, _playerDeckCsvIndex);
-            string selectedPlayerStylePath = GetSelectedPath(_styleCsvChoices, _playerStyleCsvIndex);
-            string selectedPlayerEmotePath = GetSelectedPath(_emoteCsvChoices, _playerEmoteCsvIndex);
 
             _deckCsvChoices = BuildCsvChoices(PathHelper.AIDeckPath);
             _styleCsvChoices = BuildCsvChoices(PathHelper.AIStylePath);
@@ -875,9 +900,6 @@ namespace Shadowbus
             _deckCsvIndex = FindPathIndex(_deckCsvChoices, selectedDeckPath);
             _styleCsvIndex = FindPathIndex(_styleCsvChoices, selectedStylePath);
             _emoteCsvIndex = FindPathIndex(_emoteCsvChoices, selectedEmotePath);
-            _playerDeckCsvIndex = FindPathIndex(_deckCsvChoices, selectedPlayerDeckPath);
-            _playerStyleCsvIndex = FindPathIndex(_styleCsvChoices, selectedPlayerStylePath);
-            _playerEmoteCsvIndex = FindPathIndex(_emoteCsvChoices, selectedPlayerEmotePath);
         }
 
         private void RefreshCsvChoicesAndControls()
@@ -892,7 +914,7 @@ namespace Shadowbus
             Directory.CreateDirectory(directory);
             var choices = new List<CsvChoice>
             {
-                new CsvChoice { Label = "使用原作预设", Path = null }
+                new CsvChoice { Label = "使用官方预设", Path = null }
             };
             choices.AddRange(Directory.EnumerateFiles(directory, "*.csv", SearchOption.TopDirectoryOnly)
                 .OrderBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)
@@ -926,6 +948,11 @@ namespace Shadowbus
 
         private void UpdateDeckButton()
         {
+            if (!_uiReady)
+            {
+                return;
+            }
+
             string label = _decks != null && _decks.Count > 0
                 ? GetDeckChoiceLabel(_decks[Mathf.Clamp(_deckIndex, 0, _decks.Count - 1)])
                 : "无可用卡组";
@@ -938,12 +965,15 @@ namespace Shadowbus
             UpdateLogicButtons();
             UpdateLifeSlider();
             UpdateAIPresetButton();
-            UpdatePlayerPresetButton();
-            UpdatePlayerAIControls();
         }
 
         private void UpdatePlayerDeckButton()
         {
+            if (!_uiReady)
+            {
+                return;
+            }
+
             string label = _playerDecks != null && _playerDecks.Count > 0
                 ? GetDeckChoiceLabel(_playerDecks[Mathf.Clamp(_playerDeckIndex, 0, _playerDecks.Count - 1)])
                 : "无可用卡组";
@@ -955,9 +985,7 @@ namespace Shadowbus
             SetNativeButtonText(_deckCsvButton, GetChoiceLabel(_deckCsvChoices, _deckCsvIndex));
             SetNativeButtonText(_styleCsvButton, GetChoiceLabel(_styleCsvChoices, _styleCsvIndex));
             SetNativeButtonText(_emoteCsvButton, GetChoiceLabel(_emoteCsvChoices, _emoteCsvIndex));
-            SetNativeButtonText(_playerDeckCsvButton, GetChoiceLabel(_deckCsvChoices, _playerDeckCsvIndex));
-            SetNativeButtonText(_playerStyleCsvButton, GetChoiceLabel(_styleCsvChoices, _playerStyleCsvIndex));
-            SetNativeButtonText(_playerEmoteCsvButton, GetChoiceLabel(_emoteCsvChoices, _playerEmoteCsvIndex));
+            UpdateStoryAiControls();
         }
 
         private void UpdateAIPresetButton()
@@ -966,14 +994,6 @@ namespace Shadowbus
                 ? _presets[Mathf.Clamp(_presetIndex, 0, _presets.Count - 1)].Label
                 : "无可用预设";
             SetNativeButtonText(_presetButton, label);
-        }
-
-        private void UpdatePlayerPresetButton()
-        {
-            string label = _playerPresets != null && _playerPresets.Count > 0
-                ? _playerPresets[Mathf.Clamp(_playerPresetIndex, 0, _playerPresets.Count - 1)].Label
-                : "无可用预设";
-            SetNativeButtonText(_playerPresetButton, label);
         }
 
         private void ToggleLLMAI()
@@ -999,22 +1019,357 @@ namespace Shadowbus
             SetButtonSelected(_llmAIButton, available && _enableLLMAI);
         }
 
-        private void TogglePlayerAI()
+        /// <summary>
+        /// 载入官方剧情敌方 AI 列表（master 的 story_ai_setting + story_ai 目录里的 CSV）。
+        /// </summary>
+        private void LoadStoryAiChoices()
         {
-            _enablePlayerAI = !_enablePlayerAI;
-            UpdatePlayerAIControls();
+            _storyAiChoices = new List<StoryAiChoice>
+            {
+                // 固定的「无」：选中它即可取消剧情 AI，把变暗的自定义按钮恢复。
+                new StoryAiChoice()
+            };
+            try
+            {
+                List<StoryAISettingData> settings = Data.Master?.StoryAISettingList?.GetSettingDataTable()?.ToList();
+                if (settings == null)
+                {
+                    return;
+                }
+
+                string officialRoot = PathHelper.OfficialAIDataPath;
+                foreach (StoryAISettingData setting in settings.Where(s => s != null).OrderBy(s => s.EnemyAiId))
+                {
+                    string deckName = GetStoryDeckFileName(setting.DeckId);
+                    string styleName = GetAIStyleFileName(setting.StyleId);
+                    string emoteName = GetAIEmoteFileName(setting.EmoteId);
+                    string emotePath = FindOfficialCsv(officialRoot, "emote", emoteName);
+                    string deckPath = FindOfficialCsv(officialRoot, "deck", deckName);
+                    int enemyCharaId = ResolveStoryEnemyChara(emotePath);
+                    _storyAiChoices.Add(new StoryAiChoice
+                    {
+                        Setting = setting,
+                        DeckName = deckName,
+                        DeckCsvPath = deckPath,
+                        StyleCsvPath = FindOfficialCsv(officialRoot, "style", styleName),
+                        EmoteCsvPath = emotePath,
+                        EnemyCharaId = enemyCharaId,
+                        EnemyClassId = ResolveCharaClassId(enemyCharaId),
+                        DeckCardIds = ReadDeckCardIds(deckPath)
+                    });
+                }
+
+                Plugin.Logger.LogInfo(
+                    $"[AIManager] Story AI choices available: {_storyAiChoices.Count} " +
+                    $"(story data root '{officialRoot ?? "<none>"}').");
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[AIManager] Could not list the story AI settings: {exception.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 剧情 AI 的敌方主战者：story_ai_setting 里没有这一列，但它的表情表每条都有
+        /// <c>voice_id</c>（如 <c>500211_003_100</c>），前缀就是主战者 chara id。取第一个能在
+        /// 本地角色表里查到的前缀即可（20 篇第 8 章 -> 500211，与章节里的 enemy_chara_id 一致）。
+        /// </summary>
+        private static int ResolveStoryEnemyChara(string emoteCsvPath)
+        {
+            if (string.IsNullOrEmpty(emoteCsvPath) || !File.Exists(emoteCsvPath))
+            {
+                return 0;
+            }
+
+            try
+            {
+                foreach (string line in File.ReadLines(emoteCsvPath).Skip(1))
+                {
+                    string[] cells = line.Split(',');
+                    if (cells.Length <= 4)
+                    {
+                        continue;
+                    }
+
+                    string voiceId = cells[4].Trim().Trim('"');
+                    int separator = voiceId.IndexOf('_');
+                    string prefix = separator > 0 ? voiceId.Substring(0, separator) : string.Empty;
+                    if (prefix.Length == 0 || !prefix.All(char.IsDigit) ||
+                        !int.TryParse(prefix, out int charaId) || charaId <= 0)
+                    {
+                        continue;
+                    }
+
+                    if (GameMgr.GetIns().GetDataMgr().GetCharaPrmByCharaId(charaId) != null)
+                    {
+                        return charaId;
+                    }
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning(
+                    $"[AIManager] Could not read the story AI's enemy chara from '{emoteCsvPath}': {exception.Message}");
+            }
+
+            return 0;
+        }
+
+        private static int ResolveCharaClassId(int charaId)
+        {
+            if (charaId <= 0)
+            {
+                return 0;
+            }
+
+            try
+            {
+                ClassCharacterMasterData chara = GameMgr.GetIns().GetDataMgr().GetCharaPrmByCharaId(charaId);
+                return chara != null && chara.class_id >= 1 && chara.class_id <= 8 ? chara.class_id : 0;
+            }
+            catch (Exception)
+            {
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// 把官方牌组 CSV 展开成卡表（card_id × card_num）。超过 9 位的卡 id 后两位是版本号，
+        /// 取基础卡 id（和客户端 AICardDataAssetSet 的处理一致）。
+        /// </summary>
+        private static List<int> ReadDeckCardIds(string deckCsvPath)
+        {
+            var cardIds = new List<int>();
+            if (string.IsNullOrEmpty(deckCsvPath) || !File.Exists(deckCsvPath))
+            {
+                return cardIds;
+            }
+
+            try
+            {
+                foreach (string line in File.ReadLines(deckCsvPath).Skip(1))
+                {
+                    string[] cells = line.Split(',');
+                    if (cells.Length < 4)
+                    {
+                        continue;
+                    }
+
+                    string text = cells[0].Trim().Trim('"');
+                    string countText = cells[3].Trim().Trim('"');
+                    if (!text.All(char.IsDigit) || !int.TryParse(countText, out int count) || count <= 0)
+                    {
+                        continue;
+                    }
+
+                    if (text.Length > 9)
+                    {
+                        text = text.Substring(0, text.Length - 2);
+                    }
+
+                    if (!int.TryParse(text, out int cardId) || cardId <= 0)
+                    {
+                        continue;
+                    }
+
+                    for (int i = 0; i < count; i++)
+                    {
+                        cardIds.Add(cardId);
+                    }
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning(
+                    $"[AIManager] Could not read the story AI deck '{deckCsvPath}': {exception.Message}");
+            }
+
+            return cardIds;
+        }
+
+        private static string FindOfficialCsv(string officialRoot, string kind, string fileName)        {
+            if (string.IsNullOrEmpty(officialRoot) || string.IsNullOrEmpty(fileName))
+            {
+                return null;
+            }
+
+            string path = Path.Combine(Path.Combine(officialRoot, kind), fileName + ".csv");
+            if (File.Exists(path))
+            {
+                return path;
+            }
+
+            // 官方资源没导出时，仍然可以退回 master 里的 AI 资源（由 AIManager 自己加载）。
+            return null;
+        }
+
+        private static string GetStoryDeckFileName(int deckId)
+        {
+            try
+            {
+                return Data.Master?.AIDeckFileNameList?.GetFileName(deckId);
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private static string GetAIStyleFileName(int styleId)        {
+            try
+            {
+                return Data.Master?.AIStyleFileNameList?.GetFileName(styleId);
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private static string GetAIEmoteFileName(int emoteId)
+        {
+            try
+            {
+                return Data.Master?.AIEmoteFileNameList?.GetFileName(emoteId);
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private void OpenStoryAiDialog()
+        {
+            if (_storyAiChoices == null || _storyAiChoices.Count == 0)
+            {
+                ShowValidation("没有可用的剧情 AI 数据（master 的 story_ai_setting 为空）。");
+                return;
+            }
+
+            OpenListDialog(
+                "选择剧情AI预设",
+                _storyAiChoices.Select(choice => choice.Label).ToList(),
+                _storyAiIndex < 0 ? 0 : _storyAiIndex,
+                SelectStoryAi);
+        }
+
+        private void SelectStoryAi(int index)
+        {
+            if (_storyAiChoices == null || _storyAiChoices.Count == 0)
+            {
+                return;
+            }
+
+            _storyAiIndex = Mathf.Clamp(index, 0, _storyAiChoices.Count - 1);
+            // 剧情对战的官方生命上限就是 20；选剧情 AI 时把它拉回默认值
+            // （之前会残留上一个职业预设的生命上限，比如 30/40）。
+            if (StoryAiSelected && _maxLife != 20)
+            {
+                _maxLife = 20;
+                UpdateLifeSlider();
+            }
+            UpdateStoryAiControls();
             ClearValidation();
         }
 
-        private void UpdatePlayerAIControls()
+        /// <summary>是否真的启用了剧情 AI（列表第 0 项是固定的「无」）。</summary>
+        private bool StoryAiSelected =>
+            _storyAiIndex > 0 && _storyAiChoices != null && _storyAiIndex < _storyAiChoices.Count;
+
+        private StoryAiChoice SelectedStoryAi => StoryAiSelected ? _storyAiChoices[_storyAiIndex] : null;
+
+        /// <summary>
+        /// 动了自定义的任意一项就退回「无」——剧情 AI 与自定义 AI 互斥。
+        /// </summary>
+        private void ClearStoryAiSelection(bool updateControls = true)
         {
-            SetNativeButtonText(_playerAIButton, _enablePlayerAI ? "开启（双方 AI）" : "关闭（仅对手 AI）");
-            // Each row has its own "使用原作预设" entry, so Deck/Style/Emote can be
-            // mixed independently. Keep the legacy flag in sync for retry diagnostics.
-            _playerAIUseLocalCsv =
-                !string.IsNullOrEmpty(GetSelectedPath(_deckCsvChoices, _playerDeckCsvIndex)) ||
-                !string.IsNullOrEmpty(GetSelectedPath(_styleCsvChoices, _playerStyleCsvIndex)) ||
-                !string.IsNullOrEmpty(GetSelectedPath(_emoteCsvChoices, _playerEmoteCsvIndex));
+            _storyAiIndex = 0;
+            if (updateControls)
+            {
+                UpdateStoryAiControls();
+            }
+        }
+
+        private void UpdateStoryAiControls()
+        {
+            // Initialize 里 SelectDeck 会在 BuildNativeUi 之前跑，那时按钮还不存在。
+            if (!_uiReady)
+            {
+                return;
+            }
+
+            StoryAiChoice choice = _storyAiChoices != null &&
+                                   _storyAiIndex >= 0 &&
+                                   _storyAiIndex < _storyAiChoices.Count
+                ? _storyAiChoices[_storyAiIndex]
+                : null;
+            bool story = StoryAiSelected;
+
+            if (_storyAiButton != null)
+            {
+                SetNativeButtonText(_storyAiButton, choice == null ? "无（自定义对手AI数据）" : choice.Label);
+                SetButtonSelected(_storyAiButton, story);
+            }
+
+            // 剧情 AI 接管了敌方主战者 / 职业 / 卡组 / AI 数据 / 逻辑等级，所以这些自定义项
+            // 全部变暗；LLM AI 也会去抢对手的出牌决策，同样算冲突。
+            bool customEnabled = !story;
+            foreach (UIButton button in new[]
+                     {
+                         _deckButton, _presetButton,
+                         _deckCsvButton, _styleCsvButton, _emoteCsvButton,
+                         _llmAIButton
+                     })
+            {
+                SetButtonEnabled(button, customEnabled);
+            }
+
+            foreach (UIButton button in _classButtons)
+            {
+                SetButtonEnabled(button, customEnabled);
+            }
+
+            foreach (UIButton button in _logicButtons)
+            {
+                SetButtonEnabled(button, customEnabled);
+            }
+
+            // 主战者栏（含左右翻页）也一并变暗。
+            if (_leaderStripRoot != null)
+            {
+                UIManager.SetObjectToGrey(_leaderStripRoot, !customEnabled);
+            }
+
+            // 左右翻页按钮不在 _leaderStripRoot 里（是单独克隆出来的），所以
+            // 光靠上面那行变暗盖不到它们，得单独灰掉。
+            SetLeaderPageButtonEnabled(_leaderPreviousButton, customEnabled);
+            SetLeaderPageButtonEnabled(_leaderNextButton, customEnabled);
+        }
+
+        /// <summary>
+        /// 主战者左右翻页按钮没有走 ItemButton 那套，<c>isEnabled</c> 只拦点击不改变外观，
+        /// 这里额外把它整块变灰。
+        /// </summary>
+        private static void SetLeaderPageButtonEnabled(UIButton button, bool enabled)
+        {
+            if (button == null)
+            {
+                return;
+            }
+
+            button.isEnabled = enabled;
+            UIManager.SetObjectToGrey(button.gameObject, !enabled);
+        }
+
+        private static void SetButtonEnabled(UIButton button, bool enabled)
+        {
+            if (button == null)
+            {
+                return;
+            }
+
+            button.isEnabled = enabled;
+            UIManager.SetObjectToGrey(button.gameObject, !enabled);
         }
 
         private static string GetChoiceLabel(List<CsvChoice> choices, int index)
@@ -1250,7 +1605,7 @@ namespace Shadowbus
             }
             if (_presets == null || _presets.Count == 0)
             {
-                ShowValidation("所选职业没有可用的原作 AI 预设。");
+                ShowValidation("所选职业没有可用的官方 AI 预设。");
                 return;
             }
             if (_enableLLMAI && !LLMAITurnController.IsAvailable(out string llmReason))
@@ -1261,32 +1616,47 @@ namespace Shadowbus
 
             _isStarting = true;
             _dialog.IsButton1Enabled = false;
-            UpdatePlayerAIControls();
+            StoryAiChoice storyAi = SelectedStoryAi;
+
             var settings = new AIManager.CustomPracticeSettings
             {
                 Deck = _decks[_deckIndex].Deck,
                 PlayerDeck = _playerDecks != null && _playerDecks.Count > 0
                     ? _playerDecks[Mathf.Clamp(_playerDeckIndex, 0, _playerDecks.Count - 1)].Deck
                     : null,
-                EnemyClassId = _classId,
+                EnemyClassId = storyAi != null && storyAi.EnemyClassId > 0 ? storyAi.EnemyClassId : _classId,
                 PlayerClassId = _playerClassId,
                 Leader = _leaders[_leaderIndex],
+                // 剧情 AI 连敌方主战者一起接管。
+                EnemyCharaId = storyAi?.EnemyCharaId ?? 0,
+                EnemyDeckCardIds = storyAi?.DeckCardIds,
+                StoryAiId = storyAi?.Setting?.EnemyAiId ?? 0,
                 AIPreset = _presets[_presetIndex].Setting,
-                PlayerAIPreset = _playerPresets != null && _playerPresets.Count > 0
-                    ? _playerPresets[Mathf.Clamp(_playerPresetIndex, 0, _playerPresets.Count - 1)].Setting
-                    : null,
-                LocalDeckCsvPath = GetSelectedPath(_deckCsvChoices, _deckCsvIndex),
-                LocalStyleCsvPath = GetSelectedPath(_styleCsvChoices, _styleCsvIndex),
-                LocalEmoteCsvPath = GetSelectedPath(_emoteCsvChoices, _emoteCsvIndex),
-                LogicLevel = _logicLevel,
+                // 我方 AI 已删除，这项恒为 null（AIManager 里只有 EnablePlayerAI 为真时才用它）。
+                PlayerAIPreset = null,
+                // 剧情 AI 优先：直接用官方那一套 CSV 和逻辑等级接管对手 AI。
+                LocalDeckCsvPath = storyAi?.DeckCsvPath ?? GetSelectedPath(_deckCsvChoices, _deckCsvIndex),
+                LocalStyleCsvPath = storyAi?.StyleCsvPath ?? GetSelectedPath(_styleCsvChoices, _styleCsvIndex),
+                LocalEmoteCsvPath = storyAi?.EmoteCsvPath ?? GetSelectedPath(_emoteCsvChoices, _emoteCsvIndex),
+                LogicLevel = storyAi != null ? storyAi.Setting.LogicLevel : _logicLevel,
                 MaxLife = _maxLife,
                 EnableLLMAI = _enableLLMAI,
-                EnablePlayerAI = _enablePlayerAI,
-                PlayerAIUseLocalCsv = _playerAIUseLocalCsv,
-                LocalPlayerDeckCsvPath = GetSelectedPath(_deckCsvChoices, _playerDeckCsvIndex),
-                LocalPlayerStyleCsvPath = GetSelectedPath(_styleCsvChoices, _playerStyleCsvIndex),
-                LocalPlayerEmoteCsvPath = GetSelectedPath(_emoteCsvChoices, _playerEmoteCsvIndex)
+                // 只需要配置对手 AI：我方 AI 恒为关闭。
+                EnablePlayerAI = false,
+                PlayerAIUseLocalCsv = false,
+                LocalPlayerDeckCsvPath = null,
+                LocalPlayerStyleCsvPath = null,
+                LocalPlayerEmoteCsvPath = null
             };
+
+            if (storyAi != null)
+            {
+                Plugin.Logger.LogInfo(
+                    $"[AIManager] Custom practice uses the story AI {storyAi.Setting.EnemyAiId} " +
+                    $"({storyAi.DeckName}), deckCsv='{storyAi.DeckCsvPath ?? "<master>"}', " +
+                    $"logic={storyAi.Setting.LogicLevel}.");
+            }
+
             _dialog.CloseSoon();
             AIManager.StartCustomPractice(_page, settings);
         }
@@ -1297,10 +1667,7 @@ namespace Shadowbus
             {
                 _validationLabel.text = message;
             }
-            if (_leaderNameLabel != null)
-            {
-                _leaderNameLabel.text = string.Empty;
-            }
+            // 报错栏已经移到页面最上方，不再需要清空主战者名字来给它让位。
         }
 
         private void ClearValidation()

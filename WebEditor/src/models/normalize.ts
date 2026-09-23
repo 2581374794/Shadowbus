@@ -1,5 +1,6 @@
 import type { AttackEffectFields, BossRushAbility, BossRushBoss, BossRushPackage, CardMasterPatch, CustomFormat, JsonRecord, TwoPickRule } from "../types";
 import { newAbility, newBoss, newBossRush, newCardPatch, newFormat, newTwoPick } from "./defaults";
+import { extraVoiceIdsValue, normalizeImageFiles, normalizeVoiceFiles } from "./cardAssets";
 
 const object = (value: unknown): JsonRecord => value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : {};
 const string = (value: unknown, fallback = "") => typeof value === "string" ? value : fallback;
@@ -67,7 +68,7 @@ export function normalizeCardMaster(value: unknown): CardMasterPatch[] {
     const foilEffectCardId = Number.isSafeInteger(Number(source.foilEffectCardId)) && Number(source.foilEffectCardId) > 0
       ? Number(source.foilEffectCardId)
       : undefined;
-    return { ...base, ...source, newCard: boolean(source.newCard), cardId: number(source.cardId), templateCardId: number(source.templateCardId), foilEffectCardId, boolFields: Object.fromEntries(Object.entries(object(source.boolFields)).map(([key, value]) => [key, boolean(value)])), intFields: numberMap(source.intFields), intArrayFields: Object.fromEntries(Object.entries(object(source.intArrayFields)).map(([key, value]) => [key, numberArray(value)])), stringChangeFields: stringMap(source.stringChangeFields), stringAppendFields: stringMap(source.stringAppendFields), stringArrayFields: Object.fromEntries(Object.entries(object(source.stringArrayFields)).map(([key, value]) => [key, stringArray(value)])), localizationFields: stringMap(source.localizationFields), attackEffectFields };
+    return { ...base, ...source, newCard: boolean(source.newCard), cardId: number(source.cardId), templateCardId: number(source.templateCardId), foilEffectCardId, boolFields: Object.fromEntries(Object.entries(object(source.boolFields)).map(([key, value]) => [key, boolean(value)])), intFields: numberMap(source.intFields), intArrayFields: Object.fromEntries(Object.entries(object(source.intArrayFields)).map(([key, value]) => [key, numberArray(value)])), stringChangeFields: stringMap(source.stringChangeFields), stringAppendFields: stringMap(source.stringAppendFields), stringArrayFields: Object.fromEntries(Object.entries(object(source.stringArrayFields)).map(([key, value]) => [key, stringArray(value)])), localizationFields: stringMap(source.localizationFields), extraVoiceIds: extraVoiceIdsValue(source.extraVoiceIds), imageFiles: normalizeImageFiles(source.imageFiles), voiceFiles: normalizeVoiceFiles(source.voiceFiles), attackEffectFields };
   });
 }
 

@@ -47,8 +47,8 @@ namespace Shadowbus
 
         private static string ResolveExternalTexturePath(int id, bool isEvolution)
         {
-            // 先在卡自己的文件夹（Mods/CardMaster/<卡文件夹>）里找 card.png / card_evo.png，
-            // 再回退到旧的 Mods/CardImages/<资源卡号>.png。
+            // 卡图只在卡自己的文件夹（Mods/CardMaster/<卡文件夹>）里找，没有全局目录。
+            // 查找顺序见 ModCardAssets.ResolveImagePath。
             return ModCardAssets.ResolveImagePath(id, isEvolution);
         }
 

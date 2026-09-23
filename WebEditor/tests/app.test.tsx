@@ -164,6 +164,41 @@ describe("CardMaster 导入 DSL", () => {
   });
 });
 
+describe("CardMaster 本地资源与闪卡提示", () => {
+  const newPatch = () => normalizeCardMaster([{ newCard: true, cardId: 999991000, templateCardId: 100011010 }]);
+
+  it("新卡提示闪卡自动生成，不要求填写 FoilCardId", () => {
+    render(<CardMasterEditor value={newPatch()} onChange={() => {}} />);
+    expect(screen.getByText("闪卡会自动生成：卡号 999991001")).toBeInTheDocument();
+    expect(screen.getByText(/只写普通版就够了/)).toBeInTheDocument();
+  });
+
+  it("借用语音按行编辑并自动去重", async () => {
+    const onChange = vi.fn();
+    render(<CardMasterEditor value={newPatch()} onChange={onChange} />);
+    fireEvent.click(screen.getByText("借用原版语音"));
+    const box = await screen.findByPlaceholderText(/125641030_4/);
+    fireEvent.change(box, { target: { value: "125641030_4 125641030_4\n125641031_2" } });
+    expect(onChange.mock.calls[0][0][0].extraVoiceIds).toEqual(["125641030_4", "125641031_2"]);
+  });
+
+  it("本地卡图写入相对卡文件夹的路径", async () => {
+    const onChange = vi.fn();
+    render(<CardMasterEditor value={newPatch()} onChange={onChange} />);
+    fireEvent.click(screen.getByText("本地卡图"));
+    const input = await screen.findByPlaceholderText(/card\.png 或/);
+    fireEvent.change(input, { target: { value: "图/card.png" } });
+    expect(onChange.mock.calls[0][0][0].imageFiles).toEqual({ normal: "图/card.png" });
+  });
+
+  it("本地语音列出六个时点和两个技能语音数组", async () => {
+    render(<CardMasterEditor value={newPatch()} onChange={() => {}} />);
+    fireEvent.click(screen.getByText("本地语音"));
+    expect(await screen.findByText("出场语音")).toBeInTheDocument();
+    expect(screen.getByText("进化后技能语音（按槽位）")).toBeInTheDocument();
+  });
+});
+
 describe("card portal tooltip", () => {
   it("shows the portal URL for a valid card ID", async () => {
     render(<CardIdTooltip cardId={100011010}><button type="button">card</button></CardIdTooltip>);

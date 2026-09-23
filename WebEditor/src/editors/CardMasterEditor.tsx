@@ -1,16 +1,37 @@
-import type { AttackEffectFields, CardMasterPatch } from "../types";
+import type { AttackEffectFields, CardImageFiles, CardMasterPatch, CardVoiceFiles } from "../types";
 import { useMemo, useState, type ReactNode } from "react";
 import { CheckOutlined, CloseOutlined, EditOutlined, ImportOutlined, PlusOutlined } from "@ant-design/icons";
 import { Alert, Button, Input, Modal, Space, Tag, Tooltip, Typography } from "antd";
 import { cardParameterFields, localizationKeys, skillParallelKeys } from "../data/catalog";
 import { newCardPatch } from "../models/defaults";
 import { skillRowsFromDsl } from "../models/cardDsl";
+import { extraVoiceIdsValue, parseVoiceIds, voiceFileListKeys } from "../models/cardAssets";
 import { applySkillGroups, emptySkillRow, isSkillField, onlySkillFields, parseSkillGroups, type SkillFieldSource, type SkillGroups, type SkillRow } from "../models/skills";
 import { Card, CheckboxField, Field, NumberField, RowActions, Section, TextField, cardTitle, moveItem } from "../components/Fields";
 import { useCardCatalog } from "../components/CardCatalog";
-import { StringMapEditor, UnknownFieldsEditor } from "../components/Collections";
+import { StringMapEditor, TextLinesField, UnknownFieldsEditor } from "../components/Collections";
 
-const known = ["newCard", "cardId", "templateCardId", "foilEffectCardId", "boolFields", "intFields", "intArrayFields", "stringChangeFields", "stringAppendFields", "stringArrayFields", "localizationFields", "attackEffectFields"];
+const known = ["newCard", "cardId", "templateCardId", "foilEffectCardId", "boolFields", "intFields", "intArrayFields", "stringChangeFields", "stringAppendFields", "stringArrayFields", "localizationFields", "attackEffectFields", "extraVoiceIds", "imageFiles", "voiceFiles"];
+
+/** `CardVoiceFilePatch` slots, in the order the plugin class declares them. */
+const voiceFileFields = [
+  ["play", "出场语音"],
+  ["evolve", "进化语音"],
+  ["attack", "攻击语音"],
+  ["evolvedAttack", "进化后攻击语音"],
+  ["destroy", "被破坏语音"],
+  ["evolvedDestroy", "进化后被破坏语音"],
+] as const;
+
+/** The file name each slot picks up on its own when the folder uses the conventional name. */
+const voiceFileConventions: Record<(typeof voiceFileFields)[number][0], string> = {
+  play: "play.wav",
+  evolve: "evolve.wav",
+  attack: "attack.wav",
+  evolvedAttack: "attack_evolved.wav",
+  destroy: "destroy.wav",
+  evolvedDestroy: "destroy_evolved.wav",
+};
 
 /** The patch map each write mode stores the six parallel skill fields in. */
 const skillSourceMap = { append: "stringAppendFields", change: "stringChangeFields" } as const;
@@ -262,6 +283,19 @@ function PatchForm({ value, onChange }: { value: CardMasterPatch; onChange: (val
       [target]: applySkillGroups(value[target], { ...groups, leadingComma: next === "append" }),
     });
   };
+  // Local asset declarations are paths relative to the card's own folder. A slot the
+  // user clears is dropped from the object (and the object itself when nothing is
+  // left), so a patch that declares no local files writes none of these keys.
+  const setAssetSlot = (key: "imageFiles" | "voiceFiles", slot: string, item: string | string[] | undefined) => {
+    const current: Record<string, unknown> = { ...value[key] };
+    const empty = item == null || (Array.isArray(item) ? !item.length : !item);
+    const next = empty
+      ? Object.fromEntries(Object.entries(current).filter(([name]) => name !== slot))
+      : { ...current, [slot]: item };
+    // Keys the editor does not know are kept: they belong to a newer plugin version.
+    if (key === "imageFiles") set("imageFiles", Object.keys(next).length ? next as CardImageFiles : undefined);
+    else set("voiceFiles", Object.keys(next).length ? next as CardVoiceFiles : undefined);
+  };
   return <div className="stack">
     <Section title="补丁目标">
       <div className="field-grid">
@@ -270,6 +304,34 @@ function PatchForm({ value, onChange }: { value: CardMasterPatch; onChange: (val
         <NumberField label="模板卡 ID" field="templateCardId" value={value.templateCardId} cardId onChange={(item) => set("templateCardId", item)} />
         <NumberField label="闪卡效果来源卡 ID（0 = 不覆盖）" field="foilEffectCardId" value={value.foilEffectCardId ?? 0} min={0} cardId onChange={(item) => set("foilEffectCardId", item > 0 ? item : undefined)} />
       </div>
+      {/* The foil record is derived by the plugin, so the only thing to get right here
+          is leaving cardId + 1 free. Validation reports the id when it is not. */}
+      {value.newCard && value.boolFields?.IsFoil !== true && <Alert
+        className="foil-companion-alert"
+        type="info"
+        showIcon
+        message={`闪卡会自动生成：${value.cardId > 0 ? `卡号 ${value.cardId + 1}` : "新卡 ID + 1"}`}
+        description={<>只写普通版就够了。插件会克隆模板卡的闪卡版本，按 <code>cardId + 1</code> 自动生成闪卡记录，所以不用手填 <code>FoilCardId</code>，也请把这个卡号留给它。想手工配对两条记录时，在下面的「布尔属性」里显式写 <code>IsFoil: true</code>，插件就不再自动派生。</>}
+      />}
+    </Section>
+    <Section title="借用原版语音" description={`extraVoiceIds · ${(value.extraVoiceIds ?? []).length} 项`} collapsible defaultOpen={false}>
+      <TextLinesField label="原版语音 ID" field="extraVoiceIds" value={value.extraVoiceIds ?? []} parse={parseVoiceIds} rows={2} placeholder={"125641030_4\n125641031_2"} hint="借用别的原版卡的语音库：填原版语音列里的 ID，例如 125641030_4；只写 125641030 也可以，游戏按第一个 _ 之前的卡号去找 v/vo_<卡号>.acb。每行一个（空格或逗号分隔也行），重复项会自动去重。" onChange={(items) => set("extraVoiceIds", extraVoiceIdsValue(items))} />
+    </Section>
+    <Section title="本地卡图" description="imageFiles · 相对卡文件夹" collapsible defaultOpen={false}>
+      <div className="field-grid">
+        <TextField label="进化前卡图" field="imageFiles.normal" value={value.imageFiles?.normal ?? ""} placeholder="例如 card.png 或 图/card.png" onChange={(item) => setAssetSlot("imageFiles", "normal", item)} />
+        <TextField label="进化后卡图" field="imageFiles.evolved" value={value.imageFiles?.evolved ?? ""} placeholder="例如 card_evo.png" onChange={(item) => setAssetSlot("imageFiles", "evolved", item)} />
+      </div>
+      <Typography.Text type="secondary" className="field-hint">文件放在这张卡自己的文件夹（<code>Mods/CardMaster/&lt;卡文件夹&gt;/</code>）里，这里写相对该文件夹的路径，可以带子目录。留空时用约定名 <code>card.png</code> / <code>card_evo.png</code>；进化图留空则沿用进化前那张。</Typography.Text>
+    </Section>
+    <Section title="本地语音" description="voiceFiles · 相对卡文件夹" collapsible defaultOpen={false}>
+      <div className="field-grid">
+        {voiceFileFields.map(([slot, label]) => <TextField key={slot} label={label} field={`voiceFiles.${slot}`} value={value.voiceFiles?.[slot] ?? ""} placeholder={`例如 ${voiceFileConventions[slot]}`} onChange={(item) => setAssetSlot("voiceFiles", slot, item)} />)}
+      </div>
+      <div className="field-grid">
+        {voiceFileListKeys.map((slot) => <TextLinesField key={slot} label={slot === "skills" ? "技能语音（按槽位）" : "进化后技能语音（按槽位）"} field={`voiceFiles.${slot}`} value={value.voiceFiles?.[slot] ?? []} rows={2} placeholder="例如 skill_1.wav" hint="每行一个文件，按顺序对应技能槽位；留空表示这个槽位不覆盖。" onChange={(items) => setAssetSlot("voiceFiles", slot, items)} />)}
+      </div>
+      <Typography.Text type="secondary" className="field-hint">留空的时点继续使用模板卡的语音；卡文件夹里放了约定名 <code>play.wav</code>、<code>evolve.wav</code>、<code>attack.wav</code>、<code>attack_evolved.wav</code>、<code>destroy.wav</code>、<code>destroy_evolved.wav</code> 时也会自动生效。推荐 16-bit PCM WAV。</Typography.Text>
     </Section>
     <GenericFieldMap title="布尔属性" field="boolFields" value={value.boolFields} type="boolean" suggestions={cardParameterFields.boolean} onChange={(item) => set("boolFields", item)} />
     <GenericFieldMap title="整数 / 枚举属性" field="intFields" value={value.intFields} type="number" suggestions={cardParameterFields.number} onChange={(item) => set("intFields", item)} />

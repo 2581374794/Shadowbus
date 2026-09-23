@@ -1,6 +1,7 @@
 using HarmonyLib;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -64,6 +65,7 @@ namespace Shadowbus
 
         private static void ExportNames()
         {
+            Stopwatch watch = Stopwatch.StartNew();
             CardMaster master = CardMaster.GetInstance(CardMaster.CardMasterId.Default);
             List<CardParameter> cards = master?.GetAllParameters()?
                 .Where(card => card != null)
@@ -107,10 +109,12 @@ namespace Shadowbus
             _namesExported = true;
             Plugin.Logger.LogInfo(
                 $"[CardSkill] Exported {cards.Count} card name row(s) ({named} named) to '{path}'.");
+            Plugin.Logger.LogInfo($"[Perf] card_names.csv export took {watch.ElapsedMilliseconds} ms");
         }
 
         private static void Export(CardMaster master)
         {
+            Stopwatch watch = Stopwatch.StartNew();
             List<CardParameter> cards = master.GetAllParameters()?
                 .Where(card => card != null)
                 .OrderBy(card => card.CardId)
@@ -211,6 +215,7 @@ namespace Shadowbus
             _exported = true;
             Plugin.Logger.LogInfo(
                 $"[CardSkill] Exported {rows} skill row(s) from {skillCards} card(s) of {cards.Count} to '{path}'.");
+            Plugin.Logger.LogInfo($"[Perf] card_skills.csv export took {watch.ElapsedMilliseconds} ms");
         }
 
         /// <summary>

@@ -1,10 +1,15 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <!-- 本机游戏目录：可选。不想设环境变量也不想改这个文件，就在同目录放一个
+       Shadowverse.local.props（已 gitignore），内容是
+       <Project><PropertyGroup><ShadowverseDir>D:\...\Shadowverse</ShadowverseDir></PropertyGroup></Project> -->
+  <Import Project="Shadowverse.local.props" Condition="Exists('Shadowverse.local.props')" />
+
   <PropertyGroup>
     <TargetFramework>net46</TargetFramework>
     <AssemblyName>Shadowbus</AssemblyName>
     <Product>My first plugin</Product>
-    <Version>2.5.5</Version>
+    <Version>2.5.6</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <LangVersion>latest</LangVersion>
     <RestoreAdditionalProjectSources>
@@ -15,7 +20,28 @@
     <RootNamespace>Shadowbus</RootNamespace>
   </PropertyGroup>
 
-  <ItemGroup>
+  <!-- 游戏目录的查找顺序（仓库里不写死任何用户名/机器专属路径）：
+       1) Shadowverse.local.props 里的 ShadowverseDir（本机配置，已 gitignore）
+       2) 环境变量 SHADOWVERSE_DIR
+       3) Steam 默认库：<仓库>\..\..\..\SteamLibrary\steamapps\common\Shadowverse
+                        %ProgramFiles(x86)%\Steam\steamapps\common\Shadowverse
+       4) 仓库上级、上上级目录下的 Shadowverse
+       都没有就在构建时报一条清楚的错，而不是抛一大堆找不到 Wizard/Cute 的编译错误。
+       游戏目录**不需要**在 Steam 库里（也不需要任何目录联接）：随便放哪，按上面任一方式指定即可。 -->
+  <PropertyGroup>
+    <_SteamX86>$([System.Environment]::GetEnvironmentVariable('ProgramFiles(x86)'))</_SteamX86>
+    <ShadowverseDir Condition="'$(ShadowverseDir)' == '' AND '$(SHADOWVERSE_DIR)' != ''">$(SHADOWVERSE_DIR)</ShadowverseDir>
+    <ShadowverseDir Condition="'$(ShadowverseDir)' == '' AND Exists('$(MSBuildThisFileDirectory)..\..\..\SteamLibrary\steamapps\common\Shadowverse\Shadowverse_Data\Managed\Assembly-CSharp.dll')">$(MSBuildThisFileDirectory)..\..\..\SteamLibrary\steamapps\common\Shadowverse</ShadowverseDir>
+    <ShadowverseDir Condition="'$(ShadowverseDir)' == '' AND '$(_SteamX86)' != '' AND Exists('$(_SteamX86)\Steam\steamapps\common\Shadowverse\Shadowverse_Data\Managed\Assembly-CSharp.dll')">$(_SteamX86)\Steam\steamapps\common\Shadowverse</ShadowverseDir>
+    <ShadowverseDir Condition="'$(ShadowverseDir)' == '' AND Exists('$(MSBuildThisFileDirectory)..\Shadowverse\Shadowverse_Data\Managed\Assembly-CSharp.dll')">$(MSBuildThisFileDirectory)..\Shadowverse</ShadowverseDir>
+    <ShadowverseDir Condition="'$(ShadowverseDir)' == '' AND Exists('$(MSBuildThisFileDirectory)..\..\Shadowverse\Shadowverse_Data\Managed\Assembly-CSharp.dll')">$(MSBuildThisFileDirectory)..\..\Shadowverse</ShadowverseDir>
+    <ShadowverseManagedDir>$(ShadowverseDir)\Shadowverse_Data\Managed</ShadowverseManagedDir>
+  </PropertyGroup>
+
+  <Target Name="CheckShadowverseDir" BeforeTargets="BeforeBuild">
+    <Error Condition="!Exists('$(ShadowverseManagedDir)\Assembly-CSharp.dll')"
+           Text="找不到 Shadowverse 游戏目录（当前是 '$(ShadowverseDir)'）。任选一种方式指定：1) 在 Shadowbus.csproj 同目录建 Shadowverse.local.props，写入 &lt;Project&gt;&lt;PropertyGroup&gt;&lt;ShadowverseDir&gt;游戏目录&lt;/ShadowverseDir&gt;&lt;/PropertyGroup&gt;&lt;/Project&gt;；2) 设环境变量 SHADOWVERSE_DIR；3) 把游戏目录放到仓库上级目录。" />
+  </Target>  <ItemGroup>
     <PackageReference Include="BepInEx.Analyzers" Version="1.*" PrivateAssets="all" />
     <PackageReference Include="BepInEx.AssemblyPublicizer.MSBuild" Version="0.4.3">
       <PrivateAssets>all</PrivateAssets>
@@ -33,11 +59,16 @@
 
   <ItemGroup>
     <Reference Include="Assembly-CSharp" Publicize="True">
-      <HintPath>..\..\..\SteamLibrary\steamapps\common\Shadowverse\Shadowverse_Data\Managed\Assembly-CSharp.dll</HintPath>
+      <HintPath>$(ShadowverseManagedDir)\Assembly-CSharp.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="Assembly-CSharp-firstpass">
-      <HintPath>..\..\..\SteamLibrary\steamapps\common\Shadowverse\Shadowverse_Data\Managed\Assembly-CSharp-firstpass.dll</HintPath>
+      <HintPath>$(ShadowverseManagedDir)\Assembly-CSharp-firstpass.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <!-- CRIWARE 运行时：ResourceRootPatches 用它把额外资源目录里的 ACB 注册进 Atom。 -->
+    <Reference Include="CriMw.CriWare.Runtime">
+      <HintPath>$(ShadowverseManagedDir)\CriMw.CriWare.Runtime.dll</HintPath>
       <Private>False</Private>
     </Reference>
   </ItemGroup>

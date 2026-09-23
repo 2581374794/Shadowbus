@@ -54,6 +54,32 @@ export function StringListEditor({ label, field, value, onChange, multiline = tr
   </Section>;
 }
 
+/** One non-empty, trimmed value per line; the default reader of a list of file paths. */
+export function parseLines(text: string) {
+  return text.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+}
+
+/**
+ * A list edited as raw text, one value per line.
+ *
+ * The textarea keeps a draft of what is being typed and only the derived list goes
+ * into the model. A value bound straight to the model would swallow the newline that
+ * starts the next entry, and — for a path like `图 1.png` — also the space before the
+ * next character, because a stored entry is trimmed.
+ */
+export function TextLinesField({ label, field, value, onChange, hint, parse = parseLines, placeholder, rows = 3 }: { label: string; field?: string; value: string[]; onChange: (value: string[]) => void; hint?: string; parse?: (text: string) => string[]; placeholder?: string; rows?: number }) {
+  const serialized = value.join("\n");
+  const [draft, setDraft] = useState(serialized);
+  useEffect(() => {
+    // Adopt a value that came from elsewhere (another card, another file), but keep
+    // the draft while it still reads back as the current model.
+    setDraft((current) => parse(current).join("\n") === serialized ? current : serialized);
+  }, [serialized]);
+  return <Field label={label} field={field} hint={hint}>
+    <Input.TextArea value={draft} rows={rows} spellCheck={false} placeholder={placeholder} onChange={(event) => { setDraft(event.target.value); onChange(parse(event.target.value)); }} />
+  </Field>;
+}
+
 export function StringMapEditor({ label, field, value, onChange, valueMultiline = false }: { label: string; field?: string; value: Record<string, string>; onChange: (value: Record<string, string>) => void; valueMultiline?: boolean }) {
   const entries = Object.entries(value);
   const update = (index: number, key: string, itemValue: string) => onChange(Object.fromEntries(entries.map(([oldKey, oldValue], itemIndex) => itemIndex === index ? [key, itemValue] : [oldKey, oldValue])));

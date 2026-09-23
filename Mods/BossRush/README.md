@@ -527,6 +527,107 @@ Style 和 Emote CSV 不改变牌组，只替换官方 AI 设置引用的行为/�
 若只想手工重置某个配置，可以在游戏关闭后删除对应的
 `Mods/BossRush/State/<id>.json`；下次进入时会按配置重新创建。
 
+## 活动时间与离线任务
+
+**本地 BossRush 没有活动期。** `QuestInfoTask` 的离线应答把窗口报成「一天前 ~ 十年后」，
+My Page 那张「任务」卡也被强制 `IsOpen = true`，所以不会因为活动结束而进不去。
+
+- **不显示期限**：My Page 任务卡的结束时间（文案键 `MyPage_0048`＝「{0}まで」，取自
+  `QuestOpenInfo.EndTime`）和任务选择页顶部那行「活动时间」（`Quest_0007`，取自
+  `QuestInfoTask.StartTime/EndTime`）都会在本地包激活时被清空/隐藏 —— 既然没有期限，
+  再画一个十年后的日期只会误导。补丁在 `BossRushPatches`：
+  `MyPageItemSoroPlay.Show` 的 postfix 关掉 `_questEndTimeRoot`，
+  `QuestSelectionPage.SetupLayout` 的 postfix 清空 `_periodLabel`。
+- **`QuestMissionInfoTask`（api 68）离线返回空**：这是「任务一览」弹窗
+  （`QuestAllConfirmDialog`）的数据，任务本身是服务端内容，客户端里没有，所以离线给出
+  空列表：`{"data_headers":{…,"result_code":1},"data":[]}`（`result_code` 必须是 1，
+  `QuestMissionInfoTask.Parse` 才会解析 `data`；`data` 会被当成任务数组）。
+  这条应答写在插件里（`FakeConnect.EmptyOfflineResponses`），**不落 `Mods/OfflinizedTasks`
+  文件**，免得以后有人把它当成可编辑数据。不加这条的话请求会打到官方服务器、拿回空响应，
+  `MessagePack` 解码失败并弹出「復号化に失敗しました」。
+
+## 入口与大厅的精简
+
+入口卡（任务页上的 BossRush 按钮，`QuestEventBossRushButton`）上行固定显示 **`BOSS RUSH`**
+（原版是 `BossRush_0016`，简繁两种语言下都显示成「大赛模式」——这块 prefab 是从大赛活动的入口改的；
+`BOSS RUSH` 是纯拉丁字母，两种语言设置下都不用查本地化表），下行那几句奖励说明
+（`BossRush_0013/0014/0015`＝「初回挑战可获得报酬」「通关后可获得专属报酬」「胜利后可获得点数。」）
+整行清空。
+
+大厅（`BossRushLobby`）里这几样都是服务端活动才有的东西，本地包激活时会被隐藏/清空：
+
+| 字段 | 原本是什么 |
+| --- | --- |
+| `_stageSelectButton` | 「单人挑战任务」——本地关卡表由 `bossrush.json` 决定，点它只会去要服务端关卡列表 |
+| `_receiveRewardButton` / `_receiveRewardText` | 「确认报酬」——离线一律报「没有报酬」 |
+| `_winTitleLabel` / `_winRewardLabel` | 「通关后可获得专属报酬」「胜利后可获得点数。」这类活动说明 |
+
+只做 `SetActive(false)` / 清空文字，不动布局也不碰逻辑；入口卡那两个标签在
+`SetNameLabel` / `SetRewardStatusLabel` 的 postfix 里改，大厅那批在 `Initialize` 与
+`InitializeBattleButton` 的 postfix 里各收一次（后者跑在后面，防止原版刷新时又把按钮打开）。
+日志 `[BossRush] Lobby cleanup: hid N item(s); resolved […]; NOT FOUND […]` 会列出每个字段
+有没有解析到 —— 换游戏版本后先看这一行。
+
+任务选择页（BossRush 入口所在那一页）右下角那两个按钮 `_questConfirmButton`（「单人挑战任务」一览，
+`QuestAllConfirmDialog` → `QuestMissionInfoTask`）和 `_pointConfirmButton`（「确认报酬」，
+`QuestPointConfirmDialog` → `QuestPointInfoTask`）也一样隐藏（`SetupLayout` 与
+`SelectBossRushButton` 的 postfix 各收一次，日志 `[BossRush] Removed N quest-page mission button(s).`）。
+这两个任务本身也做了离线应答（`QuestMissionInfoTask` 空数组、`QuestPointInfoTask` 空点数窗口），
+所以就算别处再触发它们，也不会弹「復号化に失敗しました」。
+
+## 增益说明的简繁文本
+
+每个增益（`abilities[]`）除了抓包拿到的英文原文 `special_ability_desc`，还可以给两版中文：
+
+```json
+{
+  "ability_id": 117031020,
+  "skill": "(skill:draw)…",
+  "special_ability_desc": "Increase maximum life by 5, …",
+  "special_ability_desc_chs": "最大生命值 +5，回复 5 点生命，并在第 1 回合额外抽 1 张牌。",
+  "special_ability_desc_cht": "最大生命值 +5，回復 5 點生命，並在第 1 回合額外抽 1 張牌。",
+  "max_life_change": 5,
+  "life_change": 5
+}
+```
+
+- 取用顺序（`BossRushOfflineData.ResolveAbilityDescription`）：**当前文字语言**是繁体 → 先取
+  `special_ability_desc_cht`，简体 → 先取 `special_ability_desc_chs`；只有一版中文时用那一版；
+  两版都没有才回退英文 `special_ability_desc`。
+- 语言取自与剧情文本同一处（`CustomPreference.GetTextLanguage()`，见
+  `StoryTextLanguagePatches.IsTraditionalChinese`），所以在「设定 → 语言」里切简繁后
+  **重新进一次大厅**（列表/详情是在应答任务时组装的）就会跟着变。
+- `PP` / `EP` 这类缩写保持英文字母，不翻译。
+- 默认包（插件自动生成的 `default/bossrush.json`）自带这 6 条的中文；
+  `Mods/BossRush/README.md` 同级这份说明与 `Sample 1/bossrush.json` 也已同步。
+
+**对手增益**（每个 `bosses[]` / `hidden_boss`）同样有三份文本：
+
+```json
+"enemy_skill": "(skill:draw)…",
+"enemy_skill_desc": "At the start of the first turn, draw 1 extra card.",
+"enemy_skill_desc_chs": "第 1 回合开始时，额外抽 1 张牌。",
+"enemy_skill_desc_cht": "第 1 回合開始時，額外抽 1 張牌。"
+```
+
+取值规则与增益说明完全一致（`BossRushOfflineData.ResolveEnemySkillDescription`），
+英文原文 `enemy_skill_desc` 只作兜底。默认包三个 Boss + 隐藏 Boss 的简繁文本都已补上。
+
+**本地化字段一览**（都是可选，缺了就用原字段；简繁各自优先、再互相兜底、最后回退原字段）：
+
+| 原字段 | 简体 | 繁体 |
+| --- | --- | --- |
+| `display_name` | `display_name_chs` | `display_name_cht` |
+| `detail_title` | `detail_title_chs` | `detail_title_cht` |
+| `detail_text` | `detail_text_chs` | `detail_text_cht` |
+| `bosses[].name` / `hidden_boss.name` | `name_chs` | `name_cht` |
+| `abilities[].special_ability_desc` | `special_ability_desc_chs` | `special_ability_desc_cht` |
+| `bosses[].enemy_skill_desc` / `hidden_boss.enemy_skill_desc` | `enemy_skill_desc_chs` | `enemy_skill_desc_cht` |
+
+界面取的都是本地化后的值：大厅标题/My Page 卡片/配置选择框（`display_name`）、详情弹窗
+（`detail_title` + `detail_text`）、Boss 列表与对手设置窗口（`name`）、增益与对手增益说明。
+语言取自与剧情文本同一处，切简繁后**重新进一次大厅**即可。
+
 ## 默认配置
 
 首次运行且不存在 `default/bossrush.json` 时，插件会生成一个可玩的默认包：

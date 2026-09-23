@@ -92,7 +92,7 @@ namespace Shadowbus
                 }
 
                 loadedPackages.Sort((left, right) =>
-                    string.Compare(left.DisplayName, right.DisplayName, StringComparison.OrdinalIgnoreCase));
+                    string.Compare(left.LocalizedDisplayName, right.LocalizedDisplayName, StringComparison.OrdinalIgnoreCase));
                 Packages.Clear();
                 Packages.AddRange(loadedPackages);
                 PackageDirectories.Clear();
@@ -999,7 +999,7 @@ namespace Shadowbus
             {
                 BossRushBoss boss = _current.Bosses[index];
                 JsonData value = new JsonData();
-                value["name"] = boss.Name;
+                value["name"] = boss.LocalizedName;
                 value["enemy_class"] = ResolveEnemyClass(boss);
                 value["enemy_chara_id"] = ResolveCharaId(boss);
                 value["enemy_emblem_id"] = boss.EnemyEmblemId;
@@ -1010,7 +1010,7 @@ namespace Shadowbus
                 value["bgm_id"] = boss.BgmId ?? string.Empty;
                 value["enemy_life"] = ResolveEnemyLife(boss);
                 value["enemy_skill"] = CreateEnemySkill(boss);
-                value["enemy_skill_desc"] = boss.EnemySkillDesc ?? string.Empty;
+                value["enemy_skill_desc"] = ResolveEnemySkillDescription(boss);
                 value["recovery_point"] = boss.RecoveryPoint;
                 value["is_clear_battle"] = index < state.Progress || state.IsFinished;
                 list.Add(value);
@@ -1118,8 +1118,57 @@ namespace Shadowbus
             value["ability_id"] = ability.AbilityId;
             value["is_foil"] = foil;
             value["skill"] = ability.Skill ?? string.Empty;
-            value["special_ability_desc"] = ability.SpecialAbilityDesc ?? string.Empty;
+            value["special_ability_desc"] = ResolveAbilityDescription(ability);
             return value;
+        }
+
+        /// <summary>
+        /// 增益说明按当前**文字语言**取：繁体设置优先 <c>special_ability_desc_cht</c>、
+        /// 简体设置优先 <c>special_ability_desc_chs</c>；只有一种中文时用那一种；都没有才回退
+        /// <c>special_ability_desc</c>（抓包拿到的英文原文）。PP / EP 这类缩写保持英文字母。
+        /// </summary>
+        internal static string ResolveAbilityDescription(BossRushAbility ability)
+        {
+            if (ability == null)
+            {
+                return string.Empty;
+            }
+
+            return ResolveLocalizedText(
+                ability.SpecialAbilityDescChs,
+                ability.SpecialAbilityDescCht,
+                ability.SpecialAbilityDesc);
+        }
+
+        /// <summary>
+        /// 本地文本的简繁选择（增益说明与对手增益都用它）：繁体设置优先 <paramref name="traditional"/>、
+        /// 简体设置优先 <paramref name="simplified"/>；只有一版中文时用那版；都没有才回退
+        /// <paramref name="fallback"/>（抓包原文）。
+        /// </summary>
+        internal static string ResolveLocalizedText(string simplified, string traditional, string fallback)
+        {
+            bool useTraditional = StoryTextLanguagePatches.IsTraditionalChinese();
+            string localized = useTraditional ? traditional : simplified;
+            if (string.IsNullOrWhiteSpace(localized))
+            {
+                localized = useTraditional ? simplified : traditional;
+            }
+
+            return string.IsNullOrWhiteSpace(localized) ? (fallback ?? string.Empty) : localized;
+        }
+
+        /// <summary>对手增益说明按当前语言取（字段见 <see cref="BossRushBoss"/>）。</summary>
+        internal static string ResolveEnemySkillDescription(BossRushBoss boss)
+        {
+            if (boss == null)
+            {
+                return string.Empty;
+            }
+
+            return ResolveLocalizedText(
+                boss.EnemySkillDescChs,
+                boss.EnemySkillDescCht,
+                boss.EnemySkillDesc);
         }
 
         /// <summary>
@@ -1296,7 +1345,7 @@ namespace Shadowbus
         {
             JsonData data = new JsonData();
             int charaId = ResolveCharaId(boss);
-            data["name"] = boss.Name;
+            data["name"] = boss.LocalizedName;
             data["enemy_class"] = ResolveEnemyClass(boss);
             data["enemy_chara_id"] = charaId;
             data["texture_id"] = charaId;
@@ -1308,7 +1357,7 @@ namespace Shadowbus
             data["bgm_id"] = boss.BgmId ?? string.Empty;
             data["quest_stage_id"] = boss.BossrushStageId;
             data["enemy_skill"] = CreateEnemySkill(boss);
-            data["enemy_skill_desc"] = boss.EnemySkillDesc ?? string.Empty;
+            data["enemy_skill_desc"] = ResolveEnemySkillDescription(boss);
             data["recovery_point"] = boss.RecoveryPoint;
             return data;
         }
@@ -1490,6 +1539,29 @@ namespace Shadowbus
         [JsonProperty("display_name")] public string DisplayName { get; set; }
         [JsonProperty("detail_title")] public string DetailTitle { get; set; }
         [JsonProperty("detail_text")] public string DetailText { get; set; }
+
+        /// <summary>本地化文本（可选）：语言为简体时优先 <c>display_name_chs</c>，繁体时优先 <c>_cht</c>。</summary>
+        [JsonProperty("display_name_chs")] public string DisplayNameChs { get; set; }
+        [JsonProperty("display_name_cht")] public string DisplayNameCht { get; set; }
+        [JsonProperty("detail_title_chs")] public string DetailTitleChs { get; set; }
+        [JsonProperty("detail_title_cht")] public string DetailTitleCht { get; set; }
+        [JsonProperty("detail_text_chs")] public string DetailTextChs { get; set; }
+        [JsonProperty("detail_text_cht")] public string DetailTextCht { get; set; }
+
+        /// <summary>界面上真正显示的名字（按当前语言取，取不到回退 <see cref="DisplayName"/>）。</summary>
+        [JsonIgnore]
+        public string LocalizedDisplayName =>
+            BossRushOfflineData.ResolveLocalizedText(DisplayNameChs, DisplayNameCht, DisplayName);
+
+        /// <summary>详情弹窗标题（按当前语言取）。</summary>
+        [JsonIgnore]
+        public string LocalizedDetailTitle =>
+            BossRushOfflineData.ResolveLocalizedText(DetailTitleChs, DetailTitleCht, DetailTitle);
+
+        /// <summary>详情弹窗正文（按当前语言取）。</summary>
+        [JsonIgnore]
+        public string LocalizedDetailText =>
+            BossRushOfflineData.ResolveLocalizedText(DetailTextChs, DetailTextCht, DetailText);
         [JsonProperty("ui_theme")] public string UiTheme { get; set; } = "grand_prix_1";
         [JsonProperty("lobby_background")] public string LobbyBackground { get; set; }
         [JsonProperty("default_player_life")] public int DefaultPlayerLife { get; set; } = 20;
@@ -1526,8 +1598,14 @@ namespace Shadowbus
                 SchemaVersion = 5,
                 Id = "default",
                 DisplayName = "BossRush: Offline Gauntlet",
+                DisplayNameChs = "BossRush：离线连战",
+                DisplayNameCht = "BossRush：離線連戰",
                 DetailTitle = "Offline Gauntlet",
+                DetailTitleChs = "离线连战",
+                DetailTitleCht = "離線連戰",
                 DetailText = "Defeat three bosses in sequence with one deck. Before every main battle, choose one of three upgrades. Life carries between battles, while each defeated boss restores part of it. Clear all main battles to unlock the hidden challenger.",
+                DetailTextChs = "用同一副牌组连续挑战三名 Boss。每场主要战斗前，从三个强化中选择一个。生命值会带入下一场战斗，每击败一名 Boss 会恢复一部分。通关全部主要战斗后解锁隐藏挑战者。",
+                DetailTextCht = "用同一副牌組連續挑戰三名 Boss。每場主要戰鬥前，從三個強化中選擇一個。生命值會帶入下一場戰鬥，每擊敗一名 Boss 會恢復一部分。通關全部主要戰鬥後解鎖隱藏挑戰者。",
                 UiTheme = "grand_prix_1",
                 DefaultPlayerLife = 20,
                 InitialProgress = 0,
@@ -1538,6 +1616,8 @@ namespace Shadowbus
                         AbilityId = 117031020,
                         Skill = drawOne,
                         SpecialAbilityDesc = "Increase maximum life by 5, recover 5 life, and draw 1 extra card on turn 1.",
+                        SpecialAbilityDescChs = "最大生命值 +5，回复 5 点生命，并在第 1 回合额外抽 1 张牌。",
+                        SpecialAbilityDescCht = "最大生命值 +5，回復 5 點生命，並在第 1 回合額外抽 1 張牌。",
                         MaxLifeChange = 5,
                         LifeChange = 5
                     },
@@ -1545,31 +1625,41 @@ namespace Shadowbus
                     {
                         AbilityId = 100011020,
                         Skill = drawOne,
-                        SpecialAbilityDesc = "At the start of your first turn, draw 1 card."
+                        SpecialAbilityDesc = "At the start of your first turn, draw 1 card.",
+                        SpecialAbilityDescChs = "第 1 回合开始时，抽 1 张牌。",
+                        SpecialAbilityDescCht = "第 1 回合開始時，抽 1 張牌。"
                     },
                     new BossRushAbility
                     {
                         AbilityId = 100012010,
                         Skill = drawTwo,
-                        SpecialAbilityDesc = "At the start of your first turn, draw 2 cards."
+                        SpecialAbilityDesc = "At the start of your first turn, draw 2 cards.",
+                        SpecialAbilityDescChs = "第 1 回合开始时，抽 2 张牌。",
+                        SpecialAbilityDescCht = "第 1 回合開始時，抽 2 張牌。"
                     },
                     new BossRushAbility
                     {
                         AbilityId = 100011030,
                         Skill = recoverOneEp,
-                        SpecialAbilityDesc = "Once per battle, recover 1 EP at the start of your turn when you have no usable EP."
+                        SpecialAbilityDesc = "Once per battle, recover 1 EP at the start of your turn when you have no usable EP.",
+                        SpecialAbilityDescChs = "每场对战 1 次，当自己没有可用 EP 时，在自己回合开始时回复 1 点 EP。",
+                        SpecialAbilityDescCht = "每場對戰 1 次，當自己沒有可用 EP 時，在自己回合開始時回復 1 點 EP。"
                     },
                     new BossRushAbility
                     {
                         AbilityId = 100011040,
                         Skill = recoverTwoEp,
-                        SpecialAbilityDesc = "Once per battle, recover 2 EP at the start of your turn when you have no usable EP."
+                        SpecialAbilityDesc = "Once per battle, recover 2 EP at the start of your turn when you have no usable EP.",
+                        SpecialAbilityDescChs = "每场对战 1 次，当自己没有可用 EP 时，在自己回合开始时回复 2 点 EP。",
+                        SpecialAbilityDescCht = "每場對戰 1 次，當自己沒有可用 EP 時，在自己回合開始時回復 2 點 EP。"
                     },
                     new BossRushAbility
                     {
                         AbilityId = 100011050,
                         Skill = drawOne + "," + recoverOneEp,
-                        SpecialAbilityDesc = "Draw 1 extra card on turn 1 and recover 1 EP once when depleted."
+                        SpecialAbilityDesc = "Draw 1 extra card on turn 1 and recover 1 EP once when depleted.",
+                        SpecialAbilityDescChs = "第 1 回合额外抽 1 张牌；EP 用尽时回复 1 点 EP（每场对战 1 次）。",
+                        SpecialAbilityDescCht = "第 1 回合額外抽 1 張牌；EP 用盡時回復 1 點 EP（每場對戰 1 次）。"
                     }
                 },
                 Bosses = new List<BossRushBoss>
@@ -1588,6 +1678,8 @@ namespace Shadowbus
                         RecoveryPoint = 5,
                         EnemySkill = drawOne,
                         EnemySkillDesc = "At the start of the first turn, draw 1 extra card.",
+                        EnemySkillDescChs = "第 1 回合开始时，额外抽 1 张牌。",
+                        EnemySkillDescCht = "第 1 回合開始時，額外抽 1 張牌。",
                         EnemyAiId = 1,
                         PlayerFirstTurn = true,
                         CustomDeckCardIds = CreateStarterDeck(1),
@@ -1608,6 +1700,8 @@ namespace Shadowbus
                         RecoveryPoint = 5,
                         EnemySkill = recoverOneEp,
                         EnemySkillDesc = "Once per battle, recover 1 EP when no usable EP remains.",
+                        EnemySkillDescChs = "每场对战 1 次，当自己没有可用 EP 时回复 1 点 EP。",
+                        EnemySkillDescCht = "每場對戰 1 次，當自己沒有可用 EP 時回復 1 點 EP。",
                         EnemyAiId = 1,
                         PlayerFirstTurn = false,
                         CustomDeckCardIds = CreateStarterDeck(4),
@@ -1628,6 +1722,8 @@ namespace Shadowbus
                         RecoveryPoint = 0,
                         EnemySkill = drawTwo + "," + recoverTwoEp,
                         EnemySkillDesc = "Draw 2 extra cards on turn 1 and recover 2 EP once when depleted.",
+                        EnemySkillDescChs = "第 1 回合额外抽 2 张牌；EP 用尽时回复 2 点 EP（每场对战 1 次）。",
+                        EnemySkillDescCht = "第 1 回合額外抽 2 張牌；EP 用盡時回復 2 點 EP（每場對戰 1 次）。",
                         EnemyAiId = 1,
                         EnemyStartPp = 1,
                         CustomDeckCardIds = CreateStarterDeck(8),
@@ -1649,6 +1745,8 @@ namespace Shadowbus
                     RecoveryPoint = 0,
                     EnemySkill = drawTwo + "," + recoverTwoEp,
                     EnemySkillDesc = "Draw 2 extra cards on turn 1 and recover 2 EP once when depleted.",
+                    EnemySkillDescChs = "第 1 回合额外抽 2 张牌；EP 用尽时回复 2 点 EP（每场对战 1 次）。",
+                    EnemySkillDescCht = "第 1 回合額外抽 2 張牌；EP 用盡時回復 2 點 EP（每場對戰 1 次）。",
                     EnemyAiId = 1,
                     PlayerFirstTurn = false,
                     EnemyStartPp = 1,
@@ -1766,6 +1864,15 @@ namespace Shadowbus
     public sealed class BossRushBoss
     {
         [JsonProperty("name")] public string Name { get; set; }
+
+        /// <summary>本地化 Boss 名（可选），取值规则同其它本地化文本。</summary>
+        [JsonProperty("name_chs")] public string NameChs { get; set; }
+        [JsonProperty("name_cht")] public string NameCht { get; set; }
+
+        /// <summary>界面上真正显示的 Boss 名（按当前语言取，取不到回退 <see cref="Name"/>）。</summary>
+        [JsonIgnore]
+        public string LocalizedName =>
+            BossRushOfflineData.ResolveLocalizedText(NameChs, NameCht, Name);
         [JsonProperty("enemy_class")] public int EnemyClass { get; set; } = 1;
         [JsonProperty("enemy_chara_id")] public int EnemyCharaId { get; set; } = 1;
         [JsonProperty("enemy_emblem_id")] public long EnemyEmblemId { get; set; }
@@ -1778,6 +1885,12 @@ namespace Shadowbus
         [JsonProperty("enemy_skill")] public string EnemySkill { get; set; }
         [JsonProperty("enemy_skills")] public List<string> EnemySkills { get; set; } = new List<string>();
         [JsonProperty("enemy_skill_desc")] public string EnemySkillDesc { get; set; }
+
+        /// <summary>对手增益的简体中文说明（语言设置为简体时用）。</summary>
+        [JsonProperty("enemy_skill_desc_chs")] public string EnemySkillDescChs { get; set; }
+
+        /// <summary>对手增益的繁体中文说明（语言设置为繁体时用）。</summary>
+        [JsonProperty("enemy_skill_desc_cht")] public string EnemySkillDescCht { get; set; }
         [JsonProperty("enemy_ai_id")] public int EnemyAiId { get; set; } = 1;
         [JsonProperty("player_first_turn")] public bool? PlayerFirstTurn { get; set; }
         [JsonProperty("player_start_pp")] public int PlayerStartPp { get; set; }
@@ -1831,6 +1944,13 @@ namespace Shadowbus
         [JsonProperty("is_foil")] public bool IsFoil { get; set; }
         [JsonProperty("skill")] public string Skill { get; set; }
         [JsonProperty("special_ability_desc")] public string SpecialAbilityDesc { get; set; }
+
+        /// <summary>简体中文说明（语言设置为简体时用，见 <see cref="ResolveAbilityDescription"/>）。</summary>
+        [JsonProperty("special_ability_desc_chs")] public string SpecialAbilityDescChs { get; set; }
+
+        /// <summary>繁体中文说明（语言设置为繁体时用）。</summary>
+        [JsonProperty("special_ability_desc_cht")] public string SpecialAbilityDescCht { get; set; }
+
         [JsonProperty("max_life_change")] public int MaxLifeChange { get; set; }
         [JsonProperty("life_change")] public int LifeChange { get; set; }
     }

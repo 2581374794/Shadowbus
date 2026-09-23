@@ -1,0 +1,39 @@
+{
+  "_chapter": {
+    "player_chara_id": 0,
+    "enemy_chara_id": 0,
+    "battle3dfield_id": 0,
+    "bgm_id": "",
+    "enemy_ai_id": 0,
+    "enemy_deck_id": 0,
+    "enemy_style_id": 0,
+    "enemy_emote_id": 0,
+    "enemy_class": 0
+  },
+  "_ai": {
+    "deck": "2050800(deck).csv",
+    "style": "2050800(style).csv",
+    "emote": "2050800(emote).csv",
+    "logic": 2,
+    "max_life": 20,
+    "use_inner_emote": true,
+    "cards": [
+      { "id": 113521020, "num": 3 }
+    ]
+  },
+  "player_first_turn": 0,
+  "player_start_pp": 0,
+  "enemy_start_pp": 0,
+  "player_start_life": 0,
+  "enemy_start_life": 0,
+  "player_attach_skill": "",
+  "enemy_attach_skill": "",
+  "id": "",
+  "id_override_in_battle_log": "",
+  "banish_effect_override": "",
+  "token_draw_effect_override": "",
+  "special_token_draw_effect_override": "",
+  "result_skip": 0,
+  "vs_effect_override": 0,
+  "class_destroy_effect_override": 0
+}

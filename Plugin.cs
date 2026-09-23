@@ -9,7 +9,7 @@ using UnityEngine;
 
 namespace Shadowbus;
 
-[BepInPlugin("08c8e386-a794-442f-a98c-aec65a183898", "GeorgesZebit.Shadowbus", "2.5.5")]
+[BepInPlugin("08c8e386-a794-442f-a98c-aec65a183898", "GeorgesZebit.Shadowbus", "2.5.6")]
 public class Plugin : BaseUnityPlugin
 {
     public static new ManualLogSource Logger;
@@ -17,6 +17,22 @@ public class Plugin : BaseUnityPlugin
     public static readonly string UnlimitedDeckPath = System.IO.Path.Combine(ModPath, "UnlimitedDecks");
     public static readonly string CardMasterPath = System.IO.Path.Combine(ModPath, "CardMaster");
     public static Plugin Instance { get; private set; }
+
+    /// <summary>
+    /// 额外资源目录的覆盖值（[Resources] Root）。空字符串表示自动查找。
+    /// </summary>
+    public static string ResourceRootOverride { get; private set; } = string.Empty;
+
+    /// <summary>
+    /// 是否允许剧情临时语音真的去服务器下载（[Resources] AllowTemporaryVoiceDownload）。
+    /// 默认关：离线构建不联网，本地没有的语音就静音。
+    /// </summary>
+    public static bool AllowTemporaryVoiceDownload { get; private set; }
+
+    /// <summary>
+    /// 离线战斗（剧情 / 练习 AI 战）录像，见 <c>[Replay] RecordOfflineBattles</c>。
+    /// </summary>
+    public static bool RecordOfflineReplays { get; private set; } = true;
 
     public BattleCardBase SelectedCard { get; set; }
 
@@ -48,6 +64,9 @@ public class Plugin : BaseUnityPlugin
     private ConfigEntry<bool> aiRespectPlayLimitLocks;
     private ConfigEntry<int> aiLowLifeHealThreshold;
     private ConfigEntry<bool> bossRushAbilityPicker;
+    private ConfigEntry<string> resourceRootOverride;
+    private ConfigEntry<bool> allowTemporaryVoiceDownload;
+    private ConfigEntry<bool> recordOfflineBattles;
 
     private void Awake()
     {
@@ -55,6 +74,54 @@ public class Plugin : BaseUnityPlugin
         // Plugin startup logic
         Logger = base.Logger;
         Logger.LogInfo($"Plugin Shadowbus is loaded!");
+        // 构建时间横幅：判断日志是不是最新 DLL 产生的，一眼就能看出来
+        // （之前出现过"代码改了但日志里没有新日志"，就是因为加载的还是旧 dll）。
+        try
+        {
+            Logger.LogInfo(
+                $"[Shadowbus] build={System.IO.File.GetLastWriteTimeUtc(
+                    System.Reflection.Assembly.GetExecutingAssembly().Location)
+                    .ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture)}Z, " +
+                $"version={System.Reflection.Assembly.GetExecutingAssembly().GetName().Version}");
+        }
+        catch (System.Exception exception)
+        {
+            Logger.LogWarning($"[Shadowbus] Could not report the build stamp: {exception.Message}");
+        }
+
+        // 资源目录：留空就自动找（游戏目录同级的 Resources 等），
+        // 也可以指到任意位置、任意名字的文件夹。相对路径按游戏目录解析。
+        resourceRootOverride = Config.Bind(
+            "Resources",
+            "Root",
+            string.Empty,
+            "Extra resource folder. Empty auto-detects: <game>/../Resources, <game>/Resources, " +
+            "<game>/Shadowbus/Resources, then the SHADOWBUS_RESOURCES environment variable. " +
+            "A relative path is resolved against the game folder.");
+        ResourceRootOverride = resourceRootOverride.Value ?? string.Empty;
+
+        // 剧情临时语音（v/t/ 里的那些）默认不去服务器下载：本地没有的就静音。
+        // 想自己把语音下下来（下完可以随整合包分发），把它改成 true。
+        allowTemporaryVoiceDownload = Config.Bind(
+            "Resources",
+            "AllowTemporaryVoiceDownload",
+            false,
+            "Let the game download the story's temporary voice banks (v/t/*.acb) from the official " +
+            "server again. Off by default: an offline build cannot fetch them, so those lines stay " +
+            "silent. Turn it on while online and play the chapter; the ACBs land in the resource " +
+            "folder's v/t/ and can then be shipped with the pack.");
+        AllowTemporaryVoiceDownload = allowTemporaryVoiceDownload.Value;
+
+        // 离线战斗录像（游戏自己的「其他 → 回放」）。关掉之后插件不再接管录像器：
+        // 战斗起手/结束时那条录像链路整条不跑，排查卡顿时可以用来做 A/B。
+        recordOfflineBattles = Config.Bind(
+            "Replay",
+            "RecordOfflineBattles",
+            true,
+            "Record offline (story / practice AI) battles into <resource root>/NewReplay so they can be " +
+            "played back from the game's own replay menu. Turn it off to check whether replay recording " +
+            "is involved in a battle-start stutter or freeze.");
+        RecordOfflineReplays = recordOfflineBattles.Value;
 
         socketIoBindAddress = Config.Bind(
             "SocketIO",
@@ -184,13 +251,29 @@ public class Plugin : BaseUnityPlugin
             "Shows a 随便选 button on the BossRush ability select screen that offers every configured buff instead of the three random candidates. Set to false to hide the button and keep the original random selection.");
         BossRushAbilityPicker.Configure(bossRushAbilityPicker.Value);
         CustomFormats.Initialize();
-        // P2PTwoPickRules.Initialize(); // TODO: 重新实现 TwoPick 规则
         BossRushOfflineData.Initialize();
         BossRushReferenceExporter.Export();
 
         try
         {
             var harmony = new Harmony("GeorgesZebit.Shadowbus");
+            try
+            {
+                // 最先做：把游戏里所有 Application.persistentDataPath 换到额外资源目录，
+                // 越早越好（游戏读资源之前）。资源目录是后来才放进来的时候，
+                // Plugin.Update 里的 Tick 会补上这一步。
+                PersistentDataPathRedirect.SetHarmony(harmony);
+                PersistentDataPathRedirect.Apply(harmony);
+
+                // 紧接着：把 PlayerPrefs（注册表 HKCU\Software\Cygames\Shadowverse）
+                // 搬到额外资源目录里的 PlayerPrefs.txt，游戏从一开始就读到本地值。
+                PlayerPrefsRedirect.SetHarmony(harmony);
+                PlayerPrefsRedirect.Apply(harmony);
+            }
+            catch (System.Exception exception)
+            {
+                Logger.LogError($"[Resources] FAILED to redirect persistentDataPath: {exception}");
+            }
             Harmony.CreateAndPatchAll(typeof(DebugPatcher));
             Harmony.CreateAndPatchAll(typeof(DeckEdit));
             Harmony.CreateAndPatchAll(typeof(CardMasterPatcher));
@@ -269,17 +352,63 @@ public class Plugin : BaseUnityPlugin
             {
                 Logger.LogError($"[AICardData] FAILED to apply the AI card data fallback patch: {exception}");
             }
+            try
+            {
+                // Guards cards that carry no AI data at all. Without it the original
+                // EvaluatePlayValue dereferences a null AIData record.
+                Harmony.CreateAndPatchAll(typeof(AIEvaluateTagCompatibility));
+            }
+            catch (System.Exception exception)
+            {
+                Logger.LogError($"[AICardData] FAILED to apply the AI evaluate compatibility patch: {exception}");
+            }
             Harmony.CreateAndPatchAll(typeof(ActiveSkill));
             Harmony.CreateAndPatchAll(typeof(GeminizeSkillPatcher));
             Harmony.CreateAndPatchAll(typeof(AcquireSkillsSkillPatcher));
             Harmony.CreateAndPatchAll(typeof(MirrorSkillPatcher));
             Harmony.CreateAndPatchAll(typeof(MirrorResidentEffectPatcher));
             Harmony.CreateAndPatchAll(typeof(StoryOfflinePatches));
+            try
+            {
+                // Story script battles take their enemy AI deck/style/emote from local
+                // files; the count is logged so a silent registration failure is visible.
+                var storyBattleAiHarmony =
+                    Harmony.CreateAndPatchAll(typeof(StoryBattleAiPatches));
+                Logger.LogInfo(
+                    $"[StoryAI] Harmony registration complete: " +
+                    $"{storyBattleAiHarmony.GetPatchedMethods().Count()} game method(s) patched.");
+            }
+            catch (System.Exception exception)
+            {
+                Logger.LogError($"[StoryAI] FAILED to apply the story AI patches: {exception}");
+            }
             Harmony.CreateAndPatchAll(typeof(LanguageVoicePatches));
+            Harmony.CreateAndPatchAll(typeof(LanguageSelectionPatches));
+            Harmony.CreateAndPatchAll(typeof(StoryTextLanguagePatches));
             Harmony.CreateAndPatchAll(typeof(LocalCardVoicePatches));
             Harmony.CreateAndPatchAll(typeof(BattleVfxGuards));
+            Harmony.CreateAndPatchAll(typeof(BattleLogPatch));
             Harmony.CreateAndPatchAll(typeof(HomeMenuPatches));
+            Harmony.CreateAndPatchAll(typeof(MyPageOtherPatches));
+            Harmony.CreateAndPatchAll(typeof(ReplayOfflineData));
+            // 临时诊断（定位完就删）：回放播放停在换牌界面时打印 op / 换牌 / 开战 / 暂停日志。
+            Harmony.CreateAndPatchAll(typeof(ReplayPlaybackTrace));
+            Harmony.CreateAndPatchAll(typeof(ProfileOfflineData));
+            Harmony.CreateAndPatchAll(typeof(ResourceRootPatches));
             Harmony.CreateAndPatchAll(typeof(DeckFormatUI));
+            try
+            {
+                // 结算界面是所有模式共用的 prefab：把「任务」按钮整个删掉。
+                var battleResultUiHarmony =
+                    Harmony.CreateAndPatchAll(typeof(BattleResultUiPatches));
+                Logger.LogInfo(
+                    $"[BattleUI] Harmony registration complete: " +
+                    $"{battleResultUiHarmony.GetPatchedMethods().Count()} game method(s) patched.");
+            }
+            catch (System.Exception exception)
+            {
+                Logger.LogError($"[BattleUI] FAILED to apply the battle result UI patches: {exception}");
+            }
             Harmony.CreateAndPatchAll(typeof(RoomRuleSelectDialogCreatePatch));
             Harmony.CreateAndPatchAll(typeof(RoomRuleSelectDialogInitializePatch));
             Harmony.CreateAndPatchAll(typeof(RoomRuleSelectDialogDefaultSettingPatch));
@@ -295,12 +424,6 @@ public class Plugin : BaseUnityPlugin
             Logger.LogInfo(
                 $"[CustomFormats] Deck edit rule registration complete: " +
                 $"{deckFormatRulesHarmony.GetPatchedMethods().Count()} game method(s) patched.");
-            // 联机补丁（新系统）
-            // Harmony.CreateAndPatchAll(typeof(OnlinePatches)); // TODO: 实现新的联机补丁
-            // Harmony.CreateAndPatchAll(typeof(P2PTwoPickClassDescriptionPatch)); // TODO
-            // Harmony.CreateAndPatchAll(typeof(P2PTwoPickClassIconPatch)); // TODO
-            // Harmony.CreateAndPatchAll(typeof(P2PTwoPickDeckSizePatches)); // TODO
-            // Harmony.CreateAndPatchAll(typeof(P2PTwoPickCompletionPatch)); // TODO
 
         }
         catch (System.Exception exception)
@@ -311,7 +434,11 @@ public class Plugin : BaseUnityPlugin
 
     private void Update()
     {
+        // 资源文件夹可能是开游戏之后才放进来的：发现之后在这里补打重定向补丁。
+        PersistentDataPathRedirect.Tick();
+        PlayerPrefsRedirect.Tick();
         Server.OnlineRuntime.Update();
+        TaskWatchdog.Tick();
         PracticeDualAI.Update();
         AITurnGuard.Update();
         AICardDataFallback.Update();

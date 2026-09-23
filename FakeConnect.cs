@@ -1,9 +1,10 @@
-﻿using Cute;
+using Cute;
 using HarmonyLib;
 using LitJson;
 using MessagePack;
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
 using UnityEngine.Networking;
@@ -77,15 +78,108 @@ namespace Shadowbus
                 IsLocalDeckListTask(taskName) ||
                 ProfileOfflineData.CanHandle(taskName) ||
                 StoryOfflineData.CanHandle(taskName) ||
+                PuzzleOfflineData.CanHandle(taskName) ||
+                ReplayOfflineData.CanHandle(taskName) ||
+                EmptyOfflineResponses.ContainsKey(taskName) ||
+                IsEmptyOfflineTask(taskName) ||
                 File.Exists((Path.Combine("Mods", "OfflinizedTasks", $"{taskName}.json")));
+        }
+
+        /// <summary>
+        /// Tasks whose honest offline answer is "the server has nothing for you".
+        /// Their payload is service-side (the client never stores it), so instead
+        /// of inventing content we answer with the empty shape the stock parser
+        /// expects. Leaving them to <see cref="ProcessOnlineTask"/> is worse than
+        /// useless offline: the request comes back empty, MessagePack fails to
+        /// decode it and the player gets a 「復号化に失敗しました」 dialog.
+        ///
+        /// · <c>QuestMissionInfoTask</c> (api 68) — the mission list behind the
+        ///   "任务一览" dialog. <c>QuestMissionInfoTask.Parse</c> treats
+        ///   <c>data</c> as a flat array of missions and only runs when
+        ///   <c>result_code == 1</c>; an empty array means "no missions".
+        ///
+        /// 下面 <see cref="IsEmptyOfflineTask"/> 里那几个要现算时间，所以不放进这张表。
+        /// </summary>
+        private static readonly Dictionary<string, string> EmptyOfflineResponses =
+            new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                {
+                    nameof(QuestMissionInfoTask),
+                    "{\"data_headers\":{\"short_udid\":0,\"viewer_id\":0,\"sid\":\"\"," +
+                    "\"servertime\":0,\"result_code\":1},\"data\":[]}"
+                },
+            };
+
+        /// <summary>
+        /// 需要现算内容的「空应答」任务。
+        ///
+        /// · <c>QuestPointInfoTask</c>（任务点数一览，api 71）—— 本地没有任务点数也没有
+        ///   报酬可领，但 <c>Parse</c> 会直接 <c>DateTime.Parse(data.start_time/end_time)</c>
+        ///   并读 <c>total_point</c> / <c>max_point</c> / <c>reward_list</c>，所以不能给空对象，
+        ///   要给一个「从现在起到十年后、0 点、没有奖励」的窗口。
+        /// </summary>
+        private static bool IsEmptyOfflineTask(string taskName)
+        {
+            return string.Equals(taskName, nameof(QuestPointInfoTask), StringComparison.Ordinal);
+        }
+
+        private static JsonData CreateEmptyOfflineResponse(string taskName)
+        {
+            if (EmptyOfflineResponses.TryGetValue(taskName, out string json))
+            {
+                return JsonMapper.ToObject(json);
+            }
+
+            if (string.Equals(taskName, nameof(QuestPointInfoTask), StringComparison.Ordinal))
+            {
+                string start = DateTime.UtcNow.AddDays(-1).ToString("o");
+                string end = DateTime.UtcNow.AddYears(10).ToString("o");
+                return JsonMapper.ToObject(
+                    "{\"data_headers\":{\"short_udid\":0,\"viewer_id\":0,\"sid\":\"\"," +
+                    "\"servertime\":0,\"result_code\":1},\"data\":{\"start_time\":\"" + start + "\"," +
+                    "\"end_time\":\"" + end + "\",\"total_point\":0,\"max_point\":0,\"reward_list\":[]}}");
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// 等上一笔请求结束的**有上限**版本。
+        ///
+        /// 原版只有它自己的 Connect 协程（就是被我们整个替换掉的那个 <c>NetworkManager/&lt;Connect&gt;d__18</c>）
+        /// 会清 <c>isConnect</c>，而全程序集里也没别的地方把它置 true —— 也就是说**只有插件会置 true**。
+        /// 只要有任何一条路径带着异常退出（真实请求那条路到处都是 <c>throw</c>，比如 MessagePack 解密失败、
+        /// `HandleDeserializeException` 抛出），协程直接死掉、末尾那句 <c>isConnect = false</c> 就不执行，
+        /// 于是这个标志永远留着 true：之后**每一个**任务都卡在入口的 `while (isConnect) yield return 0;`
+        /// 上——表现就是「游戏卡死」：进程还在跑帧、CPU 接近 0、窗口也能点，但什么都不再发生
+        /// （实测：进剧情页停在 StoryInfoTask，之后再没有一行日志），而游戏偶尔调用
+        /// <c>StopConnectCoroutine</c> 时又会自己恢复，正好对应「有时候过很久会自己好」。
+        ///
+        /// 所以这里最多等 <see cref="NetworkBusyTimeoutSeconds"/> 秒，超时就自己清掉并继续，把死锁掐掉。
+        /// </summary>
+        private const float NetworkBusyTimeoutSeconds = 3f;
+
+        private static IEnumerator WaitUntilNetworkIdle(NetworkManager manager, string taskName)
+        {
+            float deadline = Time.realtimeSinceStartup + NetworkBusyTimeoutSeconds;
+            while (manager.isConnect && Time.realtimeSinceStartup < deadline)
+            {
+                yield return 0;
+            }
+
+            if (manager.isConnect)
+            {
+                Plugin.Logger.LogWarning(
+                    $"[Offlinizer] The network busy flag was still set {NetworkBusyTimeoutSeconds:F0}s after the " +
+                    $"last request started (a request likely died before clearing it); clearing it so '{taskName}' " +
+                    "can run instead of freezing the whole game.");
+                manager.isConnect = false;
+            }
         }
 
         private static IEnumerator ProcessBossRushTask(NetworkManager networkManager, NetworkTask task)
         {
-            while (networkManager.isConnect)
-            {
-                yield return 0;
-            }
+            yield return WaitUntilNetworkIdle(networkManager, task?.GetType().Name ?? "BossRush");
 
             yield return new WaitForSeconds(0.01f);
             networkManager.isConnect = true;
@@ -163,10 +257,7 @@ namespace Shadowbus
         private static IEnumerator ProcessOfflineTask(NetworkManager __instance, NetworkTask task, string taskName)
         {
             
-            while (__instance.isConnect)
-            {
-                yield return 0;
-            }
+            yield return WaitUntilNetworkIdle(__instance, taskName);
             yield return new WaitForSeconds(0.01f); // Optional: slight delay to simulate network latency
 
             __instance.isConnect = true;
@@ -193,6 +284,19 @@ namespace Shadowbus
                 else if (StoryOfflineData.TryCreateResponse(task, out data))
                 {
                     Plugin.Logger.LogInfo($"[Offlinizer] Injecting generated local data for {taskName}...");
+                }
+                else if (PuzzleOfflineData.TryCreateResponse(task, out data))
+                {
+                    Plugin.Logger.LogInfo($"[Offlinizer] Injecting generated local puzzle data for {taskName}...");
+                }
+                else if (ReplayOfflineData.TryCreateResponse(task, out data))
+                {
+                    Plugin.Logger.LogInfo($"[Offlinizer] Injecting generated local replay data for {taskName}...");
+                }
+                else if (EmptyOfflineResponses.ContainsKey(taskName) || IsEmptyOfflineTask(taskName))
+                {
+                    Plugin.Logger.LogInfo($"[Offlinizer] Injecting empty local data for {taskName}...");
+                    data = CreateEmptyOfflineResponse(taskName);
                 }
                 else if (File.Exists(filePath))
                 {
@@ -261,10 +365,8 @@ namespace Shadowbus
 
         private static IEnumerator ProcessOnlineTask(NetworkManager __instance, NetworkTask task, bool showErrorDialog)
         {
-            while (__instance.isConnect)
-            {
-                yield return 0;
-            }
+            yield return WaitUntilNetworkIdle(__instance, task != null ? task.GetType().Name : "online");
+
             __instance.isConnect = true;
             __instance.isTimeOut = false;
             __instance.isError = false;
@@ -272,6 +374,12 @@ namespace Shadowbus
             {
                 __instance.NetworkUI.StartLoading(false);
             }
+
+            // 这条路径到处都会 throw（MessagePack 解密失败、HandleDeserializeException…）。
+            // 一旦异常逃出协程，下面那句 isConnect = false 就不会执行，网络忙标志会永远留着，
+            // 后续任务全部卡死 —— 所以用 finally 兜住，保证一定清掉。
+            try
+            {
             bool isLogTraceCheckUri = false;
             if (__instance.lastRequestTask is DoMatchingBase || __instance.lastRequestTask is FinishTaskBase)
             {
@@ -475,6 +583,13 @@ namespace Shadowbus
             IL_0838:
                 __instance.ClearLastRequestTask();
                 __instance.disposeUnityWebRequest(unityWebRequest);
+                __instance.isConnect = false;
+            }
+            }
+            finally
+            {
+                // 正常走完时上面已经清过了，这里再做一次幂等的收尾；异常逃出时全靠它。
+                __instance.ClearLastRequestTask();
                 __instance.isConnect = false;
             }
             //UnityWebRequest unityWebRequest = null;

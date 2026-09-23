@@ -6,7 +6,7 @@
 // its card pool and language are whatever that installation had. Point this
 // script at such an export whenever the game ships new cards.
 //
-//   npm run build:catalog                    # use the default game path below
+//   npm run build:catalog                    # 自动找游戏目录（或设 SHADOWVERSE_DIR）
 //   npm run build:catalog -- <csv path>
 //
 // Two filters run before anything is written, both verified against the real
@@ -25,14 +25,21 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { gameRootNotFoundMessage, resolveGameRoot } from "./lib/game-root.mjs";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const webEditorRoot = resolve(scriptDirectory, "..");
 const outputPath = resolve(webEditorRoot, "src/data/cards.generated.ts");
-const defaultCsvPath = resolve(
-  webEditorRoot,
-  "../../../../SteamLibrary/steamapps/common/Shadowverse/Mods/CardMaster/Reference/card_names.csv",
-);
+
+/** 只在没给 CSV 路径时才去找游戏目录，找不到就报清楚。 */
+function defaultCsvPath() {
+  const { root, tried } = resolveGameRoot();
+  if (!root) {
+    throw new Error(gameRootNotFoundMessage(tried));
+  }
+
+  return resolve(root, "Mods/CardMaster/Reference/card_names.csv");
+}
 
 /** Lowest ID the mod hands out to user created cards; everything here is machine local. */
 const CUSTOM_CARD_ID_MIN = 999990000;
@@ -87,7 +94,7 @@ function integer(text, label, lineNumber) {
   return value;
 }
 
-const csvPath = process.argv[2] ? resolve(process.argv[2]) : defaultCsvPath;
+const csvPath = process.argv[2] ? resolve(process.argv[2]) : defaultCsvPath();
 let csvText;
 try {
   csvText = readFileSync(csvPath, "utf8");

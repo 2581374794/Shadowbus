@@ -1,6 +1,8 @@
 using Cute;
+using HarmonyLib;
 using LitJson;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -42,6 +44,18 @@ namespace Shadowbus
             [JsonProperty("leader_skins")]
             public Dictionary<int, LocalLeaderSkinSetting> LeaderSkins { get; set; } =
                 new Dictionary<int, LocalLeaderSkinSetting>();
+
+            /// <summary>金币（<c>PlayerStaticData.UserRupyCount</c>）。</summary>
+            [JsonProperty("rupy")]
+            public int? Rupy { get; set; }
+
+            /// <summary>以太（<c>PlayerStaticData.UserRedEtherCount</c>）。</summary>
+            [JsonProperty("red_ether")]
+            public int? RedEther { get; set; }
+
+            /// <summary>入场券 / 兑换券类道具的数量，按道具 id 存（挑战券 1、杯赛入场券 2 …）。</summary>
+            [JsonProperty("ticket_items")]
+            public Dictionary<int, int> TicketItems { get; set; } = new Dictionary<int, int>();
         }
 
         private sealed class LocalLeaderSkinSetting
@@ -200,6 +214,181 @@ namespace Shadowbus
             {
                 userInfo["is_official_mark_displayed"] =
                     settings.IsOfficialMarkDisplayed.Value ? 1 : 0;
+            }
+            if (settings.ViewerId > 0)
+            {
+                // 「货币修改」里改的 ID：显示用的那个 viewer_id 就在这里。
+                userInfo["viewer_id"] = settings.ViewerId;
+            }
+        }
+
+        /// <summary>「货币修改」里改的 ID（显示用的 viewer_id），写进 Mods/Profile.json。</summary>
+        internal static void SaveViewerId(int viewerId)
+        {
+            if (viewerId <= 0)
+            {
+                return;
+            }
+
+            // 旧 ID 必须**先**取：下面把 Certification.ViewerId 改成新值之后，
+            // 再去读它拿到的就是新值了（上一版就是这么把自己比没了的）。
+            int previousViewerId = GetViewerId();
+
+            _cachedViewerId = viewerId;
+
+            UpdateSettings(settings => settings.ViewerId = viewerId);
+
+            // 真正让「ID 变掉」还得改客户端自己的 viewer id：
+            // Certification.ViewerId 的 setter 会写 savedata 并更新缓存。
+            try
+            {
+                Certification.ViewerId = viewerId;
+                Plugin.Logger.LogInfo($"[Other] Client viewer id changed to {viewerId}.");
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[Other] Could not change the client viewer id: {exception.Message}");
+            }
+
+            // 离线 profile 的源头文件也改掉：这样登录时注入的 LoadTask 数据本身就带新 ID，
+            // 不管哪个页面读都不会再看到旧值。
+            try
+            {
+                RewriteOfflineViewerId(previousViewerId, viewerId);
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[Other] Could not rewrite LoadTask.json: {exception.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 把 Mods/OfflinizedTasks 下**所有**离线响应里的 viewer_id 都改成新值。
+        /// （LoadTask / SignUpTask / DeckInfoTask … 每个文件里都有这个字段，
+        ///  之前只改 LoadTask 显然不够 —— 登录时那份会把旧 ID 又带回来。）
+        /// </summary>
+        private static void RewriteOfflineViewerId(int oldViewerId, int viewerId)
+        {
+            string directory = Path.Combine(PathHelper.ModPath, "OfflinizedTasks");
+            if (!Directory.Exists(directory))
+            {
+                return;
+            }
+
+            int files = 0;
+            int fields = 0;
+
+            foreach (string path in Directory.GetFiles(directory, "*.json", SearchOption.TopDirectoryOnly))
+            {
+                try
+                {
+                    string text = File.ReadAllText(path);
+                    if (!text.Contains("viewer_id"))
+                    {
+                        continue;
+                    }
+
+                    JObject root = JObject.Parse(text);
+                    int changed = ReplaceViewerIds(root, viewerId);
+                    if (changed == 0)
+                    {
+                        continue;
+                    }
+
+                    File.WriteAllText(path, root.ToString(Formatting.None), new UTF8Encoding(false));
+                    files++;
+                    fields += changed;
+                }
+                catch (Exception exception)
+                {
+                    Plugin.Logger.LogWarning(
+                        $"[Other] Could not rewrite '{Path.GetFileName(path)}': {exception.Message}");
+                }
+            }
+
+            Plugin.Logger.LogInfo(
+                $"[Other] OfflinizedTasks: rewrote {fields} viewer_id in {files} file(s) " +
+                $"(previous setting {oldViewerId:D9} -> {viewerId}).");
+        }
+
+        private static int ReplaceViewerIds(JToken token, int viewerId)
+        {
+            int changed = 0;
+
+            if (token is JObject obj)
+            {
+                foreach (JProperty property in obj.Properties().ToList())
+                {
+                    if (property.Name == "viewer_id" && property.Value.Type == JTokenType.Integer)
+                    {
+                        property.Value = viewerId;
+                        changed++;
+                    }
+                    else
+                    {
+                        changed += ReplaceViewerIds(property.Value, viewerId);
+                    }
+                }
+            }
+            else if (token is JArray array)
+            {
+                foreach (JToken item in array)
+                {
+                    changed += ReplaceViewerIds(item, viewerId);
+                }
+            }
+
+            return changed;
+        }
+
+        /// <summary>
+        /// 弹窗 / 界面里用到的 ID，**内存缓存**：<c>get_UserViewerID</c> 会在很多地方被频繁调用，
+        /// 每次都去读盘 + 解析 Profile.json 会卡到整个游戏（实测就是它引起的全局卡顿）。
+        /// </summary>
+        private static int _cachedViewerId = -1;
+
+        internal static int GetViewerId()
+        {
+            if (_cachedViewerId > 0)
+            {
+                return _cachedViewerId;
+            }
+
+            int saved = LoadSettings().ViewerId;
+            if (saved > 0)
+            {
+                _cachedViewerId = saved;
+                return _cachedViewerId;
+            }
+
+            try
+            {
+                _cachedViewerId = PlayerStaticData.UserViewerID;
+            }
+            catch (Exception)
+            {
+                _cachedViewerId = 0;
+            }
+
+            return _cachedViewerId;
+        }
+
+        /// <summary>
+        /// 改过 ID 之后，凡是读 <c>PlayerStaticData.UserViewerID</c>（= Certification.ViewerId）的地方
+        /// 都返回缓存里的那个值。**只读缓存，不碰磁盘**。
+        /// </summary>
+        [HarmonyPatch(typeof(PlayerStaticData), "get_UserViewerID")]
+        [HarmonyPostfix]
+        internal static void UserViewerID_Postfix(ref int __result)
+        {
+            if (_cachedViewerId < 0)
+            {
+                GetViewerId();      // 整个进程只读一次盘
+            }
+
+            if (_cachedViewerId > 0)
+            {
+                __result = _cachedViewerId;
             }
         }
 
@@ -598,6 +787,11 @@ namespace Shadowbus
                 {
                     loadDetail._userInfo.name = settings.Name;
                 }
+                if (settings.ViewerId > 0)
+                {
+                    // 「货币修改」里改的 ID：个人信息页显示的就是这个 viewer_id。
+                    loadDetail._userInfo.viewer_id = settings.ViewerId;
+                }
                 if (settings.EmblemId.HasValue)
                 {
                     if (refreshCachedResources)
@@ -631,6 +825,79 @@ namespace Shadowbus
             }
 
             ApplyLeaderSkinSettings(settings);
+            ApplyCurrencySettings(loadDetail, settings);
+        }
+
+        /// <summary>
+        /// 把本地保存的金币 / 以太 / 入场券数量写回 profile（「其他 → 货币修改」改的就是这三个）。
+        /// 直接写 <c>LoadDetail</c> 而不是走 <c>PlayerStaticData</c>，因为 LoadTask 刚解析完时
+        /// 传入的 loadDetail 才是要生效的那一份。
+        /// </summary>
+        private static void ApplyCurrencySettings(LoadDetail loadDetail, LocalProfileSettings settings)
+        {
+            if (loadDetail == null || settings == null)
+            {
+                return;
+            }
+
+            try
+            {
+                if (loadDetail._userCrystalCount != null)
+                {
+                    if (settings.Rupy.HasValue)
+                    {
+                        loadDetail._userCrystalCount.rupy = settings.Rupy.Value;
+                    }
+
+                    if (settings.RedEther.HasValue)
+                    {
+                        loadDetail._userCrystalCount.red_ether = settings.RedEther.Value;
+                    }
+                }
+
+                if (settings.TicketItems != null && settings.TicketItems.Count > 0)
+                {
+                    if (loadDetail._userItemDict == null)
+                    {
+                        loadDetail._userItemDict = new Dictionary<int, int>();
+                    }
+
+                    foreach (KeyValuePair<int, int> pair in settings.TicketItems)
+                    {
+                        if (pair.Key > 0 && pair.Value >= 0)
+                        {
+                            loadDetail._userItemDict[pair.Key] = pair.Value;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning("[ProfileOffline] Could not apply local currency settings: " + ex.Message);
+            }
+        }
+
+        /// <summary>「货币修改」保存：金币 / 以太 / 各入场券数量，写进 Mods/Profile.json 并立即生效。</summary>
+        internal static void SaveCurrencies(int rupy, int redEther, Dictionary<int, int> ticketItems)
+        {
+            UpdateSettings(settings =>
+            {
+                settings.Rupy = Math.Max(0, rupy);
+                settings.RedEther = Math.Max(0, redEther);
+                settings.TicketItems = new Dictionary<int, int>();
+                if (ticketItems == null)
+                {
+                    return;
+                }
+
+                foreach (KeyValuePair<int, int> pair in ticketItems)
+                {
+                    if (pair.Key > 0)
+                    {
+                        settings.TicketItems[pair.Key] = Math.Max(0, pair.Value);
+                    }
+                }
+            });
         }
 
         private static void ApplyLeaderSkinSettings(LocalProfileSettings settings)

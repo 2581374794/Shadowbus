@@ -27,7 +27,7 @@ Mods/.shadowbus-editor-backups/<UTC 时间>/<原相对路径>
 | --- | --- | --- |
 | BossRush | `BossRush/<包名>/bossrush.json` | 完整已知字段表单、Boss/加护排序复制、隐藏 Boss、本地 AI 引用 |
 | AIData | `AIData/deck|style|emote/*.csv` 与 `BossRush/<包名>/ai/.../*.csv` | Deck 基础列和 Tag 组、Style/Emote 表格 |
-| CardMaster | `CardMaster/*.json` | 补丁列表、属性字典、技能并行字段、本地化和数组字段 |
+| CardMaster | `CardMaster/<卡文件夹>/*.json` 与 `CardMaster/*.json` | 补丁列表、属性字典、技能并行字段、本地化、本地卡图/语音和数组字段 |
 | Format | `Format/*.json` | 所有赛制限制和单卡限制 |
 | TwoPick | `TwoPick/*.json` | 职业、轮次、卡池、排除与权重规则 |
 | AI 参考 | `AIData/ai_*.json`、BossRush Reference 目录 | 只读搜索 |
@@ -59,7 +59,7 @@ Mods/.shadowbus-editor-backups/<UTC 时间>/<原相对路径>
 
 ```powershell
 cd WebEditor
-npm run build:catalog                 # 使用默认游戏路径
+npm run build:catalog                 # 自动查找游戏目录（或设 SHADOWVERSE_DIR）
 npm run build:catalog -- <csv 路径>   # 或手动指定
 ```
 
@@ -208,7 +208,7 @@ DSL 比六个字段能表达的更多，因此两种情况会被整批拒绝而�
 
 ```powershell
 cd WebEditor
-npm run build:reference                                  # 使用默认游戏路径
+npm run build:reference                                  # 自动查找游戏目录（或设 SHADOWVERSE_DIR）
 npm run build:reference -- <backup csv> <card_names csv> # 或手动指定
 ```
 
@@ -245,6 +245,45 @@ U+4E00–U+9FFF 的 20992 个汉字中有 2473 个折叠到不同字符。表随
 
 折叠只用于搜索，绝不用于写回文件：它是检索键，不是转换——游戏需要卡牌本来的写法。
 
+## CardMaster 卡文件夹与本地资源
+
+2.5.5 起一张 mod 卡住在自己的文件夹里，卡图与语音也都放在那里：
+
+```text
+Mods/CardMaster/我的卡/我的卡.json       卡的定义（夹里的 json 名随意，可以有多个）
+Mods/CardMaster/我的卡/card.png          卡图：约定名，或由 imageFiles 声明
+Mods/CardMaster/我的卡/音效/登场.wav      语音：约定名，或由 voiceFiles 声明
+```
+
+侧栏的 CardMaster 列表同时收录 `CardMaster/<卡文件夹>/<文件>.json` 和仍然支持的根目录散装
+`CardMaster/<文件>.json`；`CardMaster/Reference/` 是导出的参考表，不会被当成卡。
+
+编辑器新增三个字段，值全部相对卡文件夹：
+
+| 字段 | 内容 |
+| --- | --- |
+| `extraVoiceIds` | `string[]`。借用原版语音库，填原版语音列里的 ID，例如 `125641030_4`；只写 `125641030` 也一样，游戏按第一个 `_` 之前的卡号去找 `v/vo_<卡号>.acb`。数字按字符串读取，空白与重复项自动去掉。 |
+| `imageFiles` | `{ normal?, evolved? }`，卡图文件名，可以带子目录（`图/card.png`）。留空时用约定名 `card.png` / `card_evo.png`，进化图留空则沿用进化前那张。 |
+| `voiceFiles` | `play`、`evolve`、`attack`、`evolvedAttack`、`destroy`、`evolvedDestroy` 六个时点，加上 `skills`、`evolvedSkills` 两个按技能槽位的数组。留空的时点继续使用模板卡语音。 |
+
+三个字段都只在填写后才写进 json——清空就把键去掉，`extraVoiceIds` 为空数组时也一样，未知
+子键原样保留。绝对路径、以及用 `..` 跳出卡文件夹的路径会被报为错误，因为插件拒绝这样的路径
+（`ModCardAssets.TryResolveRelativePath`）；借用语音里卡号部分不是数字的条目会给出警告，因为
+游戏只会去找 `v/vo_<卡号>.acb`。json 若直接放在 `CardMaster/` 根目录，它就没有自己的卡文件夹，
+声明了本地文件会给出警告。
+
+## CardMaster 闪卡自动派生
+
+`newCard: true` 的补丁只写普通版就够了：插件会克隆模板卡自己的闪卡版本，按 `cardId + 1` 自动
+生成闪卡记录（`CardMasterPatcher.TryAddFoilCompanion`），所以 `FoilCardId` 不需要手填，「补丁
+目标」里也会直接提示这一点。两种情况会让插件跳过派生：
+
+- 补丁里显式写了 `"IsFoil": true`：这是手工配对普通版与闪卡版，插件不介入，编辑器也不再提示；
+- `cardId + 1` 已被占用（同一批补丁里的另一张卡，或 CardMaster 里已有的卡），插件只记一条日志。
+
+编辑器会按当前文件的补丁和内置卡表检查这个卡号，命中就给出「卡号 … 已被占用，闪卡版会自动
+跳过」的警告——只写普通版时应为每张卡预留成对的 ID。
+
 ## CardMaster 攻击特效
 
 CardMaster 编辑器支持 `attackEffectFields`。每个字段使用 `[普通, 进化]` 两个值：`effectPath`（特效路径）、`se`（音效路径）、`moveType`（移动类型）、`effectEnginType`（`NONE`、`SHURIKEN`、`FLATOUT` 或 `SOLID`）和 `time`（秒）。留空字段会继续使用模板卡牌的攻击特效。
@@ -259,5 +298,7 @@ CardMaster 编辑器支持 `attackEffectFields`。每个字段使用 `[普通, �
   卡牌效果参考面板按卡名或效果文查找现成卡牌（见上文）。
 - File System Access API 的直接目录读写只由 Chromium 系浏览器完整支持；其他浏览器
   使用导入目录和 ZIP 导出。
+- 闪卡自动派生的卡号检查只能看到当前打开的这个 CardMaster 文件和内置卡表；别的
+  CardMaster 文件占用了 `cardId + 1` 时编辑器不会发现（游戏里那张闪卡仍会自动跳过）。
 - `Reference`、BossRush `State`、`selected.txt` 和 AI 导出 JSON 只作为参考或运行状态，
   不由表单修改。

@@ -356,6 +356,12 @@ namespace Shadowbus
             Action<ScenarioTemporaryVoice.DownloadInfo> finishCallback,
             ref IEnumerator __result)
         {
+            if (Plugin.AllowTemporaryVoiceDownload)
+            {
+                LogTemporaryVoiceDownloadOnce("GetDownloadInfoCoroutine");
+                return true;
+            }
+
             __result = ReturnDownloadedVoiceInfo(finishCallback);
             return false;
         }
@@ -366,8 +372,34 @@ namespace Shadowbus
             Action finishCallback,
             ref IEnumerator __result)
         {
+            if (Plugin.AllowTemporaryVoiceDownload)
+            {
+                LogTemporaryVoiceDownloadOnce("DownloadCoroutine");
+                return true;
+            }
+
             __result = CompleteVoiceDownload(finishCallback);
             return false;
+        }
+
+        private static bool HasLoggedTemporaryVoiceDownload;
+
+        /// <summary>
+        /// 开了 [Resources] AllowTemporaryVoiceDownload 之后，剧情临时语音会真的去服务器下载
+        /// （下到的文件按游戏自己的规则落在资源目录的 v/t/ 下）。日志里说明一次，免得以为卡住了。
+        /// </summary>
+        private static void LogTemporaryVoiceDownloadOnce(string source)
+        {
+            if (HasLoggedTemporaryVoiceDownload)
+            {
+                return;
+            }
+
+            HasLoggedTemporaryVoiceDownload = true;
+            Plugin.Logger.LogInfo(
+                $"[Offlinizer] Temporary story voice download is ENABLED " +
+                $"(AllowTemporaryVoiceDownload=true, {source}); the game will now talk to the server " +
+                "and write the downloaded ACBs under the resource folder's v/t/.");
         }
 
         [HarmonyPatch(
@@ -724,6 +756,50 @@ namespace Shadowbus
             return TryEnsureLocalVoiceAsset("v/" + prefixedName + ".acb", out _)
                 ? prefixedName
                 : cueName;
+        }
+
+        private static readonly HashSet<string> ExportedScenarioParams =
+            new HashSet<string>(StringComparer.Ordinal);
+
+        /// <summary>
+        /// 把本地剧情脚本资源（Story/Param/scenario_param_*）的原文本导出一份到
+        /// <c>Mods/StoryScenario/</c>，并把这一章的 BGM 注册表记下来（战斗 BGM 只存在于
+        /// 服务器响应里，离线时用剧情 BGM 兜底）。只在第一次读到某个资源时处理，
+        /// 不影响运行时性能。
+        /// </summary>
+        [HarmonyPatch(typeof(ParamMasterHandle), nameof(ParamMasterHandle.GetText))]
+        [HarmonyPostfix]
+        private static void ParamMasterHandle_GetText_Postfix(ParamMasterHandle __instance, string __result)
+        {
+            try
+            {
+                if (__instance == null || string.IsNullOrEmpty(__result))
+                {
+                    return;
+                }
+
+                string resourceId = __instance.ResourceId;
+                if (string.IsNullOrEmpty(resourceId) || !ExportedScenarioParams.Add(resourceId))
+                {
+                    return;
+                }
+
+                string directory = Path.Combine(Plugin.ModPath, "StoryScenario");
+                Directory.CreateDirectory(directory);
+                string fileName = Path.GetFileNameWithoutExtension(resourceId) + ".csv";
+                string path = Path.Combine(directory, fileName);
+                if (File.Exists(path))
+                {
+                    return;
+                }
+
+                File.WriteAllText(path, __result);
+                Plugin.Logger.LogInfo($"[Offlinizer] Exported local story scenario '{fileName}'.");
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[Offlinizer] Could not export a story scenario param: {exception.Message}");
+            }
         }
     }
 }

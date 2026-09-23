@@ -24,7 +24,7 @@ export const uiThemes = [
 ] as const;
 
 export const cardParameterFields = {
-  boolean: ["IsVariableCost", "IsResurgentCard"],
+  boolean: ["IsFoil", "IsVariableCost", "IsResurgentCard"],
   number: [
     "CardId", "ResourceCardId", "CharType", "Clan", "SummonMoveType", "SummonEffectType",
     "Cost", "Atk", "Life", "EvoAtk", "EvoLife", "ChantCount", "Rarity", "GetRedEther",

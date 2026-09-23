@@ -79,6 +79,30 @@ namespace Shadowbus
         public Dictionary<string, string[]> stringArrayFields = [];
         public Dictionary<string, string> localizationFields = [];
         public AttackEffectParameterPatch attackEffectFields = new AttackEffectParameterPatch();
+        // Optional. Borrow another card's EFFECTS (VFX + SE), the same way
+        // normalArtCardId borrows artwork and extraVoiceIds borrows voice banks.
+        // Everything the game needs to *show* an ability - the effect prefab name,
+        // its SE cue, how it moves, how long it plays - is read straight off the
+        // source card, so a mod card can look and sound like an official one
+        // without anyone having to type effect names by hand.
+        //
+        //   effectBorrowCardId  - everything below at once (summon/evolve/attack/skill)
+        //   summonEffectCardId  - summon + destroy effect/SE, SummonEffectType/MoveType, SummonTime
+        //   evolveEffectCardId  - evolve effect/SE, EvoEffectType, EvolTime
+        //   attackEffectCardId  - the whole AtkEffectParameter (effect/SE/move/engine/time)
+        //   skillEffectCardId   - every Skill*/EvoSkill* effect+SE array and SkillVoice
+        //
+        // The per-slot fields are applied after effectBorrowCardId, and the patch's own
+        // string/array fields are applied after all of them, so the most specific
+        // declaration always wins. Borrowed effect bundles (effect_<name>.unity3d) and
+        // SE banks (s/<se>.acb) are loaded automatically - without that the names would
+        // point at assets nothing ever loaded and the ability would play silently.
+        public int? effectBorrowCardId;
+        public int? summonEffectCardId;
+        public int? evolveEffectCardId;
+        public int? attackEffectCardId;
+        public int? skillEffectCardId;
+        public int? destroyEffectCardId;
         // Optional. Local audio files inside the card's own folder, used as this card's
         // voices. Applied right after PatchTemplate, because the cue names it produces are
         // written straight onto the card's voice fields.
@@ -495,6 +519,8 @@ namespace Shadowbus
         }
     }
 
+
+
     /// <summary>
     /// The game's attack effect data is stored in a nested AttackEffectParameter
     /// rather than as writable CardParameter properties. Keep it as a small,
@@ -510,6 +536,314 @@ namespace Shadowbus
     }
     public class CardMasterPatcher
     {
+
+        // ------------------------------------------------------------ 借来的特效（VFX + SE）
+        //
+        // 和借卡图（normalArtCardId）、借语音库（extraVoiceIds）一个思路：在 json 里写一个
+        // 来源卡号，插件把引擎真正要用的那套字段整组抄过来（特效名、SE 名、移动方式、
+        // 引擎类型、时长），再把来源卡的 effect_<名字>.unity3d 挂进预载清单 ——
+        // 不挂的话那些名字指向的包谁都没加载过，技能就是「静默无特效」
+        // （引擎只是取不到 GameObject，不报错、不崩）。
+        //
+        //   effectBorrowCardId  → 下面全部
+        //   summonEffectCardId  → SummonEffectPath / SummonSePath / SummonMoveType /
+        //                         SummonEffectType / SummonTime
+        //   destroyEffectCardId → DestroyEffectPath（破坏演出没有 SE 字段）
+        //   evolveEffectCardId  → EvolEffectPath / EvolSePath / EvoEffectType / EvolTime
+        //   attackEffectCardId  → AtkEffectParameter（_effectPath/_se/_moveType/
+        //                         _effectEnginType/_time，普通 + 进化两套）
+        //   skillEffectCardId   → SkillEffectPath / SkillSe / SkillMoveType /
+        //                         SkillEffectEnginType / SkillEffectTime /
+        //                         SkillEffectTargetType 以及对应的 EvoSkill* 六项
+        //
+        // 只管「演出」。技能本身（Skill / SkillTiming / SkillCondition / SkillTarget /
+        // SkillOption / SkillPreprocess）不在这里借 —— 那是效果逻辑。
+        private static readonly string[] SummonEffectFieldNames =
+        {
+            nameof(CardParameter.SummonEffectPath),
+            nameof(CardParameter.SummonSePath),
+            nameof(CardParameter.SummonMoveType),
+            nameof(CardParameter.SummonEffectType),
+            nameof(CardParameter.SummonTime)
+        };
+
+        private static readonly string[] DestroyEffectFieldNames =
+        {
+            nameof(CardParameter.DestroyEffectPath)
+        };
+
+        private static readonly string[] EvolveEffectFieldNames =
+        {
+            nameof(CardParameter.EvolEffectPath),
+            nameof(CardParameter.EvolSePath),
+            nameof(CardParameter.EvoEffectType),
+            nameof(CardParameter.EvolTime)
+        };
+
+        private static readonly string[] AttackEffectFieldNames =
+        {
+            nameof(CardParameter.AtkEffectParameter)
+        };
+
+        private static readonly string[] SkillEffectFieldNames =
+        {
+            nameof(CardParameter.SkillEffectPath),
+            nameof(CardParameter.SkillSe),
+            nameof(CardParameter.SkillMoveType),
+            nameof(CardParameter.SkillEffectEnginType),
+            nameof(CardParameter.SkillEffectTime),
+            nameof(CardParameter.SkillEffectTargetType),
+            nameof(CardParameter.EvoSkillEffectPath),
+            nameof(CardParameter.EvoSkillSe),
+            nameof(CardParameter.EvoSkillMoveType),
+            nameof(CardParameter.EvoSkillEffectEnginType),
+            nameof(CardParameter.EvoSkillEffectTime),
+            nameof(CardParameter.EvoSkillEffectTargetType)
+        };
+
+        /// <summary>借用登记：目标卡号 → 要加载的特效包 / SE 库。</summary>
+        private sealed class BorrowedEffectResources
+        {
+            public readonly HashSet<string> EffectBundles =
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            public readonly HashSet<string> SeBanks =
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        private static readonly Dictionary<int, BorrowedEffectResources> BorrowedEffectsByCardId =
+            new Dictionary<int, BorrowedEffectResources>();
+
+        private static readonly HashSet<string> BorrowedEffectWarnings = [];
+
+        private static bool BorrowedEffectBundlesRequestedInGroup;
+
+        /// <summary>
+        /// 按 <paramref name="patch"/> 的声明，把来源卡的特效/音效字段抄到 <paramref name="target"/>。
+        /// 必须在 <c>PatchTemplate</c> **之前**调用：抄完再由 json 自己写的字段覆盖，
+        /// 「明确写的」永远赢过「借来的」。
+        /// </summary>
+        internal static void ApplyBorrowedEffects(
+            CardParameterPatch patch,
+            CardParameter target,
+            CardMaster master)
+        {
+            if (patch == null || target == null || master == null)
+            {
+                return;
+            }
+
+            // 先整套（effectBorrowCardId），再逐槽位；越具体的越晚抄。
+            BorrowEffectFields(patch, target, master, patch.effectBorrowCardId, "all",
+                SummonEffectFieldNames, DestroyEffectFieldNames, EvolveEffectFieldNames,
+                AttackEffectFieldNames, SkillEffectFieldNames);
+            BorrowEffectFields(patch, target, master, patch.summonEffectCardId, "summon",
+                SummonEffectFieldNames);
+            BorrowEffectFields(patch, target, master, patch.destroyEffectCardId, "destroy",
+                DestroyEffectFieldNames);
+            BorrowEffectFields(patch, target, master, patch.evolveEffectCardId, "evolve",
+                EvolveEffectFieldNames);
+            BorrowEffectFields(patch, target, master, patch.attackEffectCardId, "attack",
+                AttackEffectFieldNames);
+            BorrowEffectFields(patch, target, master, patch.skillEffectCardId, "skill",
+                SkillEffectFieldNames);
+        }
+
+        private static void BorrowEffectFields(
+            CardParameterPatch patch,
+            CardParameter target,
+            CardMaster master,
+            int? sourceCardId,
+            string label,
+            params string[][] fieldGroups)
+        {
+            if (!sourceCardId.HasValue || sourceCardId.Value <= 0)
+            {
+                return;
+            }
+
+            if (sourceCardId.Value == target.CardId)
+            {
+                WarnBorrowedEffectOnce(
+                    $"self:{target.CardId}:{label}",
+                    $"card {target.CardId} cannot borrow its own effects ({label}); ignored");
+                return;
+            }
+
+            CardParameter source;
+            try
+            {
+                source = master.GetCardParameterFromId(sourceCardId.Value);
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning(
+                    $"[CardEffect] card {target.CardId} could not read effect source {sourceCardId.Value}: {exception.Message}");
+                return;
+            }
+
+            if (source == null)
+            {
+                WarnBorrowedEffectOnce(
+                    $"missing:{target.CardId}:{label}:{sourceCardId.Value}",
+                    $"card {target.CardId} borrows effects from {sourceCardId.Value}, which does not exist");
+                return;
+            }
+
+            // 深拷贝一份当「捐赠者」：里面的数组/嵌套对象都是新副本，抄给目标卡之后
+            // 不会和来源卡共享可变状态（来源多半是原版卡，被改坏就麻烦了）。
+            CardParameter donor;
+            try
+            {
+                donor = CardParameterCloner.DeepClone(source);
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning(
+                    $"[CardEffect] card {target.CardId} could not clone effect source {sourceCardId.Value}: {exception.Message}");
+                return;
+            }
+
+            int copied = 0;
+            foreach (string[] group in fieldGroups)
+            {
+                foreach (string fieldName in group)
+                {
+                    if (CopyEffectField(donor, target, fieldName))
+                    {
+                        copied++;
+                    }
+                }
+            }
+
+            if (copied == 0)
+            {
+                return;
+            }
+
+            CollectBorrowedEffectResources(donor, target.CardId);
+            Plugin.Logger.LogInfo(
+                $"[CardEffect] card {target.CardId} borrows {label} effects from {sourceCardId.Value} " +
+                $"({copied} field(s)).");
+        }
+
+        private static bool CopyEffectField(CardParameter donor, CardParameter target, string fieldName)
+        {
+            PropertyInfo property = typeof(CardParameter).GetProperty(
+                fieldName,
+                BindingFlags.Instance | BindingFlags.Public);
+            if (property == null || !property.CanRead || !property.CanWrite)
+            {
+                WarnBorrowedEffectOnce(
+                    $"field:{fieldName}",
+                    $"CardParameter has no writable property '{fieldName}'; that effect field was skipped");
+                return false;
+            }
+
+            try
+            {
+                property.SetValue(target, property.GetValue(donor));
+                return true;
+            }
+            catch (Exception exception)
+            {
+                WarnBorrowedEffectOnce(
+                    $"copy:{fieldName}",
+                    $"could not copy effect field '{fieldName}': {exception.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>把抄过来的特效名 / SE 名登记成「要加载的东西」。</summary>
+        private static void CollectBorrowedEffectResources(CardParameter donor, int targetCardId)
+        {
+            if (donor == null || targetCardId <= 0)
+            {
+                return;
+            }
+
+            if (!BorrowedEffectsByCardId.TryGetValue(targetCardId, out BorrowedEffectResources resources))
+            {
+                resources = new BorrowedEffectResources();
+                BorrowedEffectsByCardId[targetCardId] = resources;
+            }
+
+            AddEffectBundle(resources, donor.SummonEffectPath);
+            AddEffectBundle(resources, donor.DestroyEffectPath);
+            AddEffectBundles(resources, donor.EvolEffectPath);
+            AddEffectBundles(resources, donor.SkillEffectPath);
+            AddEffectBundles(resources, donor.EvoSkillEffectPath);
+
+            AddSeBank(resources, donor.SummonSePath);
+            AddSeBanks(resources, donor.EvolSePath);
+            AddSeBanks(resources, donor.SkillSe);
+            AddSeBanks(resources, donor.EvoSkillSe);
+
+            CardParameter.AttackEffectParameter attack = donor.AtkEffectParameter;
+            if (attack != null)
+            {
+                AddEffectBundles(resources, attack._effectPath);
+                AddSeBanks(resources, attack._se);
+            }
+        }
+
+        private static void AddEffectBundles(BorrowedEffectResources resources, IEnumerable<string> names)
+        {
+            if (names == null)
+            {
+                return;
+            }
+
+            foreach (string name in names)
+            {
+                AddEffectBundle(resources, name);
+            }
+        }
+
+        private static void AddEffectBundle(BorrowedEffectResources resources, string effectName)
+        {
+            // 引擎就是这么拼的：GetAssetTypePath(name, Effect2D /*37*/, isfetch:false)
+            // → "effect_" + name.ToLower() + ".unity3d"（对象路径是 Effect/Effects/<name>）。
+            if (resources == null || string.IsNullOrEmpty(effectName))
+            {
+                return;
+            }
+
+            resources.EffectBundles.Add("effect_" + effectName.Trim().ToLowerInvariant() + ".unity3d");
+        }
+
+        private static void AddSeBanks(BorrowedEffectResources resources, IEnumerable<string> names)
+        {
+            if (names == null)
+            {
+                return;
+            }
+
+            foreach (string name in names)
+            {
+                AddSeBank(resources, name);
+            }
+        }
+
+        private static void AddSeBank(BorrowedEffectResources resources, string seName)
+        {
+            // 战斗特效的 SE 和特效分开打包：BattleResourceMgr.LoadEffectBattle 会把
+            // "s/<se>.acb" 一起塞进加载清单（随从的进化 SE 同理）。
+            if (resources == null || string.IsNullOrEmpty(seName))
+            {
+                return;
+            }
+
+            resources.SeBanks.Add("s/" + seName.Trim() + ".acb");
+        }
+
+        private static void WarnBorrowedEffectOnce(string key, string message)
+        {
+            if (BorrowedEffectWarnings.Add(key))
+            {
+                Plugin.Logger.LogWarning($"[CardEffect] {message}");
+            }
+        }
         public static Dictionary<int,CardParameter> CardParameterBackup = [];
         public static Dictionary<string, string> CustomLocalization = [];
         private static readonly Dictionary<int, FoilEffectBinding>
@@ -521,6 +855,11 @@ namespace Shadowbus
         private static readonly HashSet<int> DisabledFoilEffectResourceIds = [];
         private static readonly HashSet<string> FoilEffectWarnings = [];
         private static readonly HashSet<Material> GeneratedCardMaterials = [];
+        // 同一张卡（同一个变体、同一个模板、同一张贴图）的材质只生成一次。以前每次取
+        // 卡面都 Instantiate 一个新材质，在卡组编辑里反复重画就会一路堆下去，把内存和
+        // 贴图都吊住。键里带模板和贴图的实例号，所以换了模板/贴图不会拿到旧的。
+        private static readonly Dictionary<string, Material> CardMaterialCache =
+            new Dictionary<string, Material>(StringComparer.Ordinal);
 
         // cardId -> extra voice bank ACB paths ("v/vo_<cardId>.acb") declared by
         // that card's patch. Filled while the CardMaster patches are applied and
@@ -547,10 +886,66 @@ namespace Shadowbus
         private static readonly HashSet<string> RequestedArtSourceBundles =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static readonly HashSet<string> ArtSlotWarnings = [];
+
+        /// <summary>
+        /// 材质号 → **实测**取到它的那个 AssetLoadPathType。用来纠正包内的对象路径。
+        ///
+        /// 剧情抉择卡（技巧/秘术）在原版数据里自相矛盾：卡是法术，卡表却让它借用一张
+        /// **随从/护符**的图。战斗里 <c>CardTemplate.DynamicSetupSpellObjMaterials</c> 于是按
+        /// <c>SpellCardMaterial(35)</c> 去拼 <c>Card/Spell/Materials/&lt;材质号&gt;_M</c>，
+        /// 而那个材质物理上躺在 <c>Card/Field/Materials/</c> 下 —— 取不到 → 手牌透明。
+        ///
+        /// 靠 charType 猜目录是不行的（实测：龙蛋 104412010 charType=FIELD，材质却在 spell 目录），
+        /// 所以这里只记「哪次查询真的拿到了材质」，再把对象路径按它纠正。
+        ///
+        /// **记录源必须是实测结果**（<c>AssetManager.LoadObject</c> 里真正命中的那条路径），
+        /// 不能是调用方声明的 <c>type</c>：`FindCardMaterial` 对 ≥10 位的材质号**无视传进来的 type**，
+        /// 一律按 <c>Card/Field/Materials/</c> 拼路径，所以「按声明记」会把实际躺在 field 目录的
+        /// 材质记成 spell。记错的后果不是"没纠正"，而是**把本来正确的请求改坏**：
+        /// 实测 <c>1214410311_M</c> / <c>1215410311_M</c>（剧情「肃清」系列抉择卡的卡面）
+        /// 两张手牌因此变紫红（<c>Assets</c> 里它们的包只有 <c>card/field/materials/</c>，
+        /// 被改去 spell 目录后 <c>LoadObject</c> 找不到 → 没有材质 = 品红）。
+        /// </summary>
+        private static readonly Dictionary<string, ResourcesManager.AssetLoadPathType> MaterialKindByMaterialId =
+            new Dictionary<string, ResourcesManager.AssetLoadPathType>(StringComparer.Ordinal);
+
+        /// <summary>位置相关的诊断只打一次。</summary>
+        private static readonly HashSet<string> MaterialPathFixWarnings = [];
+
+        /// <summary>卡面包里放卡面材质的两种目录（field = 随从/护符，spell = 法术）。</summary>
+        private const string CardFieldMaterialFolder = "card/field/materials/";
+
+        private const string CardSpellMaterialFolder = "card/spell/materials/";
+
+        /// <summary>正在用「另一个目录」重试同一次卡面查找，防止重试再触发重试（无限递归）。</summary>
+        [ThreadStatic]
+        private static bool IsRetryingCardMaterialObject;
+
+        /// <summary>「按另一个目录找回卡面」的诊断只打一次。</summary>
+        private static readonly HashSet<string> MaterialFolderFallbackLog = [];
+
+        /// <summary>
+        /// 抉择卡（技巧/秘术/奥义）的卡面材质：材质号 → 材质。只记引擎自己按
+        /// <c>choiceBrave=true</c> 取过图的那批 —— 这正是"这批卡"最可靠的判据，
+        /// 不用卡号段去猜（猜错会把对手手牌/背面卡也掀开）。
+        /// </summary>
+        private static readonly Dictionary<string, Material> ChoiceFaceMaterials =
+            new Dictionary<string, Material>(StringComparer.Ordinal);
+
+        /// <summary>已经修过（补材质/网格/图层）的「时机 + 材质号」。</summary>
+        private static readonly HashSet<string> AttachedChoiceFaceLog = [];
+
         private static readonly HashSet<int> DisabledArtSlotResourceIds = [];
         // Bundles pulled in by the on-demand fallback in GetArtSlotMaterial. Kept
         // apart from RequestedArtSourceBundles so a bundle the preload path already
         // asked for can still be retried if it turns out not to be resident.
+        //
+        // Requested and Loaded are deliberately two sets: starting the load is
+        // asynchronous, so the lookup that follows it can only succeed once the
+        // bundle is really in memory. Marking a bundle "done" the moment the request
+        // went out is what left a card blank until the UI happened to ask again.
+        private static readonly HashSet<string> ArtSourceBundlesRequestedOnDemand =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static readonly HashSet<string> ArtSourceBundlesLoadedOnDemand =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static bool IsLoadingArtSourceBundle;
@@ -805,7 +1200,12 @@ namespace Shadowbus
             ArtSlotsByTargetResourceId.Clear();
             ArtSlotTargetBundleTypes.Clear();
             RequestedArtSourceBundles.Clear();
+            ArtSourceBundlesRequestedOnDemand.Clear();
             ArtSourceBundlesLoadedOnDemand.Clear();
+            BorrowedEffectsByCardId.Clear();
+            BorrowedEffectWarnings.Clear();
+            BorrowedEffectBundlesRequestedInGroup = false;
+            CardMaterialCache.Clear();
             ArtSourceBundlesRequestedInGroup = false;
             // The registries above are rebuilt from the patch files, so a resource that
             // was disabled by an earlier conflict has to become eligible again - that is
@@ -1164,11 +1564,250 @@ namespace Shadowbus
             return true;
         }
 
+        // ---------------------------------------------------------------------------
+        // 官方卡的「卡图包名」重定向
+        //
+        // 客户端给一张卡取卡面，先要算出装着这张卡图的包：
+        //   GetAssetTypePath(<号>, UnitCardMaterial | SpellCardMaterial, isfetch: false)
+        // 拿到包名后把它加载进来，最后在**所有已加载的包**里按路径搜材质。可这个包名是按
+        // 传进来的那个号拼的（"card_<号>0.unity3d"），而客户端里一大批卡的卡图根本不在那个包里：
+        //   · 闪卡版（…011）的材质放在普通版（…010）的包里；
+        //   · 剧情/特殊卡（蛟的秘术 930444080 → 资源卡号 102424030）的材质放在**别的卡**的包里；
+        //   · 各调用点传进来的号也不统一 —— 卡组编辑/卡牌详情传卡号，UICardList、CardDetailUI、
+        //     UnitBattleCardView 这些传的是资源卡号。
+        // 于是「按号拼出来的包」磁盘上根本没有 → 包永远不会被加载 → 材质搜不到 → 卡面全黑/透明。
+        //
+        // 规律只跟传进来的那个号有关（本地 11895 张卡逐张核对过）：
+        //     材质号 M10 = (号 >= 10 位 ? 号 : 号 * 10)
+        //     真正的包   = "card_" + (M10 - M10 % 100) + ".unity3d"
+        // 只在「按号拼的包磁盘上没有、算出来的这个在」时才换。
+        // ---------------------------------------------------------------------------
+        private static readonly Dictionary<string, string> ArtBundleRedirects =
+            new Dictionary<string, string>(StringComparer.Ordinal);
+
+        /// <summary>
+        /// 从卡表补一批「传卡号」的重定向：有些调用点（卡组编辑的 CardBundle、部分战斗卡牌视图）
+        /// 传的是**卡号**，光按号算规律是算不出来的 —— 卡号 820144030（贯穿肃清的意志）的图
+        /// 其实在资源卡号 1211410301 那一组里。这里用卡表的 ResourceCardId 把它们也登记进去。
+        /// </summary>
+        private static void BuildArtBundleRedirects(CardMaster master)
+        {
+            ArtBundleRedirects.Clear();
+            double startedAt = PerfTrace.Now;
+            if (master == null)
+            {
+                return;
+            }
+
+            IEnumerable<CardParameter> cards = master.GetAllParameters();
+            if (cards == null)
+            {
+                return;
+            }
+
+            int registered = 0;
+            foreach (CardParameter card in cards)
+            {
+                if (card == null || card.CardId <= 0 || card.ResourceCardId <= 0)
+                {
+                    continue;
+                }
+
+                string ownBundle = "card_" + card.CardId + "0.unity3d";
+                if (BundleFileExists(ownBundle))
+                {
+                    continue;
+                }
+
+                long materialId = card.ResourceCardId >= 1000000000
+                    ? card.ResourceCardId
+                    : (long)card.ResourceCardId * 10;
+                string groupBundle = "card_" + (materialId - (materialId % 100)) + ".unity3d";
+
+                if (!string.Equals(groupBundle, ownBundle, StringComparison.OrdinalIgnoreCase) &&
+                    BundleFileExists(groupBundle))
+                {
+                    ArtBundleRedirects[card.CardId.ToString()] = groupBundle;
+                    registered++;
+                }
+            }
+
+            if (registered != 0)
+            {
+                Plugin.Logger.LogInfo(
+                    $"[CardArt] {registered} card id(s) load their card face from another bundle " +
+                    "of the same card group.");
+            }
+
+            PerfTrace.Note("BuildArtBundleRedirects", (long)((PerfTrace.Now - startedAt) * 1000.0));
+        }
+
+        /// <summary>这个号要卡图时该加载哪个包；不需要改就返回 null。</summary>
+        private static string RedirectedArtBundle(string idText)
+        {
+            string cached;
+            if (ArtBundleRedirects.TryGetValue(idText, out cached))
+            {
+                return string.IsNullOrEmpty(cached) ? null : cached;
+            }
+
+            // 传进来的是资源卡号时（UICardList / CardDetailUI / UnitBattleCardView 这些），
+            // 规律只跟这个号本身有关，不需要卡表。
+            string redirect = null;
+            long id;
+            if (long.TryParse(idText, out id) && id > 0)
+            {
+                long materialId = id >= 1000000000 ? id : id * 10;
+                string groupBundle = "card_" + (materialId - (materialId % 100)) + ".unity3d";
+                string ownBundle = "card_" + idText + "0.unity3d";
+
+                if (!string.Equals(groupBundle, ownBundle, StringComparison.OrdinalIgnoreCase) &&
+                    !BundleFileExists(ownBundle) &&
+                    BundleFileExists(groupBundle))
+                {
+                    redirect = groupBundle;
+                }
+            }
+
+            ArtBundleRedirects[idText] = redirect;
+            return redirect;
+        }
+
+        /// <summary>
+        /// 这个包在额外资源目录里存在吗。没有额外资源目录时一律返回 true ——
+        /// 那种情况下不该替游戏下判断，交给它自己按原路径处理。
+        /// </summary>
+        private static bool BundleFileExists(string bundle)
+        {
+            string root = ResourceRootPatches.ResourceRoot;
+            if (string.IsNullOrEmpty(root))
+            {
+                return true;
+            }
+
+            try
+            {
+                return System.IO.File.Exists(System.IO.Path.Combine(root, "a", bundle));
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 卡面材质的两条路都要纠正：
+        /// <list type="bullet">
+        ///   <item><c>isfetch=false</c>：包名（纯数字输入，换成真正装着材质的包）；</item>
+        ///   <item><c>isfetch=true</c>：包内的对象路径（<c>Card/Spell/Materials/&lt;材质号&gt;_M</c>
+        ///         与 <c>Card/Field/Materials/…</c> 之间的目录纠正）。</item>
+        /// </list>
+        /// </summary>
+        [HarmonyPatch(typeof(ResourcesManager), nameof(ResourcesManager.GetAssetTypePath))]
+        [HarmonyPostfix]
+        private static void ResourcesManager_GetAssetTypePath_CardArt(
+            string path,
+            ResourcesManager.AssetLoadPathType type,
+            bool isfetch,
+            ref string __result)
+        {
+            if (type != ResourcesManager.AssetLoadPathType.UnitCardMaterial &&
+                type != ResourcesManager.AssetLoadPathType.SpellCardMaterial)
+            {
+                return;
+            }
+
+            if (isfetch)
+            {
+                // 对象路径：目录段可能和实际不符，按实测学到的目录纠正。
+                string corrected = CorrectMaterialObjectPath(path, type, __result);
+                if (corrected != null)
+                {
+                    __result = corrected;
+                }
+
+                return;
+            }
+
+            if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(__result) || path.Length > 10 ||
+                !__result.StartsWith("card_", StringComparison.Ordinal) ||
+                !__result.EndsWith(".unity3d", StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            for (int i = 0; i < path.Length; i++)
+            {
+                if (path[i] < '0' || path[i] > '9')
+                {
+                    return;
+                }
+            }
+
+            string redirect = RedirectedArtBundle(path);
+            if (redirect != null)
+            {
+                __result = redirect;
+            }
+        }
+
+        /// <summary>
+        /// 把 <c>Card/Spell/Materials/&lt;材质号&gt;_M</c> 这类对象路径换成实测取到材质的那个目录。
+        /// 只有「这个材质号之前确实在另一种目录下拿到了带贴图的材质」时才改，否则返回 null 不动它。
+        /// </summary>
+        private static string CorrectMaterialObjectPath(
+            string name,
+            ResourcesManager.AssetLoadPathType requested,
+            string result)
+        {
+            if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(result) || name.Length < 3)
+            {
+                return null;
+            }
+
+            // 调用方给的可能是材质名（<材质号>_M），也可能只是材质号（路径由引擎自己补 _M）。
+            string materialId = name.EndsWith("_M", StringComparison.Ordinal)
+                ? name.Substring(0, name.Length - 2)
+                : name;
+            for (int i = 0; i < materialId.Length; i++)
+            {
+                if (materialId[i] < '0' || materialId[i] > '9')
+                {
+                    return null;
+                }
+            }
+
+            ResourcesManager.AssetLoadPathType working;
+            if (!MaterialKindByMaterialId.TryGetValue(materialId, out working) || working == requested)
+            {
+                return null;
+            }
+
+            string expected = working == ResourcesManager.AssetLoadPathType.UnitCardMaterial
+                ? "/Field/Materials/"
+                : "/Spell/Materials/";
+            string wrong = expected == "/Field/Materials/" ? "/Spell/Materials/" : "/Field/Materials/";
+            if (result.IndexOf(wrong, StringComparison.Ordinal) < 0)
+            {
+                return null;
+            }
+
+            string corrected = result.Replace(wrong, expected);
+            if (MaterialPathFixWarnings.Add(materialId))
+            {
+                Plugin.Logger.LogInfo(
+                    $"[CardArt] {materialId}_M is really stored under {expected}; corrected the engine's " +
+                    $"object path '{result}' -> '{corrected}' (this card's kind and the artwork it borrows " +
+                    "disagree in the stock data).");
+            }
+
+            return corrected;
+        }
+
         private static void BuildArtSlotRegistry(
             CardMaster master,
             IEnumerable<ArtSlotRequest> requests)
-        {
-            foreach (ArtSlotRequest request in requests)
+        {            foreach (ArtSlotRequest request in requests)
             {
                 CardParameter target = master.GetCardParameterFromId(request.CardId);
                 if (target == null)
@@ -1416,6 +2055,11 @@ namespace Shadowbus
                     $"material-unavailable:{resourceCardId}:{bundleType}:{isEvolution}",
                     $"artwork source {resourceCardId} ({bundleType}) is unavailable; the engine artwork is used instead");
             }
+            else
+            {
+                // 借来的卡面同样要保活，否则战斗中途会被 UnloadUnusedAssets 收走（卡面变紫红）。
+                KeepArtAssetsAlive(material);
+            }
 
             return material;
         }
@@ -1448,6 +2092,44 @@ namespace Shadowbus
         // Loads one borrowed-art bundle on the spot. Returns true when the caller
         // should retry the lookup. Each bundle is attempted once per CardMaster
         // generation, so a genuinely missing bundle does not spin.
+        /// <summary>
+        /// 卡图真正所在的那个包名。
+        ///
+        /// 常规情况就是「按资源卡号算出来的包名」（<c>GetAssetTypePath(id, type, false)</c>）。
+        /// 但客户端里有一大批卡（实测 2742 张）的 <c>ResourceCardId</c> 指向**别的卡**：
+        /// 按自己的资源号算出来的包名磁盘上根本没有，真正装着材质的是
+        /// <c>card_&lt;材质号去掉后两位&gt;.unity3d</c>（一张卡面材质
+        /// <c>&lt;10位材质号&gt;_M</c> 与同组的另外三个变体一起放在这个包里）。
+        /// 这条规律在本地 2742 张上逐张核对过，0 例外。
+        /// </summary>
+        private static string ResolveArtBundleName(
+            ResourcesManager resourcesManager,
+            int resourceCardId,
+            ResourcesManager.AssetLoadPathType bundleType)
+        {
+            string byResource = resourcesManager.GetAssetTypePath(
+                resourceCardId.ToString(),
+                bundleType,
+                false);
+
+            if (string.IsNullOrEmpty(byResource) || BundleFileExists(byResource))
+            {
+                return byResource;
+            }
+
+            string materialId = resourceCardId >= 1000000000
+                ? resourceCardId.ToString()
+                : resourceCardId + "0";
+            long value;
+            if (!long.TryParse(materialId, out value))
+            {
+                return byResource;
+            }
+
+            string groupBundle = "card_" + (value - (value % 100)) + ".unity3d";
+            return BundleFileExists(groupBundle) ? groupBundle : byResource;
+        }
+
         private static bool TryLoadArtSourceBundleOnDemand(
             int resourceCardId,
             ResourcesManager.AssetLoadPathType bundleType)
@@ -1470,10 +2152,7 @@ namespace Shadowbus
             string bundle;
             try
             {
-                bundle = resourcesManager.GetAssetTypePath(
-                    resourceCardId.ToString(),
-                    bundleType,
-                    false);
+                bundle = ResolveArtBundleName(resourcesManager, resourceCardId, bundleType);
             }
             catch (Exception e)
             {
@@ -1482,15 +2161,35 @@ namespace Shadowbus
                 return false;
             }
 
-            if (string.IsNullOrEmpty(bundle) || !ArtSourceBundlesLoadedOnDemand.Add(bundle))
+            if (string.IsNullOrEmpty(bundle))
             {
                 return false;
+            }
+
+            // 这个按号算出来的包磁盘上就没有：请求它只会白跑一趟，而且协程回调还会把它
+            // 记成「按需已加载」，之后再也不重试。直接当作「没有」处理。
+            if (!BundleFileExists(bundle))
+            {
+                return false;
+            }
+
+            // 包已经在内存里，或者上一次请求还在飞:前者不用再拉，后者让调用方直接重查
+            // （协程跑完之前查不到，但下一次调用就会命中）。两种都不再记账成"试过了"。
+            if (ArtSourceBundlesLoadedOnDemand.Contains(bundle))
+            {
+                return false;
+            }
+
+            if (ArtSourceBundlesRequestedOnDemand.Contains(bundle))
+            {
+                return true;
             }
 
             try
             {
                 if (resourcesManager.IsLoadedAssetBundle(bundle))
                 {
+                    ArtSourceBundlesLoadedOnDemand.Add(bundle);
                     return false;
                 }
             }
@@ -1499,18 +2198,36 @@ namespace Shadowbus
                 // The probe is only an optimisation; fall through and try to load.
             }
 
+            ArtSourceBundlesRequestedOnDemand.Add(bundle);
+
             try
             {
-                IsLoadingArtSourceBundle = true;
-                resourcesManager.StartCoroutine_LoadAssetGroupSync(
-                    new List<string> { bundle },
-                    null,
-                    true);
-                Plugin.Logger.LogDebug($"loading borrowed artwork bundle on demand: {bundle}");
+                using (PerfTrace.Enter("loadArtBundle(" + bundle + ")"))
+                {
+                    IsLoadingArtSourceBundle = true;
+
+                    // 必须是异步那一支（StartCoroutine_LoadAssetGroupSync 会传
+                    // preferSynchronousLoad=true，AssetHandle 立刻走阻塞的 AssetBundle.LoadFromFile）。
+                    // 这个调用点在 FindCardMaterial 里面 —— 也就是**游戏自己正在加载资源的时候**，
+                    // 同步再去拉一个包属于「在包加载过程中重入包加载」，实测会把主线程彻底挂住
+                    // （日志最后一行停在加载中途，之后再没有任何输出）。
+                    // 异步只把包排进队列，几帧后回调；调用方下次查卡面时就已经命中了。
+                    resourcesManager.StartCoroutine_LoadAssetGroupAsync(
+                        new List<string> { bundle },
+                        delegate
+                        {
+                            ArtSourceBundlesLoadedOnDemand.Add(bundle);
+                            Plugin.Logger.LogInfo($"[ArtBundle] Borrowed artwork bundle {bundle} is loaded.");
+                        },
+                        true);
+                }
+
+                Plugin.Logger.LogInfo($"[ArtBundle] Requested borrowed artwork bundle {bundle} on demand.");
                 return true;
             }
             catch (Exception e)
             {
+                ArtSourceBundlesRequestedOnDemand.Remove(bundle);
                 Plugin.Logger.LogWarning(
                     $"failed to load borrowed artwork bundle {bundle}: {e.Message}");
                 return false;
@@ -1566,12 +2283,20 @@ namespace Shadowbus
                 return;
             }
 
-            string bundle = resourcesManager.GetAssetTypePath(
-                resourceCardId.ToString(),
-                bundleType,
-                false);
+            // 这里传进来的常常是**10 位材质号**（借来的卡面就是按材质号登记的），按
+            // `<id>0.unity3d` 算出来的包名磁盘上根本不存在 —— 真正装着它的是同组的包
+            // （见 ResolveArtBundleName）。把一个不存在的包名塞进加载列表只会让引擎白跑一趟、
+            // 日志里多一条找不到包；这里按实测规律纠正，确实没有就不加（按需加载那条路还会再试）。
+            string bundle = ResolveArtBundleName(resourcesManager, resourceCardId, bundleType);
             if (string.IsNullOrEmpty(bundle) || !loaded.Add(bundle))
             {
+                return;
+            }
+
+            if (!BundleFileExists(bundle))
+            {
+                Plugin.Logger.LogDebug(
+                    $"borrowed artwork bundle {bundle} is not on disk; skipping the preload of resource {resourceCardId}.");
                 return;
             }
 
@@ -1696,6 +2421,9 @@ namespace Shadowbus
                                 continue;
                             }
 
+                            // 借来的特效要先抄：抄完 PatchTemplate 里 json 明确写的字段再覆盖，
+                            // 「明确写的」赢过「借来的」。
+                            ApplyBorrowedEffects(patch, variant, master);
                             patch.PatchTemplate(variant, preserveVariantIdentity: true);
                             LocalCardVoicePatches.ApplyVoiceFiles(
                                 variant,
@@ -1750,6 +2478,7 @@ namespace Shadowbus
                             // Set it before PatchTemplate so localizationFields are also
                             // registered under the new card's ID.
                             newCard.CardId = patch.cardId;
+                            ApplyBorrowedEffects(patch, newCard, master);
                             patch.PatchTemplate(newCard);
                             LocalCardVoicePatches.ApplyVoiceFiles(
                                 newCard,
@@ -1868,6 +2597,7 @@ namespace Shadowbus
 
             BuildFoilEffectRegistry(master, foilEffectRequests);
             BuildArtSlotRegistry(master, artSlotRequests);
+            BuildArtBundleRedirects(master);
             LocalCardVoicePatches.BeginPreload();
 
             // 关键词注册放在「把全卡加入本地收藏」之前：后者依赖 Data.Load，
@@ -2018,6 +2748,7 @@ namespace Shadowbus
                 return;
             }
             SortCardIdListByCost(cardIds);
+            RequestBorrowedArtFor(__result);
         }
 
         [HarmonyPatch(typeof(UIBase_CardManager), "SortIDList", MethodType.Normal)]
@@ -2030,6 +2761,208 @@ namespace Shadowbus
                 return;
             }
             SortCardIdListByCost(cardIds);
+        }
+
+        /// <summary>
+        /// 引擎这个方法本身没有任何空判断：
+        ///
+        ///   return (from id in idList
+        ///           let card = CardMaster.GetInstance(cardMasterId).GetCardParameterFromId(id)
+        ///           orderby new ComparableCard(card.CardId, cardMasterId)   // card 为 null 就 NRE
+        ///           select id).ToList();
+        ///
+        /// 只要传入的 id 列表里有一个卡号在当前卡表里查不到（自制卡被删、旧牌组/牌组码/导入
+        /// 数据里存着已经不存在的卡号），这里就空引用，调用方整段流程断掉 —— 实测：
+        /// 本地牌组列表整份注入失败（DeckInfoTask 报 NullReferenceException），牌组列表打不开。
+        ///
+        /// 所以在原版跑之前把「查不到」的卡号剔掉，其余照旧；只记一次日志。原版与上面那个
+        /// 排序 postfix 都不受影响。
+        /// </summary>
+        [HarmonyPatch(typeof(UIBase_CardManager), "SortIDList", MethodType.Normal)]
+        [HarmonyPrefix]
+        public static bool SortIDList_Prefix(
+            ref IList<int> idList,
+            CardMaster.CardMasterId cardMasterId,
+            ref List<int> __result)
+        {
+            if (idList == null || idList.Count == 0)
+            {
+                return true;
+            }
+
+            CardMaster master;
+            try
+            {
+                master = CardMaster.GetInstance(cardMasterId);
+            }
+            catch (Exception)
+            {
+                master = null;
+            }
+
+            if (master == null)
+            {
+                // 连这张卡表都没拿到：原版那句 `CardMaster.GetInstance(cardMasterId).GetCardParameterFromId(id)`
+                // 自己就会空引用。原样把列表交回去（顺序交给下面的排序 postfix），不抛异常。
+                __result = new List<int>(idList);
+                Plugin.Logger.LogWarning(
+                    $"[Cards] card master '{cardMasterId}' is not available; a card list was passed through unsorted " +
+                    "instead of letting the game throw.");
+                return false;
+            }
+
+            List<int> unknown = null;
+            for (int i = 0; i < idList.Count; i++)
+            {
+                int cardId = idList[i];
+                CardParameter card;
+                try
+                {
+                    card = master.GetCardParameterFromId(cardId);
+                }
+                catch (Exception)
+                {
+                    card = null;
+                }
+
+                if (card == null)
+                {
+                    (unknown ??= []).Add(cardId);
+                }
+            }
+
+            if (unknown == null)
+            {
+                return true;   // 一个都不缺：原样交给原版
+            }
+
+            List<int> kept = new List<int>(idList.Count - unknown.Count);
+            for (int i = 0; i < idList.Count; i++)
+            {
+                if (!unknown.Contains(idList[i]))
+                {
+                    kept.Add(idList[i]);
+                }
+            }
+
+            idList = kept;
+            unknown.Sort();
+            string key = string.Join(",", unknown.Distinct());
+            if (MissingCardIdWarnings.Add(key))
+            {
+                Plugin.Logger.LogWarning(
+                    $"[Cards] a card list references {unknown.Count} card id(s) that are not in the card master " +
+                    $"({cardMasterId}): {string.Join(", ", unknown.Distinct())} — they were skipped so the list could " +
+                    "be built (their card files are probably gone; put them back or fix the deck).");
+            }
+
+            return true;
+        }
+
+        private static readonly HashSet<string> MissingCardIdWarnings = [];
+
+        /// <summary>
+        /// 卡池（卡组编辑的卡表、图鉴、分解界面…）刚算出「要显示哪些卡号」时，先把这些卡
+        /// **借来的卡面所在包**排进加载队列。
+        ///
+        /// 为什么需要这一步：借来的图不在卡自己的包里，只能按需异步补拉；而 UI 是拿到卡号后
+        /// 立刻就去取材质的 —— 包还没到就取，只能拿到空材质（表现为卡图丢失/黑卡），要等玩家
+        /// 滚动或刷新列表才会重新取一次。在"列表刚建好、卡面还没渲染"这个时刻提前请求，
+        /// 大部分情况下包就已经在内存里了。
+        /// </summary>
+        private static void RequestBorrowedArtFor(IEnumerable<int> cardIds)
+        {
+            if (cardIds == null || ArtSlotsByTargetResourceId.Count == 0)
+            {
+                return;
+            }
+
+            int requested = 0;
+            foreach (int cardId in cardIds)
+            {
+                CardParameter card = ResolveCardParameterForPool(cardId);
+                if (card == null ||
+                    !ArtSlotsByTargetResourceId.TryGetValue(
+                        card.ResourceCardId,
+                        out ArtSlotBinding binding))
+                {
+                    continue;
+                }
+
+                if (RequestArtSourceBundle(binding.NormalResourceCardId, binding.NormalBundleType))
+                {
+                    requested++;
+                }
+
+                if (RequestArtSourceBundle(binding.EvolutionResourceCardId, binding.EvolutionBundleType))
+                {
+                    requested++;
+                }
+
+                if (RequestArtSourceBundle(binding.SpellResourceCardId, binding.SpellBundleType))
+                {
+                    requested++;
+                }
+            }
+
+            if (requested != 0)
+            {
+                Plugin.Logger.LogInfo(
+                    $"[CardArt] pre-requested {requested} borrowed artwork bundle(s) for the card list " +
+                    "that is about to be shown.");
+            }
+        }
+
+        private static bool RequestArtSourceBundle(
+            int resourceCardId,
+            ResourcesManager.AssetLoadPathType bundleType)
+        {
+            if (resourceCardId == 0)
+            {
+                return false;
+            }
+
+            try
+            {
+                return TryLoadArtSourceBundleOnDemand(resourceCardId, bundleType);
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning(
+                    $"[CardArt] could not pre-request the artwork bundle of {resourceCardId}: {exception.Message}");
+                return false;
+            }
+        }
+
+        private static CardParameter ResolveCardParameterForPool(int cardId)
+        {
+            if (cardId <= 0)
+            {
+                return null;
+            }
+
+            try
+            {
+                CardMaster master = CardMaster.GetInstanceForBattle();
+                CardParameter card = master != null ? master.GetCardParameterFromId(cardId) : null;
+                if (card != null)
+                {
+                    return card;
+                }
+            }
+            catch (Exception)
+            {
+            }
+
+            try
+            {
+                CardMaster master = CardMaster.GetInstance(CardMaster.CardMasterId.Default);
+                return master != null ? master.GetCardParameterFromId(cardId) : null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
         }
 
         // Deck edit (the card pool with the search box) uses a THIRD path that
@@ -2050,6 +2983,7 @@ namespace Shadowbus
                 return;
             }
             SortCardIdListByCost(cardIds);
+            RequestBorrowedArtFor(__result);
         }
 
         // CardDestruct overrides GetFilteringIDList on
@@ -2068,6 +3002,7 @@ namespace Shadowbus
                 return;
             }
             SortCardIdListByCost(cardIds);
+            RequestBorrowedArtFor(__result);
         }
 
         // The game keeps a normal and a foil record for every card, and the foil one
@@ -2111,6 +3046,7 @@ namespace Shadowbus
             // Set the id before PatchTemplate so localizationFields are registered under
             // the companion's own id as well.
             foil.CardId = foilCardId;
+            ApplyBorrowedEffects(patch, foil, master);
             patch.PatchTemplate(foil);
             foil.CardId = foilCardId;
             foil.IsFoil = true;
@@ -2130,7 +3066,7 @@ namespace Shadowbus
             else if (!HasExplicitIntField(patch, nameof(CardParameter.ResourceCardId)) &&
                      Utils.HasExternalTexture(normal.ResourceCardId, false))
             {
-                // Player artwork in Mods/CardImages is addressed by ResourceCardId,
+                // A player PNG in the card's own folder is addressed by ResourceCardId,
                 // so the foil companion has to share the id of the normal version.
                 // Otherwise it would resolve the template's own resource id and
                 // show the original card's artwork instead of the custom PNG.
@@ -2184,6 +3120,60 @@ namespace Shadowbus
                 : parent.FullName;
         }
 
+        /// <summary>
+        /// 引擎自己算出来的卡面包名，对「重印卡 / 异画卡」这类 <c>ResourceCardId</c> 指向别的卡的记录，
+        /// 在磁盘上**并不存在**：真正装着它的是同组的包（<see cref="RedirectedArtBundle"/>）。
+        /// 取对象那一步我们会把名字改对，但**资源组加载清单里还是那个不存在的名字** ——
+        /// 于是包从来没被请求过，第一次取卡面就取不到（卡图丢失/黑卡），要靠按需补拉、
+        /// 玩家滚动或刷新列表才恢复。实测日志：
+        ///   [ArtBundle] Requested borrowed artwork bundle card_7203140200.unity3d on demand.   ← 补拉
+        /// 这里在清单里就把不存在的卡面包名换成真正存在的那个（存在的名字一个都不动）。
+        /// </summary>
+        private static List<string> RedirectMissingCardBundles(List<string> bundles, HashSet<string> loaded)
+        {
+            if (bundles == null || bundles.Count == 0 ||
+                string.IsNullOrEmpty(ResourceRootPatches.ResourceRoot))
+            {
+                return bundles;   // 没有额外资源目录时 BundleFileExists 恒真，不用做任何事
+            }
+
+            List<string> result = null;
+            for (int i = 0; i < bundles.Count; i++)
+            {
+                string bundle = bundles[i];
+                if (string.IsNullOrEmpty(bundle) || !bundle.StartsWith("card_", StringComparison.OrdinalIgnoreCase) ||
+                    !bundle.EndsWith(".unity3d", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                // card_<资源卡号>0.unity3d —— 把末尾那个 0 去掉就是资源卡号。
+                string idText = bundle.Substring(
+                    "card_".Length,
+                    bundle.Length - "card_".Length - ".unity3d".Length);
+                if (idText.Length < 2 || idText[idText.Length - 1] != '0')
+                {
+                    continue;
+                }
+
+                idText = idText.Substring(0, idText.Length - 1);
+                if (BundleFileExists(bundle))
+                {
+                    continue;
+                }
+
+                string redirect = RedirectedArtBundle(idText);
+                if (string.IsNullOrEmpty(redirect) || !loaded.Add(redirect))
+                {
+                    continue;
+                }
+
+                (result ??= new List<string>(bundles)).Add(redirect);
+            }
+
+            return result ?? bundles;
+        }
+
         private static bool HasExplicitBoolField(CardParameterPatch patch, string fieldName)
         {
             return patch.boolFields != null && patch.boolFields.ContainsKey(fieldName);
@@ -2212,7 +3202,8 @@ namespace Shadowbus
 
             if (rogueAssetList == null || rogueAssetList.Count == 0 ||
                 (SourceBundleResourcesByTargetBundleResourceId.Count == 0 &&
-                 ArtSlotTargetBundleTypes.Count == 0))
+                 ArtSlotTargetBundleTypes.Count == 0 &&
+                 BorrowedEffectsByCardId.Count == 0))
             {
                 return;
             }
@@ -2220,34 +3211,57 @@ namespace Shadowbus
             List<string> expanded = new List<string>(rogueAssetList);
             HashSet<string> loaded = new HashSet<string>(expanded, StringComparer.OrdinalIgnoreCase);
 
+            // 引擎清单里那些"名字根本不存在"的卡面包，换成真正装着它的同组包。
+            expanded = RedirectMissingCardBundles(expanded, loaded);
+
             // Borrowed card faces: the bundle of the card whose face is borrowed has
             // to be resident before its material can be fetched.
+            //
+            // 每一次资源组加载都要补（不再是"只补第一批"）：卡组编辑、图鉴这些界面各自加载
+            // 自己的资源组，切换界面时上一批会被卸掉（日志里的 Unloading N unused Assets），
+            // 借来的卡面于是又不在内存里 —— 第一次取图就会拿到空材质（黑卡/丢图），
+            // 直到玩家滚动或刷新列表才恢复。已经加载过的包被 QuickLoadAssetGroup 直接跳过，
+            // 所以重复补是安全的（不会重复加载）。
             if (ArtSlotTargetBundleTypes.Count != 0)
             {
                 foreach (var artPair in ArtSlotTargetBundleTypes)
                 {
-                    string targetBundle = __instance.GetAssetTypePath(
-                        artPair.Key.ToString(),
-                        artPair.Value,
-                        false);
-                    // The borrowed bundle is normally pulled in only alongside the target
-                    // card's own bundle. A mod card owns a resource id that no bundle
-                    // contains, so that bundle is never requested and this guard alone
-                    // would leave the borrowed face unloadable. Inject once regardless,
-                    // so the source bundles are resident from the first card-asset load.
-                    bool targetRequested =
-                        !string.IsNullOrEmpty(targetBundle) && loaded.Contains(targetBundle);
-                    if (targetRequested || !ArtSourceBundlesRequestedInGroup)
+                    AddArtSourceBundlesToLoadList(
+                        __instance,
+                        loaded,
+                        expanded,
+                        artPair.Key);
+                }
+            }
+
+            // Borrowed effects: effect_<name>.unity3d has to be resident before the
+            // engine can fetch the effect prefab (a missing bundle is not an error, the
+            // ability just plays nothing). 同样每次资源组都补：战斗资源组之间也会互相卸载。
+            if (BorrowedEffectsByCardId.Count != 0)
+            {
+                int injected = 0;
+                foreach (var pair in BorrowedEffectsByCardId)
+                {
+                    foreach (string bundle in pair.Value.EffectBundles)
                     {
-                        AddArtSourceBundlesToLoadList(
-                            __instance,
-                            loaded,
-                            expanded,
-                            artPair.Key);
+                        if (!BundleFileExists(bundle))
+                        {
+                            continue;
+                        }
+
+                        if (loaded.Add(bundle))
+                        {
+                            expanded.Add(bundle);
+                            injected++;
+                        }
                     }
                 }
 
-                ArtSourceBundlesRequestedInGroup = true;
+                if (injected != 0)
+                {
+                    Plugin.Logger.LogInfo(
+                        $"[CardEffect] added {injected} borrowed effect bundle(s) to the load list.");
+                }
             }
 
             foreach (var pair in SourceBundleResourcesByTargetBundleResourceId)
@@ -2302,6 +3316,373 @@ namespace Shadowbus
             EnsureExtraVoicesLoaded(cardID);
         }
 
+        // 抉择卡（技巧/秘术/奥义）的手牌视图**不走** Setup*MaterialToCardMesh，所以卡面那一层
+        // （NormalField / EvolField）永远是 null 材质 —— 手牌上只剩卡框和卡背，看起来就是透明。
+        // 这里把引擎自己按 choiceBrave=true 取到的那份卡面材质挂到空着的卡面层上。
+        //
+        // 挂两个时机：InitHandParameter 时这批卡的卡面网格刚建出来（普通卡那时早已就绪），
+        // LoadResource 之后是更晚的一次机会。只有在材质是 null 时才动手，已经有材质就完全不管；
+        // 也只对"引擎按 choiceBrave 取过图"的资源号生效，免得把对手手牌/背面卡掀开。
+        [HarmonyPatch(typeof(Wizard.Battle.View.BattleCardView), "InitHandParameter")]
+        [HarmonyPostfix]
+        public static void BattleCardView_InitHandParameter_ChoiceFace(Wizard.Battle.View.BattleCardView __instance)
+        {
+            AttachChoiceFace(__instance, "InitHandParameter");
+        }
+
+        [HarmonyPatch(typeof(Wizard.Battle.View.BattleCardView), nameof(Wizard.Battle.View.BattleCardView.LoadResource))]
+        [HarmonyPostfix]
+        public static void BattleCardView_LoadResource_ChoiceFace(Wizard.Battle.View.BattleCardView __instance)
+        {
+            AttachChoiceFace(__instance, "LoadResource");
+        }
+
+        /// <summary>普通手牌卡上量到的图层/排序/网格（作为抉择卡的校准基准）。</summary>
+        private static int ReferenceCardLayer = -1;
+        private static int ReferenceSortingLayerId;
+        private static int ReferenceSortingOrder;
+        private static bool ReferenceSortingCaptured;
+        private static readonly Dictionary<string, Mesh> ReferenceMeshes = new Dictionary<string, Mesh>(StringComparer.Ordinal);
+        private static readonly HashSet<string> SortingAlignLog = [];
+
+        /// <summary>
+        /// 让抉择卡跟普通手牌一致：图层 / 排序 / **网格**。
+        ///
+        /// 引擎在 <c>CardTemplate</c> 的抉择卡分支里会：
+        ///   · 把卡面网格换成 `md_card_heroskill`（`filters[i].sharedMesh = GetChoiceBraveCardMesh(...)`）；
+        ///   · 用 `CardFrame_HS_*` 当卡框；材质数组是 [卡框, 卡面, 职业图标]。
+        ///
+        /// 本地客户端加载不到 `md_card_heroskill`（`GetChoiceBraveCardMesh` 返回 null），
+        /// 于是网格被**清空**：材质数组明明是好的，但没有网格 → 整张卡画不出来，看着就是透明。
+        /// 同时"英雄技卡"那一套还被放在比游戏 UI 更低的层（换牌背景能盖住它）。
+        ///
+        /// 这里不猜：先见到普通手牌就把它的 layer / sorting / 各 renderer 的网格记下来，
+        /// 抉择卡出现时照抄，并把空掉的网格补回同名网格 —— 于是它就和普通卡一样画得出来。
+        /// </summary>
+        private static void AlignChoiceCardSorting(
+            Wizard.Battle.View.BattleCardView view,
+            bool isChoiceCard,
+            long materialId,
+            string stage)
+        {
+            try
+            {
+                Transform root = view != null ? view.Transform : null;
+                if (root == null)
+                {
+                    return;
+                }
+
+                Renderer[] renderers = root.GetComponentsInChildren<Renderer>(true);
+
+                // 判据**不看材质表、也不看调用顺序**：普通手牌的卡框网格来自 prefab，永远不为空；
+                // 被抉择卡分支清空网格的那张卡（"英雄技卡"那套）才会是空的。所以
+                // "卡框网格为空" 就是"这张卡需要修"的确切判据。
+                bool emptyFrameMesh = false;
+                for (int i = 0; i < renderers.Length; i++)
+                {
+                    Renderer renderer = renderers[i];
+                    if (renderer == null || string.IsNullOrEmpty(renderer.name) ||
+                        !renderer.name.StartsWith("md_Card_Spell", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    MeshFilter probe = renderer.GetComponent<MeshFilter>();
+                    if (probe != null && probe.sharedMesh == null)
+                    {
+                        emptyFrameMesh = true;
+                        break;
+                    }
+                }
+
+                bool needsRepair = isChoiceCard || emptyFrameMesh;
+
+                if (!needsRepair)
+                {
+                    if (ReferenceSortingCaptured)
+                    {
+                        return;
+                    }
+
+                    if (renderers.Length == 0 || renderers[0] == null)
+                    {
+                        return;
+                    }
+
+                    ReferenceCardLayer = renderers[0].gameObject.layer;
+                    ReferenceSortingLayerId = renderers[0].sortingLayerID;
+                    ReferenceSortingOrder = renderers[0].sortingOrder;
+                    ReferenceSortingCaptured = true;
+
+                    int meshes = 0;
+                    for (int i = 0; i < renderers.Length; i++)
+                    {
+                        MeshFilter filter = renderers[i] != null ? renderers[i].GetComponent<MeshFilter>() : null;
+                        if (filter != null && filter.sharedMesh != null && !ReferenceMeshes.ContainsKey(renderers[i].name))
+                        {
+                            ReferenceMeshes[renderers[i].name] = filter.sharedMesh;
+                            meshes++;
+                        }
+                    }
+
+                    Plugin.Logger.LogInfo(
+                        $"[CardArt] reference hand card: layer={ReferenceCardLayer}, " +
+                        $"sortingLayerID={ReferenceSortingLayerId}, sortingOrder={ReferenceSortingOrder}, " +
+                        $"{meshes} mesh(es) recorded for lookup.");
+                    return;
+                }
+
+                // 注意：**不能**因为没有见过普通卡就跳过 —— 全抉择卡的牌组里根本没有参照卡，
+                // 而网格修复不依赖参照（直接取引擎无条件预载的普通卡网格）。图层对齐才是
+                // "有参照就抄、没有就算了"。上几版正是卡在这里，日志里什么都没留下。
+                int restored = 0;
+                for (int i = 0; i < renderers.Length; i++)
+                {
+                    Renderer renderer = renderers[i];
+                    if (renderer == null || string.IsNullOrEmpty(renderer.name) ||
+                        !renderer.name.StartsWith("md_Card_Spell", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    if (ReferenceSortingCaptured)
+                    {
+                        renderer.gameObject.layer = ReferenceCardLayer;
+                        renderer.sortingLayerID = ReferenceSortingLayerId;
+                        renderer.sortingOrder = ReferenceSortingOrder;
+                    }
+
+                    // 网格为空（抉择卡分支换成 md_card_heroskill 但那个没预载、拿到 null），
+                    // 或者已经被换成了 heroskill 网格 —— 都换回普通卡那套无条件预载的网格。
+                    MeshFilter filter = renderer.GetComponent<MeshFilter>();
+                    if (filter == null)
+                    {
+                        continue;
+                    }
+
+                    bool emptyMesh = filter.sharedMesh == null;
+                    bool heroSkillMesh = !emptyMesh && filter.sharedMesh.name != null &&
+                        filter.sharedMesh.name.IndexOf("heroskill", StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (!emptyMesh && !heroSkillMesh)
+                    {
+                        continue;
+                    }
+
+                    Mesh mesh = GetCardMesh(renderer.name.IndexOf("_Low", StringComparison.Ordinal) >= 0
+                        ? "md_card_spell_low"
+                        : "md_card_spell");
+                    if (mesh != null)
+                    {
+                        filter.sharedMesh = mesh;
+                        restored++;
+                    }
+                }
+
+                if (SortingAlignLog.Add(stage + ":" + materialId))
+                {
+                    Plugin.Logger.LogInfo(
+                        $"[CardArt] choice card {materialId} (emptyFrameMesh={emptyFrameMesh}): restored " +
+                        $"{restored} card mesh(es) out of {renderers.Length} renderer(s)" +
+                        (ReferenceSortingCaptured
+                            ? $"; sorting aligned to the normal hand card (layer={ReferenceCardLayer})."
+                            : "."));
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[CardArt] could not align the choice-card view: {exception.Message}");
+            }
+        }
+
+        /// <summary>引擎自己的卡面网格缓存（md_card_spell / md_card_spell_low）。</summary>
+        private static readonly Dictionary<string, Mesh> CardMeshesByName = new Dictionary<string, Mesh>(StringComparer.Ordinal);
+        private static readonly HashSet<string> ChoiceMeshLog = [];
+
+        /// <summary>
+        /// **从源头**把抉择卡要用的网格换成普通卡那套。
+        ///
+        /// `BattleResourceMgr.GetChoiceBraveCardMesh(low)` 只返回 `_choiceBraveCardMesh` /
+        /// `_choiceBraveCardLowMesh`，而这两个字段只在 <c>Wizard.Data.CurrentFormat == 39</c>
+        /// 时随预载清单加载（见 SBattleLoad 的 cardPrefabPathList）—— 离线剧情/练习战不是 39，
+        /// 于是恒为 null，引擎把卡面 MeshFilter 设成 null，卡就画不出来。
+        ///
+        /// 这里直接返回**无条件预载**的普通卡网格（`md_card_spell` / `md_card_spell_low`），
+        /// 于是从第一帧（换牌界面、抽牌动画、手牌）起就是对的，不用等到后补。
+        /// 两个实现类都拦：BattleResourceMgr 与 NullBattleResourceMgr。
+        /// </summary>
+        [HarmonyPatch(typeof(Wizard.Battle.Resource.BattleResourceMgr), "GetChoiceBraveCardMesh")]
+        [HarmonyPrefix]
+        public static bool BattleResourceMgr_GetChoiceBraveCardMesh_Prefix(bool __0, ref Mesh __result)
+        {
+            return ReplaceChoiceBraveCardMesh(__0, ref __result);
+        }
+
+        [HarmonyPatch(typeof(Wizard.Battle.Resource.NullBattleResourceMgr), "GetChoiceBraveCardMesh")]
+        [HarmonyPrefix]
+        public static bool NullBattleResourceMgr_GetChoiceBraveCardMesh_Prefix(bool __0, ref Mesh __result)
+        {
+            return ReplaceChoiceBraveCardMesh(__0, ref __result);
+        }
+
+        private static bool ReplaceChoiceBraveCardMesh(bool lowMesh, ref Mesh __result)
+        {
+            try
+            {
+                string name = lowMesh ? "md_card_spell_low" : "md_card_spell";
+                Mesh mesh = GetCardMesh(name);
+                if (mesh == null)
+                {
+                    return true;      // 拿不到就交回原版，不比原版更差
+                }
+
+                __result = mesh;
+                if (ChoiceMeshLog.Add(name))
+                {
+                    Plugin.Logger.LogInfo(
+                        $"[CardArt] choice card mesh '{name}': handing out the normal card mesh instead of the " +
+                        "not-preloaded md_card_heroskill (that set only exists in format 39).");
+                }
+
+                return false;
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[CardArt] could not substitute the choice-card mesh: {exception.Message}");
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// 取引擎自己的卡面网格。
+        ///
+        /// 证据（SBattleLoad 的预载清单）：<c>md_card_spell</c> / <c>md_card_spell_low</c> /
+        /// <c>md_card_spell_n</c> 是**无条件**预载的；而 <c>md_card_heroskill</c> /
+        /// <c>md_card_heroskill_low</c> 只在 <c>Wizard.Data.CurrentFormat == 39</c> 时才预载。
+        /// 离线剧情/练习战不是 39 —— 所以抉择卡分支把网格换成 heroskill 时拿到 null，
+        /// 卡面 MeshFilter 被清空，材质数组再好也没东西可画（观感就是"透明"）。
+        ///
+        /// 这里按引擎自己的取法（AssetLoadPathType 28、isfetch=true）把普通卡网格取回来，
+        /// 两者子网格布局一致（卡框 / 卡面 / 职业图标三个槽位），换上去就能正常显示。
+        /// </summary>
+        private static Mesh GetCardMesh(string name)
+        {
+            Mesh cached;
+            if (CardMeshesByName.TryGetValue(name, out cached) && cached != null)
+            {
+                return cached;
+            }
+
+            try
+            {
+                ResourcesManager manager = Toolbox.ResourcesManager;
+                if (manager == null)
+                {
+                    return null;
+                }
+
+                string path = manager.GetAssetTypePath(name, (ResourcesManager.AssetLoadPathType)28, true);
+                if (string.IsNullOrEmpty(path))
+                {
+                    return null;
+                }
+
+                Mesh mesh = manager.LoadObject<Mesh>(path, true, false);
+                if (mesh != null)
+                {
+                    CardMeshesByName[name] = mesh;
+                }
+                else if (CardMeshesByName.Count < 8)
+                {
+                    Plugin.Logger.LogWarning($"[CardArt] card mesh '{name}' could not be loaded from '{path}'.");
+                }
+
+                return mesh;
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[CardArt] could not load card mesh '{name}': {exception.Message}");
+                return null;
+            }
+        }
+
+        private static void AttachChoiceFace(Wizard.Battle.View.BattleCardView view, string stage)
+        {            try
+            {
+                if (view == null)
+                {
+                    return;
+                }
+
+                Wizard.Battle.IReadOnlyBattleCardInfo info = view.CardInfo;
+                CardParameter parameter = info != null ? info.BaseParameter : null;
+                if (parameter == null || parameter.ResourceCardId <= 0)
+                {
+                    return;
+                }
+
+                long materialId = parameter.ResourceCardId >= 1000000000
+                    ? parameter.ResourceCardId
+                    : (long)parameter.ResourceCardId * 10;
+                Material material;
+                bool isChoiceCard = ChoiceFaceMaterials.TryGetValue(materialId.ToString(), out material) &&
+                    material != null;
+
+                // 抉择卡会被引擎放在**比游戏 UI 还低的一层**（换牌界面的半透明黑底盖住它、
+                // 玩家血量等 UI 也在它上面），看起来就是"透明"。这里用普通手牌的图层与排序
+                // 自动校准：先见到普通卡就把它的值记下来，之后每张抉择卡照抄。
+                AlignChoiceCardSorting(view, isChoiceCard, materialId, stage);
+
+                if (!isChoiceCard)
+                {
+                    return;
+                }
+
+                Transform root = view.Transform;
+                if (root == null)
+                {
+                    return;
+                }
+
+                MeshRenderer[] renderers = root.GetComponentsInChildren<MeshRenderer>(true);
+                bool attached = false;
+                bool activated = false;
+                for (int i = 0; i < renderers.Length; i++)
+                {
+                    MeshRenderer renderer = renderers[i];
+                    if (renderer == null || renderer.sharedMaterial != null || string.IsNullOrEmpty(renderer.name))
+                    {
+                        continue;
+                    }
+
+                    // 只补卡面那一层：卡框（md_Card_*）和卡背（CardBase）都已有材质，不会命中。
+                    if (renderer.name.StartsWith("NormalField", StringComparison.Ordinal) ||
+                        renderer.name.StartsWith("EvolField", StringComparison.Ordinal))
+                    {
+                        // 只挂材质，**不激活**这一层：实测激活它只会多出一层"巨大且透明的特效"
+                        // 并渲染成紫红（比原来的透明更糟）。真正的原因看下面的说明：
+                        // 这批卡根本不在普通手牌那一层渲染（换牌界面里它们在半透明黑底**后面**，
+                        // 普通卡在前面），所以要动的是"它们由谁、在哪一层渲染"，不是这里的材质。
+                        renderer.sharedMaterial = material;
+                        attached = true;
+                    }
+                }
+
+                if (attached && AttachedChoiceFaceLog.Add(stage + ":" + materialId))
+                {
+                    Plugin.Logger.LogInfo(
+                        $"[CardArt] attached the choice-card face '{material.name}' " +
+                        $"(shader '{material.shader?.name}') to the face layer of card {parameter.CardId} " +
+                        $"(resource {parameter.ResourceCardId}) at {stage}" +
+                        (activated ? " and activated that layer." : "."));
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[CardArt] could not attach a choice-card face: {exception.Message}");
+            }
+        }
+
         // Safety net for views that never went through InitializeVoiceInfo with
         // the battle CardMaster's id (replay/choice cards and similar), so the
         // banks are still requested at the moment the voice is actually set up.
@@ -2335,6 +3716,257 @@ namespace Shadowbus
         [HarmonyPatch(typeof(Cute.ResourcesManager), nameof(Cute.ResourcesManager.FindCardMaterial))]
         [HarmonyPostfix]
         public static void ResourcesManager_FindCardMaterial(
+            int cardId,
+            ResourcesManager.AssetLoadPathType type,
+            bool isEvol,
+            bool isMutation,
+            CardBasePrm.CharaType originalType,
+            bool isChoiceBrave,
+            ref Material __result)
+        {
+            // 这是 UI 和战斗里取卡面的公共出口，卡死时最需要知道当时是不是它、是哪张卡。
+            using (PerfTrace.Enter("FindCardMaterial(" + cardId + ")"))
+            {
+                ResolveCardMaterial(cardId, type, isEvol, isMutation, originalType, isChoiceBrave, ref __result);
+            }
+
+            if (__result != null)
+            {
+                // 这是 UI 与战斗取卡面的公共出口：从这里交给引擎的每一份材质（以及它的贴图）
+                // 都要一直有人引用着，否则会被 UnloadUnusedAssets 收走（见 KeepArtAssetsAlive）。
+                KeepArtAssetsAlive(__result);
+            }
+        }
+
+        /// <summary>
+        /// 卡面材质真正的目录由**这次查找有没有真的命中**决定（不再由调用方声明的 type 决定）。
+        /// 只要确实取到了，就把它属于 field 还是 spell 记下来，供 <see cref="CorrectMaterialObjectPath"/> 用；
+        /// 覆盖写：实测结果永远赢过之前记的那条（记错一次不会一直错下去）。
+        /// </summary>
+        private static void RememberMaterialKindFromObjectPath(string objectPath)
+        {
+            try
+            {
+                int start = IndexOfCardFolder(objectPath, out int folderIndex, out bool isSpell);
+                // 只记材质那对目录：CorrectMaterialObjectPath 用的就是材质号。
+                if (start < 0 || folderIndex != CardMaterialFolderPair)
+                {
+                    return;
+                }
+
+                string materialId = objectPath.Substring(start);
+                int dot = materialId.IndexOf('.');
+                if (dot >= 0)
+                {
+                    materialId = materialId.Substring(0, dot);
+                }
+
+                if (materialId.EndsWith("_M", StringComparison.OrdinalIgnoreCase))
+                {
+                    materialId = materialId.Substring(0, materialId.Length - 2);
+                }
+
+                if (materialId.Length == 0)
+                {
+                    return;
+                }
+
+                for (int i = 0; i < materialId.Length; i++)
+                {
+                    if (materialId[i] < '0' || materialId[i] > '9')
+                    {
+                        return;
+                    }
+                }
+
+                MaterialKindByMaterialId[materialId] =
+                    isSpell
+                        ? ResourcesManager.AssetLoadPathType.SpellCardMaterial
+                        : ResourcesManager.AssetLoadPathType.UnitCardMaterial;
+            }
+            catch (Exception)
+            {
+                // 只是记账，出错就算了。
+            }
+        }
+
+        /// <summary>
+        /// 卡面包里成对的两种目录：<c>[0]</c> = field（随从/护符），<c>[1]</c> = spell（法术）。
+        /// 卡面材质、卡面贴图、卡名横幅（header）三套都会出现「卡型和实际存放目录不一致」。
+        /// </summary>
+        private static readonly string[][] CardFolderPairs =
+        {
+            new[] { CardFieldMaterialFolder, CardSpellMaterialFolder },
+            new[] { "card/field/textures/", "card/spell/textures/" },
+            new[] { "card/field/header/", "card/spell/header/" }
+        };
+
+        private const int CardMaterialFolderPair = 0;
+
+        /// <summary>
+        /// <paramref name="objectPath"/> 里命中的那对卡面目录；返回目录之后（对象名开头）的位置，
+        /// <paramref name="folderIndex"/> 是 <see cref="CardFolderPairs"/> 的下标，
+        /// <paramref name="isSpell"/> 说明命中的是 spell 那一侧。不是卡面对象就返回 -1。
+        /// </summary>
+        private static int IndexOfCardFolder(string objectPath, out int folderIndex, out bool isSpell)
+        {
+            folderIndex = -1;
+            isSpell = false;
+            if (string.IsNullOrEmpty(objectPath))
+            {
+                return -1;
+            }
+
+            for (int i = 0; i < CardFolderPairs.Length; i++)
+            {
+                int index = objectPath.IndexOf(CardFolderPairs[i][0], StringComparison.OrdinalIgnoreCase);
+                if (index >= 0)
+                {
+                    folderIndex = i;
+                    return index + CardFolderPairs[i][0].Length;
+                }
+
+                index = objectPath.IndexOf(CardFolderPairs[i][1], StringComparison.OrdinalIgnoreCase);
+                if (index >= 0)
+                {
+                    folderIndex = i;
+                    isSpell = true;
+                    return index + CardFolderPairs[i][1].Length;
+                }
+            }
+
+            return -1;
+        }
+
+        /// <summary>同一个对象换成同一对的另一个卡面目录（field ↔ spell）；不是卡面对象就返回 null。</summary>
+        private static string FlipCardFolder(string objectPath)
+        {
+            int start = IndexOfCardFolder(objectPath, out int folderIndex, out bool isSpell);
+            if (start < 0)
+            {
+                return null;
+            }
+
+            string[] pair = CardFolderPairs[folderIndex];
+            string source = isSpell ? pair[1] : pair[0];
+            string target = isSpell ? pair[0] : pair[1];
+            return objectPath.Substring(0, start - source.Length) + target + objectPath.Substring(start);
+        }
+
+        /// <summary>
+        /// 卡面对象的**兜底取法**：这次按 caller 给的目录没找到时，换另一个目录再找一次。
+        ///
+        /// 原版卡面数据的「卡型（法术/随从）」和「材质真实所在目录」经常不一致
+        /// （剧情抉择卡的卡面几乎全是借用随从/护符的图；实测 8 张「肃清」系列全部躺在
+        /// <c>card/field/materials/</c>，而 <c>FindCardMaterial</c> 对 10 位材质号一律按 field 拼路径、
+        /// 对法术卡又按 spell 拼）。上游靠"记下哪个目录能用"来纠正，但记错一次就会**把本来正确的
+        /// 请求改坏**（手牌变紫红）。这里加一道不依赖任何猜测的兜底：两个目录只有两种可能，
+        /// 第一个没找到就用另一个，找到为止。命中之后按实测记下真正的目录。
+        /// </summary>
+        private static void ResolveCardMaterialObjectPath(string objectName, Type type, ref UnityEngine.Object __result)
+        {
+            int start = IndexOfCardFolder(objectName, out _, out bool isSpell);
+            if (start < 0)
+            {
+                return;
+            }
+
+            if (__result != null)
+            {
+                RememberMaterialKindFromObjectPath(objectName);
+                return;
+            }
+
+            if (IsRetryingCardMaterialObject)
+            {
+                return;
+            }
+
+            string alternate = FlipCardFolder(objectName);
+            if (alternate == null || Toolbox.AssetManager == null)
+            {
+                return;
+            }
+
+            try
+            {
+                IsRetryingCardMaterialObject = true;
+                // 用调用方要的类型重查（原版卡面就是 UnityEngine.Object，比 Material 更宽）。
+                UnityEngine.Object retried = Toolbox.AssetManager.LoadObject(
+                    alternate,
+                    type ?? typeof(UnityEngine.Object),
+                    false);
+                if (retried == null)
+                {
+                    return;
+                }
+
+                __result = retried;
+                RememberMaterialKindFromObjectPath(alternate);
+                if (MaterialFolderFallbackLog.Add(objectName))
+                {
+                    Plugin.Logger.LogInfo(
+                        $"[CardArt] '{objectName}' is in the other folder; loaded '{alternate}' instead " +
+                        $"(the card's kind and the folder its artwork lives in disagree in the stock data" +
+                        (isSpell ? ", asked for spell)." : ", asked for field)."));
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[CardArt] could not retry '{objectName}' in the other folder: {exception.Message}");
+            }
+            finally
+            {
+                IsRetryingCardMaterialObject = false;
+            }
+        }
+
+        [HarmonyPatch(typeof(AssetManager), nameof(AssetManager.LoadObject),
+            new Type[] { typeof(string), typeof(Type), typeof(bool) })]
+        [HarmonyPostfix]
+        private static void AssetManager_LoadObject_CardArt(string objectName, Type type, ref UnityEngine.Object __result)
+        {
+            ResolveCardMaterialObjectPath(objectName, type, ref __result);
+        }
+
+        [HarmonyPatch(typeof(AssetManager), nameof(AssetManager.LoadObject),
+            new Type[] { typeof(string), typeof(string), typeof(Type) })]
+        [HarmonyPostfix]
+        private static void AssetManager_LoadObjectByName_CardArt(string objectName, Type type, ref UnityEngine.Object __result)
+        {
+            ResolveCardMaterialObjectPath(objectName, type, ref __result);
+        }
+
+        /// <summary>
+        /// 卡面素材的「保活」。游戏在战斗进出界面时会调 <c>Resources.UnloadUnusedAssets</c>
+        /// （日志里那些 `Unloading N unused Assets`）：**没有任何托管引用的材质/贴图会被直接销毁**。
+        /// 插件把「借来的卡面」（别的包的素材、按需异步拉进来的包）交回引擎之后就没人引用了，
+        /// 于是战斗中途卡面会消失 —— 材质被销毁的表现就是**紫红**（Unity 缺失材质＝品红），
+        /// 只有贴图被销毁则是黑卡（卡组编辑里「刷新一下又好」的另一半原因就在这）。
+        /// 静态字段引用算「在用」，把材质和贴图记在这里就不会被回收。
+        /// </summary>
+        private static readonly List<UnityEngine.Object> ArtAssetsToKeepAlive = new List<UnityEngine.Object>();
+
+        internal static void KeepArtAssetsAlive(Material material)
+        {
+            if (material == null)
+            {
+                return;
+            }
+
+            if (!ArtAssetsToKeepAlive.Contains(material))
+            {
+                ArtAssetsToKeepAlive.Add(material);
+            }
+
+            Texture texture = material.mainTexture;
+            if (texture != null && !ArtAssetsToKeepAlive.Contains(texture))
+            {
+                ArtAssetsToKeepAlive.Add(texture);
+            }
+        }
+
+        private static void ResolveCardMaterial(
             int cardId,
             ResourcesManager.AssetLoadPathType type,
             bool isEvol,
@@ -2408,6 +4040,24 @@ namespace Shadowbus
                 if (rescued != null)
                 {
                     __result = rescued;
+                }
+            }
+
+            // 抉择卡（技巧/秘术/奥义）在战斗里是按 choiceBrave=true 取图的，拿到的常常是
+            // **闪卡变体材质**（`Wizard/VariantCardShader`）—— 材质和贴图都是好的，但普通卡
+            // 的卡面在别处会被 `CardShaderDefine.ReplaceShader` 归一化，而这条路没有那一步，
+            // 变体 shader 在手牌视图里就渲染成透明。这里补上引擎自己那一步。
+            if (isChoiceBrave && __result != null)
+            {
+                try
+                {
+                    // 记下来：这条路的材质就是这批卡该有的卡面（下面挂到卡面层用）。
+                    long choiceMaterialId = cardId >= 1000000000 ? cardId : (long)cardId * 10;
+                    ChoiceFaceMaterials[choiceMaterialId.ToString()] = __result;
+                }
+                catch (Exception exception)
+                {
+                    Plugin.Logger.LogWarning($"[CardArt] could not remember a choice-card material: {exception.Message}");
                 }
             }
         }
@@ -2572,6 +4222,69 @@ namespace Shadowbus
             return false;
         }
 
+        private static readonly HashSet<string> ChoiceFrameLog = [];
+
+        // 抉择卡（技巧/秘术/奥义）在战斗里是**刻意**画成"英雄技卡"样式的：
+        // BattleResourceMgr.GetRerityMaterial 在 isChoiceBraveCard 为真时返回
+        // _choiceBraveCardFrameMaterials[rarity]（CardFrame_HS_*，shader 是 Front0
+        // —— 不带正面贴图），网格也是另一套 md_card_heroskill。所以手牌上只剩卡框、
+        // 中间是空的，看起来就是"透明"。取图、材质、shader 全都是好的，问题在这个选择上。
+        //
+        // 这里把这一支改成"抉择卡也用普通法术/随从卡框"（CardFrame_S_* / BTL_*，Front1
+        // 带正面贴图），它就会像普通卡一样把卡面画出来。只影响抉择卡，且只换卡框材质。
+        [HarmonyPatch(typeof(Wizard.Battle.Resource.BattleResourceMgr), "GetRerityMaterial")]
+        [HarmonyPrefix]
+        public static bool BattleResourceMgr_GetRerityMaterial_ChoiceFace(
+            Wizard.Battle.Resource.BattleResourceMgr __instance,
+            bool __0,
+            bool __1,
+            int __2,
+            bool __3,
+            ref Material __result)
+        {
+            if (!__3 || __instance == null)
+            {
+                return true;      // 不是抉择卡：原样走原版
+            }
+
+            // 抉择卡（技巧/秘术/奥义）在 CardTemplate 里会走一段**专用装配**：
+            // 把网格换成 md_card_heroskill，再取 GetRerityMaterial(..., isChoiceBraveCard: true)
+            // 当卡框。而原版这个分支取的是 _choiceBraveCardFrameMaterials —— 那个数组
+            // **只在 Data.CurrentFormat == 39 时才加载**；普通剧情/练习战不是 39，
+            // 于是这里空引用或返回 null，装配中断，卡面（MaterialArrayNormal[1]）永远挂不上
+            // → 手牌上那张卡就是透明的（而且原版抛异常时 postfix 不会执行，所以之前
+            // 打在这个方法上的 postfix 一行日志都没有）。
+            //
+            // 这里直接给它**普通手牌卡框**（带正面贴图那支）并跳过原版，让它像普通卡一样画出来。
+            try
+            {
+                string fieldName = __1
+                    ? "_handSpellCardFrameMaterials"
+                    : (__0 ? "_handStandardCardFrameMaterials" : "_inPlayStandardCardFrameMaterials");
+                System.Reflection.FieldInfo field = AccessTools.Field(__instance.GetType(), fieldName);
+                Material[] frames = field != null ? field.GetValue(__instance) as Material[] : null;
+                if (frames == null || __2 < 0 || __2 >= frames.Length || frames[__2] == null)
+                {
+                    return true;      // 拿不到就交回原版，绝不比原版更差
+                }
+
+                __result = frames[__2];
+                if (ChoiceFrameLog.Add(fieldName + ":" + __2))
+                {
+                    Plugin.Logger.LogInfo(
+                        $"[CardArt] choice card frame: using the normal '{frames[__2].name}' instead of the " +
+                        "not-loaded CardFrame_HS_* set (those only exist in format 39).");
+                }
+
+                return false;
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[CardArt] could not swap the choice-card frame: {exception.Message}");
+                return true;
+            }
+        }
+
         [HarmonyPatch(typeof(BattleResourceMgr), nameof(BattleResourceMgr.GetCardImageMaterial))]
         [HarmonyPostfix]
         public static void BattleResourceMgr_GetCardImageMaterial(
@@ -2629,6 +4342,25 @@ namespace Shadowbus
             {
                 __result = artMaterial;
                 ApplyCardShader(artMaterial, target);
+            }
+
+            // 这条路径自己拼包名，不走 FindCardMaterial，所以「借图卡的包还没加载」
+            // 这个坑要在这里单独兜一次：先按需把装着材质的包加载进来再查一遍。
+            if ((__result == null || __result.mainTexture == null) && target != null)
+            {
+                Material rescued = ResolveMissingArtwork(
+                    resourceCardId,
+                    type,
+                    isEvolution,
+                    isMutation,
+                    originalType,
+                    false,
+                    __result);
+                if (rescued != null)
+                {
+                    __result = rescued;
+                    ApplyCardShader(rescued, target);
+                }
             }
         }
 
@@ -2736,9 +4468,25 @@ namespace Shadowbus
                 return null;
             }
 
+            Texture targetTexture = texture ?? originalMaterial?.mainTexture;
+            string cacheKey = resourceCardId + ":" + (isEvolution ? "1" : "0") + ":" +
+                materialTemplate.GetInstanceID() + ":" +
+                (targetTexture != null ? targetTexture.GetInstanceID() : 0);
+            if (CardMaterialCache.TryGetValue(cacheKey, out Material cached))
+            {
+                // 贴图会随包卸载被 Unity 销毁，缓存里那条于是变成一张**黑卡**，而且会一直黑到
+                // 下次重建卡表（那时才清缓存）—— 这就是「刷新一下就好了」的另一半原因。
+                // 已经没贴图的条目直接丢掉重建，不还给调用方。
+                if (cached != null && cached.mainTexture != null)
+                {
+                    return cached;
+                }
+
+                CardMaterialCache.Remove(cacheKey);
+            }
+
             Material material = UnityEngine.Object.Instantiate(materialTemplate);
             GeneratedCardMaterials.Add(material);
-            Texture targetTexture = texture ?? originalMaterial?.mainTexture;
             if (targetTexture != null)
             {
                 material.mainTexture = targetTexture;
@@ -2746,6 +4494,10 @@ namespace Shadowbus
                 {
                     material.SetTexture("_MainTex", targetTexture);
                 }
+
+                // 只缓存带贴图的那一份：没有贴图的材质一旦进了缓存，之后每次查询
+                // 都会拿到同一张黑卡，直到缓存被清掉。
+                CardMaterialCache[cacheKey] = material;
             }
 
             Plugin.Logger.LogDebug(
@@ -2757,6 +4509,21 @@ namespace Shadowbus
         {
             if (material == null || parameter == null)
             {
+                return;
+            }
+
+            // 只换**我们自己生成**的材质（CreateCardMaterial 里 Instantiate 出来的那些）。
+            //
+            // 游戏自己的材质，shader 是它按那个包里贴图的布局挑好的：素材包里 foil / variant
+            // 材质的贴图挂在 variant shader 才认的属性上，这里硬按 IsFoil 把它换成普通
+            // shader（或反过来），材质就会采样到空的贴图属性 —— 战斗里手牌/场上那张卡
+            // 直接变透明。2D 卡面（卡组列表、卡牌图鉴）不走这两个入口，所以那边一直是好的。
+            if (!GeneratedCardMaterials.Contains(material))
+            {
+                WarnFoilEffectOnce(
+                    "keep-engine-shader:" + material.shader?.name,
+                    $"kept the bundle shader '{material.shader?.name}' of an engine card material " +
+                    "(swapping it is what makes battle hand/field cards transparent)");
                 return;
             }
 

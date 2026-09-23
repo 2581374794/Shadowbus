@@ -237,9 +237,10 @@ namespace Shadowbus
         /// </summary>
         private static string DescribeEffect(BossRushAbility ability)
         {
-            if (!string.IsNullOrWhiteSpace(ability.SpecialAbilityDesc))
+            string localized = BossRushOfflineData.ResolveAbilityDescription(ability);
+            if (!string.IsNullOrWhiteSpace(localized))
             {
-                return Shorten(ability.SpecialAbilityDesc, MaxDescriptionLength);
+                return Shorten(localized, MaxDescriptionLength);
             }
 
             var effects = new List<string>();

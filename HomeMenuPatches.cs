@@ -1,3 +1,5 @@
+using System;
+using System.Collections;
 using System.Reflection;
 using HarmonyLib;
 using UnityEngine;
@@ -5,17 +7,20 @@ using UnityEngine;
 namespace Shadowbus
 {
     /// <summary>
-    /// 隐藏主界面上用不到的入口。只关掉控件自身的 GameObject，不动任何逻辑，
-    /// 所以调整时把对应的一行删掉即可。
+    /// 隐藏（或变暗）主界面上用不到的入口。隐藏只关掉控件自身的 GameObject、不动任何逻辑；
+    /// 变暗走游戏自己的 <see cref="UIManager.SetObjectToGrey"/>，控件留在原位但点不动。
+    /// 调整时把对应的一行删掉即可。
     ///
     /// 首页 MyPageItemHome：礼物 / 任务 / 公会 / 通行证
     ///                     活动框（MyPageBattleCampaign）
     ///                     主横幅（_bannerObject / MyPageBanner，含左右切换按钮与底部小圆点）
     ///                     副横幅（_subBannerObject / MyPageSubBanner）
     /// 卡组页 MyPageItemCard：比赛精选牌组（_deckIntroductionButtons，与 卡牌、组编牌组 同一排）
+    ///                      —— **变暗不可点**，保留占位
     /// 商店 MyPageItemShop：购买卡套、购买角色皮肤、购买道具、交换临时卡牌、购买预组卡牌
-    ///                      （连同各自的介绍条与维护提示牌）
-    /// 单人页 MyPageItemSoroPlay：解谜
+    ///                      （连同各自的介绍条与维护提示牌）—— **变暗不可点**，保留占位
+    /// 单人页 MyPageItemSoroPlay：解谜入口（曾隐藏，2.5.6 已恢复，见文件末尾注释）
+    /// 解谜挑战 PracticePuzzleUI：右上角「解谜任务」（_missionButton）
     ///
     /// 刻意不动：商店「礼包 / 特供」页入口 _supplyButton 及其介绍条 _supplyAppealItem，
     /// 动了整页会连入口一起消失。
@@ -69,38 +74,104 @@ namespace Shadowbus
         [HarmonyPostfix]
         public static void MyPageItemCard_Show_Postfix(MyPageItemCard __instance)
         {
-            HideAll(Find<Component[]>(__instance, "_deckIntroductionButtons"));
+            // 比赛精选牌组这一排：留着占位，但变暗、点不动（原来是整排隐藏）。
+            ApplyDim(__instance);
+            KeepDimmed(__instance, () => ApplyDim(__instance));
         }
 
         [HarmonyPatch(typeof(MyPageItemShop), nameof(MyPageItemShop.Show))]
         [HarmonyPostfix]
         public static void MyPageItemShop_Show_Postfix(MyPageItemShop __instance)
         {
-            // 按钮
-            Hide(Find<Component>(__instance, "_buyCardSleeveButton"));    // 购买卡套
-            Hide(Find<Component>(__instance, "_buyLeaderSkinButton"));    // 购买角色皮肤
-            Hide(Find<Component>(__instance, "_buyItemButton"));          // 购买道具
-            Hide(Find<Component>(__instance, "_exchangeSpotCardButton")); // 交换临时卡牌
-            Hide(Find<Component>(__instance, "_buyDeckButton"));          // 购买预组卡牌
-
-            // 各自上方的介绍条，留着会变成悬空的一块
-            Hide(Find<Component>(__instance, "_sleeveAppealItem"));
-            Hide(Find<Component>(__instance, "_skinAppealItem"));
-            Hide(Find<Component>(__instance, "_deckAppealItem"));
-
-            // 维护提示牌
-            Hide(Find<Component>(__instance, "_buyCardSleeveMaintenancePlate"));
-            Hide(Find<Component>(__instance, "_buyLeaderSkinMaintenancePlate"));
-            Hide(Find<Component>(__instance, "_buyItemMaintenancePlate"));
-            Hide(Find<Component>(__instance, "_buyBuildDeckMaintenancePlate"));
-            Hide(Find<Component>(__instance, "_exchangeSpotCardMaintenancePlate"));
+            ApplyDim(__instance);
+            KeepDimmed(__instance, () => ApplyDim(__instance));
         }
 
-        [HarmonyPatch(typeof(MyPageItemSoroPlay), nameof(MyPageItemSoroPlay.Show))]
-        [HarmonyPostfix]
-        public static void MyPageItemSoroPlay_Show_Postfix(MyPageItemSoroPlay __instance)
+        /// <summary>
+        /// 把一页上要变暗的控件全部压成禁用态。按钮自己的 BoxCollider 由
+        /// <see cref="UIManager.SetObjectToGrey"/> 关掉，所以「变暗」和「点不动」是一件事。
+        /// </summary>
+        private static void ApplyDim(Component page)
         {
-            Hide(Find<Component>(__instance, "_practiceBattlePazzle"));   // 解谜
+            if (page is MyPageItemCard)
+            {
+                DimAll(Find<Component[]>(page, "_deckIntroductionButtons"));
+                return;
+            }
+
+            if (!(page is MyPageItemShop))
+            {
+                return;
+            }
+
+            // 按钮
+            Dim(Find<Component>(page, "_buyCardSleeveButton"));    // 购买卡套
+            Dim(Find<Component>(page, "_buyLeaderSkinButton"));    // 购买角色皮肤
+            Dim(Find<Component>(page, "_buyItemButton"));          // 购买道具
+            Dim(Find<Component>(page, "_exchangeSpotCardButton")); // 交换临时卡牌
+            Dim(Find<Component>(page, "_buyDeckButton"));          // 购买预组卡牌
+
+            // 各自上方的介绍条
+            Dim(Find<Component>(page, "_sleeveAppealItem"));
+            Dim(Find<Component>(page, "_skinAppealItem"));
+            Dim(Find<Component>(page, "_deckAppealItem"));
+
+            // 维护提示牌（官方维护时才会出现）
+            Dim(Find<Component>(page, "_buyCardSleeveMaintenancePlate"));
+            Dim(Find<Component>(page, "_buyLeaderSkinMaintenancePlate"));
+            Dim(Find<Component>(page, "_buyItemMaintenancePlate"));
+            Dim(Find<Component>(page, "_buyBuildDeckMaintenancePlate"));
+            Dim(Find<Component>(page, "_exchangeSpotCardMaintenancePlate"));
+        }
+
+        /// <summary>
+        /// 游戏自己会把已经变暗的按钮重新点亮：切页走 <c>ShowSupplyMenu</c> / <c>ShowCardMenu</c>
+        /// 时，<c>MyPageItem.SetMaintenanceVisible</c> 会执行 <c>SetObjectToGrey(button, false)</c> 并把
+        /// <c>button.isEnabled</c> 设回 true；介绍条也会被自己的动画重新上色；「其他」页的入场动画
+        /// 还会把 <c>defaultColor</c> 刷回白色。所以一次性变暗一定会被顶掉，这里在页面还活着的
+        /// 时候每 0.1 秒压一次；页面被销毁或失活，协程自己结束。
+        /// </summary>
+        internal static void KeepDimmed(Component page, Action apply)
+        {
+            if (page == null || apply == null || Plugin.Instance == null)
+            {
+                return;
+            }
+
+            Plugin.Instance.StartCoroutine(KeepDimmedCoroutine(page, apply));
+        }
+
+        private static IEnumerator KeepDimmedCoroutine(Component page, Action apply)
+        {
+            WaitForSeconds wait = new WaitForSeconds(0.1f);
+
+            while (true)
+            {
+                yield return wait;
+
+                if (page == null || !page.gameObject.activeInHierarchy)
+                {
+                    yield break;
+                }
+
+                apply();
+            }
+        }
+
+        // 解谜入口（_practiceBattlePazzle）以前在这里被隐藏，因为那时解谜的离线数据还是空的。
+        // 现在解谜按本地 master 复原（见 PuzzleOfflineData），按钮必须留着，所以这段补丁已删除。
+
+        /// <summary>
+        /// 解谜挑战（<c>PracticePuzzleUI</c>）右上角的「解谜任务」按钮。
+        /// 它触发 <c>PracticePuzzleMissionListTask</c> 再弹出 <c>PracticePuzzleMissionDialog</c>；
+        /// 按要求把这个入口藏掉。只关按钮自己的 GameObject，<c>OnClickMissionButton</c> 的调用链、
+        /// 以及本地的 <c>puzzle/puzzle_mission.json</c> 都原样留着，以后想恢复删掉本方法即可。
+        /// </summary>
+        [HarmonyPatch(typeof(Wizard.PracticePuzzleUI), nameof(Wizard.PracticePuzzleUI.onFirstStart))]
+        [HarmonyPostfix]
+        public static void PracticePuzzleUI_onFirstStart_Postfix(Wizard.PracticePuzzleUI __instance)
+        {
+            Hide(Find<Component>(__instance, "_missionButton"));
         }
 
         private static T Find<T>(object instance, string fieldName) where T : class
@@ -114,7 +185,33 @@ namespace Shadowbus
             return field != null ? field.GetValue(instance) as T : null;
         }
 
-        private static void HideAll(Component[] controls)
+        /// <summary>
+        /// 变暗 + 点不动，而不是隐藏：<see cref="UIManager.SetObjectToGrey"/> 会把它自己和
+        /// 子节点上的 UIWidget 全部涂成禁用色、并关掉根节点的 BoxCollider（NGUI 的点击靠它），
+        /// 所以按钮还在原位、只是灰掉且点不下去。找不到控件时静默跳过。
+        /// </summary>
+        private static void Dim(Component control)
+        {
+            if (control == null)
+            {
+                return;
+            }
+
+            UIButton button = control as UIButton;
+            if (button == null)
+            {
+                button = control.GetComponent<UIButton>();
+            }
+
+            if (button != null)
+            {
+                button.isEnabled = false;
+            }
+
+            UIManager.SetObjectToGrey(control.gameObject, true);
+        }
+
+        private static void DimAll(Component[] controls)
         {
             if (controls == null)
             {
@@ -123,7 +220,7 @@ namespace Shadowbus
 
             foreach (Component control in controls)
             {
-                Hide(control);
+                Dim(control);
             }
         }
 
