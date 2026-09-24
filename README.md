@@ -389,11 +389,35 @@ P2P 模式不提供账号服务、房间列表、STUN 打洞或 TURN 中继。�
 - `AdvertisedAddress` — 写入连接码的地址。留空时优先使用显式配置的 `BindAddress`，否则自动选择一个同地址族的本机地址。跨公网或在虚拟局域网中使用时建议显式设置。使用 IPv6 时两项都必须是 IPv6 地址。
 - `Port` — 房主监听的 Socket.IO 端口，默认 `29600`。
 
-目前支持：标准构筑的 Open Room BO1，以及带自定义规则的 Room Two Pick BO1。不支持：HOF、Windfall、Avatar、原版 Backdraft/Cube/Chaos Two Pick、BO3/BO5、观战、断线重连、奖励与反作弊。
+目前支持：标准构筑的 Open Room BO1，以及带自定义规则的 Room Two Pick BO1。不支持：HOF、Windfall、Avatar、原版 Backdraft/Cube/Chaos Two Pick、BO3/BO5、观战、奖励与反作弊。
 
 `Mods/TwoPick` 下的每个 JSON 文件对应一种创建房间时可选的二选一模式，以 `displayName` 作为显示名。双方在本地各自选牌，房主把完整规则同步给访客，最终卡组再进入匹配。对战中掉线时，仍在线的一方默认获胜。
 
 每个游戏安装各自在 `Mods/P2PIdentity.json` 保存玩家 ID，并在 `Mods/Profile.json` 保存修改后的名称、称号、徽章与地区。请勿把生成的身份文件复制给其他玩家或第二个测试实例。
+
+### 断线、失焦与对局停滞（2.5.7）
+
+**打联机时请让游戏窗口保持焦点。** 游戏自身在窗口失去焦点时会暂停对局并**屏蔽全部出牌操作**
+（`UnityEventAgent.OnApplicationFocus(false)` → `m_battleMgr.Pause()`，所有触摸处理器都判 `HasFocus`），
+但 **Socket.IO 心跳、服务器转发、回合计时器都照常运行** —— 切出去不仅不能出牌，还可能被判回合超时输掉。
+2.5.7 起插件会在日志里明确写出这件事：
+
+```
+[Focus] 游戏窗口失去焦点：对局已暂停，牌桌不再接受任何操作，但回合计时器与网络连接仍在继续……
+[Focus] 游戏窗口重新获得焦点：对局恢复，可以继续操作。
+```
+
+断线处理（2.5.7 新增/加强）：
+
+- **半死连接回收**：对端悄悄消失（拔网线、掉虚拟局域网、杀进程）时 TCP 不会报错，socket 会一直挂着。
+  现在按"最后收到数据的时间"判断：静默超过 **30 秒**不再算该槽位活跃，超过 **45 秒**直接回收并释放槽位。
+- **槽位接管**：重连时若旧连接已静默超过 **8 秒**，新连接直接接管同一槽位（不再回 `already connected`），
+  并且**不会**把这条被顶掉的旧连接按掉线结算而判你负。
+- **结果补发**：结算那一刻正好断线的玩家，重连时会自动补发他那一份结算结果，不再卡在"等结算"里反复重连。
+- **对手状态**：心跳回包按对手最后心跳时间上报 `ONLINE / TIMEOUT / OFFLINE / WAITING`，对端哑掉时不再
+  一直显示在线让你干等。
+- **对局停滞告警**：房间处于对战中且超过 **150 秒**没有任何战斗帧时，日志里会打一条 `[Online]` 警告，
+  附带最后一条帧、双方各自静默时长与本机窗口焦点状态，便于远程定位。
 
 ## 增强日志
 
@@ -436,6 +460,32 @@ while (__instance.isConnect) { yield return 0; }   // 三个任务路径的入�
   同一局最多 12 行。
 
 只读状态、只打日志。下次卡死时这几行会直接指出「卡在哪个任务、网络标志是什么、插件正在做什么」。
+
+### 联机卡死现场（2.5.7 新增的诊断）
+
+- `[Focus] 游戏窗口失去焦点… / 重新获得焦点…`：把"失焦导致牌桌不接受操作"这件事写进日志。
+  实测的两次「联机卡死」都是这个原因 —— 玩家切到别的窗口，游戏按自己的规则暂停了输入，
+  而心跳与回合计时器照跑，服务器侧只看到"这个玩家一直不发操作"。
+- `[Online] 房间 <id> 已 N 秒没有收到任何战斗帧…`：对局中超过 150 秒没有任何战斗帧时告警，
+  附最后一条帧（uri/seq/谁发的）、双方连接各自静默多久、本机窗口焦点状态。
+- `[SocketIO] Closing a silent connection…` / `Opponent … has been silent for Ns`：
+  半死连接被回收、以及对手心跳超时被如实上报时的记录。
+- 插件自身日志改为**加锁整行输出**，Socket.IO 线程 / 看门狗 / 主线程并发写日志时不会再出现
+  "半截行互相插入"，玩家贴过来的日志可以直接读。
+
+### 发布前校验补丁（`_tools/PatchCheck`）
+
+Harmony 是**按参数名**注入的：名字写错时补丁会静默挂不上，编译期发现不了。
+`_tools/PatchCheck/` 里有一个校验器，加载插件与 `Assembly-CSharp`，逐个核对每个 `[HarmonyPatch]`
+目标是否存在、注入参数名与 `___字段` 是否对得上：
+
+```powershell
+dotnet build _tools/PatchCheck/PatchCheck.csproj -c Release
+_tools/PatchCheck/bin/Release/net48/PatchCheck.exe `
+    "<游戏目录>\BepInEx\plugins\Shadowbus.dll" `
+    "<游戏目录>\Shadowverse_Data\Managed\Assembly-CSharp.dll"
+# patch definition(s): 268, patched target method(s): 269, mismatch(es): 0
+```
 
 Shadowbus 会在 BepInEx 的全局日志分发边界统一格式化日志，因此普通模块、Unity/BepInEx 转发日志和联机日志都会使用同一套格式。BepInEx 原有的 `[Level:Source]` 前缀只保留一次；等级颜色只在外部控制台输出边界应用，文本日志不会出现 ANSI 控制符。过长内容会按配置换行，并为前缀预留宽度。
 

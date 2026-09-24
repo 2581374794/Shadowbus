@@ -14,7 +14,7 @@ namespace Shadowbus
     ///   · <c>[ReplayTrace] mulligan …</c> —— 换牌收尾 / 换牌阶段拆除
     ///   · <c>[ReplayTrace] StartBattle</c> —— 对局真正开始（以及它抛的异常）
     ///   · <c>[ReplayTrace] paused</c>     —— 谁把回放置成暂停（带调用栈）
-    ///   · <c>[ReplayTrace] op failed</c>  —— 某条 op 处理时抛的异常（原本会被静默吞掉）
+    ///   · 操作抛异常时的记录与兜底见 <see cref="ReplayPlaybackGuards"/>（`[ReplayGuard] …`）
     /// </summary>
     public static class ReplayPlaybackTrace
     {
@@ -54,17 +54,8 @@ namespace Shadowbus
             }
         }
 
-        [HarmonyPatch(typeof(NetworkBattleManagerBase), "ConductReplayReceiveData")]
-        [HarmonyFinalizer]
-        private static Exception ConductReplayReceiveData_Finalizer(Exception __exception)
-        {
-            if (__exception != null)
-            {
-                Plugin.Logger.LogError($"[ReplayTrace] op failed (op#{_opCount}): {__exception}");
-            }
-
-            return __exception;
-        }
+        // 异常的处理（记录 + 兜底吞掉，避免整条播放协程被打死）在 ReplayPlaybackGuards 里，
+        // 这里只保留诊断日志 —— 同一个方法上只挂一个 finalizer，免得两者互相覆盖返回值。
 
         [HarmonyPatch(typeof(WatchMulliganMgr), "CompleteMulligan")]
         [HarmonyPostfix]

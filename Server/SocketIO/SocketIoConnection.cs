@@ -37,6 +37,39 @@ namespace Shadowbus.Server.SocketIO
         internal JToken LastProfile { get; set; }
         public bool IsOpen => Volatile.Read(ref _closed) == 0 && _socket.IsOpen;
 
+        /// <summary>
+        /// 最后一次从这个连接收到任何数据的时刻（UTC）。
+        ///
+        /// 客户端每 2 秒就会和服务器对一次 Engine.IO 心跳（它收到我们的 ping 会回 pong，
+        /// 自己也会发 ping），战斗里还有每 5 秒一次的 Gungnir。所以这个时间戳是很可靠的
+        /// 存活指示：**已经建立了连接、但对端悄悄消失（拔网线、VPN 掉线、进程被杀，
+        /// 没有 FIN/RST）时，TCP 层不会告诉我们，只有这里能看出来。**
+        /// </summary>
+        public DateTime LastReceivedUtc { get; private set; } = DateTime.UtcNow;
+
+        /// <summary>
+        /// 这次关闭是"被重连的新连接顶掉"（对端其实还活着，只是旧 socket 哑了）。
+        /// 置位时服务器**不要**按掉线处理：不标记玩家断线、也不结算对局。
+        /// </summary>
+        internal bool SupersededByReconnect { get; set; }
+
+        /// <summary>这个连接静默了多少秒。</summary>
+        public double IdleSeconds => (DateTime.UtcNow - LastReceivedUtc).TotalSeconds;
+
+        internal void MarkReceived()
+        {
+            LastReceivedUtc = DateTime.UtcNow;
+        }
+
+        /// <summary>日志用的一行摘要（谁、什么角色、静默多久）。</summary>
+        internal string Describe()
+        {
+            string role = string.IsNullOrEmpty(BattleId)
+                ? "unbound"
+                : (IsHost ? "host" : "guest");
+            return $"{SessionId} role={role} player={PlayerId ?? "<none>"} idle={IdleSeconds:F1}s";
+        }
+
         internal event Action<SocketIoConnection, string, JToken, byte[], int?> PacketReceived;
         internal event Action<SocketIoConnection, string> Closed;
 
@@ -202,6 +235,9 @@ namespace Shadowbus.Server.SocketIO
                 {
                     if (!_socket.TryReceive(out bool isBinary, out byte[] payload))
                         return;
+
+                    // 任何收到的字节都算"对端还活着"（含 Engine.IO 的 ping/pong 与心跳）。
+                    MarkReceived();
 
                     if (payload == null || payload.Length == 0)
                         continue;

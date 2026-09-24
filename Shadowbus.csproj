@@ -9,7 +9,7 @@
     <TargetFramework>net46</TargetFramework>
     <AssemblyName>Shadowbus</AssemblyName>
     <Product>My first plugin</Product>
-    <Version>2.5.6</Version>
+    <Version>2.5.7</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <LangVersion>latest</LangVersion>
     <RestoreAdditionalProjectSources>
@@ -77,5 +77,11 @@
     <Folder Include="Mods\RotationDecks\" />
     <Folder Include="UIs\" />
     <Compile Remove="Tests\**\*.cs" />
+    <!-- 工具目录自带 csproj：它 build 出来的 obj/ 里也有 AssemblyInfo 之类的生成文件，
+         默认 glob 会把它们收进插件编译，导致 CS0579「特性重复」。 -->
+    <Compile Remove="_tools\**\*.cs" />
+    <None Include="_tools\**\*.cs" />
+    <None Include="_tools\**\*.csproj" />
+    <None Include="_tools\**\*.md" />
   </ItemGroup>
 </Project>

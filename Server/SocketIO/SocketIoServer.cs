@@ -53,6 +53,41 @@ namespace Shadowbus.Server.SocketIO
         private readonly RealtimeMessageRouter _messageRouter =
             new RealtimeMessageRouter();
         private readonly object _connectionLock = new object();
+
+        // ------------------------------------------------------------ 存活/停滞监控
+        //
+        // 现场教训（两份玩家反馈的"联机卡死"）：TCP 是"对端悄悄消失不会告诉你"的。
+        // 玩家拔网线/掉 VPN/直接杀进程时，socket 会长时间停在 Established，
+        // 服务器于是把那个槽位一直当成"有人在"，重连的玩家反而被顶到另一个槽位
+        // 或者被判 room_full（玩家日志里那一百多行重连风暴就是这么来的）。
+        // 所以这里自己维护"最后收到数据的时间"，用它来判断谁真的死了。
+        private const double StaleConnectionSeconds = 30.0;
+        private const double DeadConnectionSeconds = 45.0;
+        private const double DuplicateConnectionSeconds = 8.0;
+        private const double PeerTimeoutReportSeconds = 20.0;
+        private const double BattleStallWarnSeconds = 150.0;
+        private const double BattleStallRepeatSeconds = 90.0;
+
+        /// <summary>每个房间最后一次收到战斗帧的时间与描述（只用于诊断与看门狗）。</summary>
+        private readonly Dictionary<string, BattleFrameStamp> _lastBattleFrame =
+            new Dictionary<string, BattleFrameStamp>(StringComparer.Ordinal);
+
+        private readonly Dictionary<string, DateTime> _lastStallWarning =
+            new Dictionary<string, DateTime>(StringComparer.Ordinal);
+
+        private int _handshakeFailureCount;
+
+        private Thread _watchdogThread;
+
+        private sealed class BattleFrameStamp
+        {
+            public DateTime Utc;
+            public string EventName;
+            public string Uri;
+            public int Sequence;
+            public string FromPlayerId;
+        }
+
         private TcpListener _listener;
         private Thread _listenerThread;
         private volatile bool _running;
@@ -92,6 +127,12 @@ namespace Shadowbus.Server.SocketIO
                     Name = "Shadowbus-SocketIO-Listener"
                 };
                 _listenerThread.Start();
+                _watchdogThread = new Thread(WatchdogLoop)
+                {
+                    IsBackground = true,
+                    Name = "Shadowbus-SocketIO-Watchdog"
+                };
+                _watchdogThread.Start();
                 Plugin.Logger.LogInfo($"[SocketIO] Listener started on {BuildPrefix()}");
                 return true;
             }
@@ -132,15 +173,144 @@ namespace Shadowbus.Server.SocketIO
             {
                 _connections.Clear();
                 _pendingRoomReentries.Clear();
+                _lastBattleFrame.Clear();
+                _lastStallWarning.Clear();
+                _peerStatus.Clear();
             }
+        }
+
+        /// <summary>
+        /// 后台看门狗：每 2 秒做两件事。
+        ///
+        /// 1. **回收"半死"连接**：建立过连接、但对端悄悄消失（拔网线、VPN 掉线、
+        ///    进程被杀）时 TCP 不会报错，socket 会一直停在 Established。静默超过
+        ///    <see cref="DeadConnectionSeconds"/> 就直接关掉它 —— 这样槽位会被释放、
+        ///    重连的玩家能拿回自己的位置，房间里还在的那个人也能正常收到"对手掉线"
+        ///    的结算，而不是对着一个永远不动的牌桌干等。
+        ///
+        /// 2. **对局停滞告警**：房间在 InGame、而整间房超过
+        ///    <see cref="BattleStallWarnSeconds"/> 没有收到任何战斗帧时打一条警告，
+        ///    带上"最后一条帧是什么/谁的、两边各自静默了多久、本机窗口有没有焦点"。
+        ///    实测最常见的成因是**某一方窗口失焦**：游戏会暂停对局并屏蔽战斗输入，
+        ///    但心跳和回合计时器照跑，所以从服务器侧看就是"谁都不发操作"。
+        /// </summary>
+        private void WatchdogLoop()
+        {
+            while (_running)
+            {
+                try
+                {
+                    Thread.Sleep(2000);
+                    if (!_running)
+                        break;
+
+                    ReapIdleConnections();
+                    WarnAboutStalledBattles();
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Logger.LogWarning($"[SocketIO] Watchdog error: {ex.Message}");
+                }
+            }
+        }
+
+        private void ReapIdleConnections()
+        {
+            List<SocketIoConnection> dead = null;
+            lock (_connectionLock)
+            {
+                foreach (SocketIoConnection connection in _connections.Values)
+                {
+                    if (!connection.IsOpen || connection.IdleSeconds < DeadConnectionSeconds)
+                        continue;
+
+                    (dead ??= new List<SocketIoConnection>()).Add(connection);
+                }
+            }
+
+            if (dead == null)
+                return;
+
+            foreach (SocketIoConnection connection in dead)
+            {
+                Plugin.Logger.LogWarning(
+                    $"[SocketIO] Closing a silent connection ({connection.Describe()}); " +
+                    $"nothing received for more than {DeadConnectionSeconds:F0}s " +
+                    "(the peer vanished without closing the socket). " +
+                    "Its room slot is released so the player can reconnect normally.");
+                connection.Close("idle_timeout");
+            }
+        }
+
+        private void WarnAboutStalledBattles()
+        {
+            List<GameRoom> rooms = _rooms.GetAllRooms();
+            DateTime now = DateTime.UtcNow;
+            foreach (GameRoom room in rooms)
+            {
+                if (room == null || room.State != RoomState.InGame)
+                    continue;
+
+                BattleFrameStamp stamp;
+                lock (_connectionLock)
+                {
+                    if (!_lastBattleFrame.TryGetValue(room.RoomId, out stamp) || stamp == null)
+                        continue;
+
+                    if ((now - stamp.Utc).TotalSeconds < BattleStallWarnSeconds)
+                        continue;
+
+                    if (_lastStallWarning.TryGetValue(room.RoomId, out DateTime last) &&
+                        (now - last).TotalSeconds < BattleStallRepeatSeconds)
+                    {
+                        continue;
+                    }
+
+                    _lastStallWarning[room.RoomId] = now;
+                }
+
+                double idle = (now - stamp.Utc).TotalSeconds;
+                Plugin.Logger.LogWarning(
+                    $"[Online] 房间 {room.RoomId} 已 {idle:F0} 秒没有收到任何战斗帧（仍在 InGame）。" +
+                    $"最后一条帧：{stamp.EventName} {stamp.Uri} seq={stamp.Sequence} " +
+                    $"from {stamp.FromPlayerId ?? "<unknown>"}。" +
+                    DescribeConnectionsFor(room) +
+                    FocusDiagnostics.DescribeLocalFocus() +
+                    " 常见原因：暂停方的游戏窗口失去焦点（游戏会暂停对局并屏蔽出牌，但心跳与回合计时器照跑）。");
+            }
+        }
+
+        private string DescribeConnectionsFor(GameRoom room)
+        {
+            var parts = new List<string>();
+            lock (_connectionLock)
+            {
+                foreach (SocketIoConnection connection in _connections.Values)
+                {
+                    if (string.Equals(connection.BattleId, room.RoomId, StringComparison.Ordinal))
+                        parts.Add(connection.Describe());
+                }
+            }
+
+            foreach (Player player in room.GetPlayers())
+            {
+                if (player == null)
+                    continue;
+
+                bool connected = parts.Exists(part => part.Contains(player.PlayerId));
+                if (!connected)
+                    parts.Add($"{player.PlayerId} ({(player.IsHost ? "host" : "guest")}, no live socket)");
+            }
+
+            return parts.Count == 0
+                ? " 当前没有任何连接。"
+                : " 当前连接：" + string.Join("; ", parts) + "。";
         }
 
         public string CreateRoomCode(string roomId)
         {
             return CreateRoomCode(roomId, null);
-        }
-
-        public string CreateRoomCode(string roomId, global::Shadowbus.P2PProfile hostProfile)
+        }        public string CreateRoomCode(string roomId, global::Shadowbus.P2PProfile hostProfile)
         {
             return CreateRoomCode(roomId, hostProfile, null);
         }
@@ -337,13 +507,30 @@ namespace Shadowbus.Server.SocketIO
                 player.Name = "Player";
             }
 
-            if (IsPlayerConnected(player.PlayerId, battleId))
+            // 同一个槽位已经有连接时，先看它是不是"已经哑了"：
+            // 客户端重连前会自己关掉旧 socket，但对端悄悄消失（掉 VPN/杀进程）时
+            // 旧连接会一直挂在 Established 上，于是重连请求被"你已经连着了"顶回去，
+            // 客户端只能反复重试（玩家日志里那种上百行的重连风暴）。
+            // 静默超过 DuplicateConnectionSeconds 秒就认为是死连接，让新连接接管；
+            // 静默很短则维持原判（真的可能是重复连接）。
+            SocketIoConnection existing = FindBoundConnection(battleId, player.PlayerId);
+            if (existing != null && existing != connection)
             {
+                if (existing.IdleSeconds < DuplicateConnectionSeconds)
+                {
+                    Plugin.Logger.LogWarning(
+                        $"[SocketIO] Rejecting {connection.SessionId}: player {player.PlayerId} is already connected " +
+                        $"({existing.Describe()})");
+                    connection.SendEvent("error", new { code = "player_already_connected" });
+                    connection.Close("player_already_connected");
+                    return;
+                }
+
                 Plugin.Logger.LogWarning(
-                    $"[SocketIO] Rejecting {connection.SessionId}: player {player.PlayerId} is already connected");
-                connection.SendEvent("error", new { code = "player_already_connected" });
-                connection.Close("player_already_connected");
-                return;
+                    $"[SocketIO] Player {player.PlayerId} reconnected after {existing.IdleSeconds:F1}s of silence; " +
+                    $"replacing the silent connection {existing.SessionId} and keeping the battle running.");
+                existing.SupersededByReconnect = true;
+                existing.Close("superseded_by_reconnect");
             }
 
             connection.BattleId = battleId;
@@ -372,6 +559,15 @@ namespace Shadowbus.Server.SocketIO
                 SendOpponentSnapshot(connection, room);
                 FlushPendingMessages(connection, room);
             }
+
+            // 对局已经结束、而这个玩家当时没收到结算（socket 正好断着，
+            // `OUT BattleFinish … sent=False`）时，在这里给他补一次自己的结果。
+            //
+            // 不补的后果实测非常难看：客户端一直等不到结算，就自己反复重连
+            // （玩家日志里 150+ 行重连风暴、`room is full`、握手失败），
+            // 只有等它自己重发一次 JudgeResult 才终于拿到结果。
+            // 注意只重发"该玩家自己的那一条"，不重放旧战斗帧。
+            ResendFinishedResultIfNeeded(connection, room);
         }
 
         internal void OnSocketPacket(SocketIoConnection connection, string eventName, JToken payload, byte[] binary, int? packetId)
@@ -419,6 +615,9 @@ namespace Shadowbus.Server.SocketIO
                 $"shape={structure}, ack={(packetId.HasValue ? packetId.Value.ToString() : "none")}, " +
                 $"bytes={binary.Length}" +
                 (string.IsNullOrEmpty(hiddenStructure) ? string.Empty : ", hidden=" + hiddenStructure));
+
+            // 记录"这个房间最后一次收到战斗帧"的时刻，供停滞看门狗使用。
+            RecordBattleFrame(connection, eventName, uri, sequence);
 
             if (uri == "ShadowbusProfile")
             {
@@ -675,9 +874,31 @@ namespace Shadowbus.Server.SocketIO
             lock (_connectionLock)
                 _connections.Remove(connection.SessionId);
 
+            if (connection.SupersededByReconnect)
+            {
+                // 这个 socket 是被重连顶掉的：玩家没走，只是换了条连接。
+                // 不要标记断线、也不要把对局按掉线结算（否则重连会莫名其妙判负）。
+                Plugin.Logger.LogInfo(
+                    $"[SocketIO] Client {connection.SessionId} closed ({reason}) but was superseded by a reconnect; " +
+                    "keeping the player's slot and the running battle untouched.");
+                return;
+            }
+
             GameRoom room = _rooms.GetRoom(connection.BattleId);
             if (room != null && !string.IsNullOrEmpty(connection.PlayerId))
             {
+                // 这个槽位已经有"新的、还活着的"连接时，说明玩家只是换了条连接
+                // （旧 socket 哑掉后被重连顶掉，或者被看门狗回收）。
+                // 这时绝不能按掉线处理：会把正在进行的对局按 disconnect 结算掉。
+                SocketIoConnection replacement = FindActiveConnection(connection.BattleId, connection.PlayerId);
+                if (replacement != null && replacement != connection)
+                {
+                    Plugin.Logger.LogInfo(
+                        $"[SocketIO] Client {connection.SessionId} closed ({reason}) but {connection.PlayerId} " +
+                        $"is already on a newer connection ({replacement.SessionId}); keeping the battle running.");
+                    return;
+                }
+
                 // Keep the logical slot, profile and battle-session history
                 // alive so the native agent can reconnect and receive pending
                 // frames. Explicit room shutdown is handled separately by
@@ -703,6 +924,48 @@ namespace Shadowbus.Server.SocketIO
 
             if (room != null && room.State != RoomState.Finished)
                 BroadcastAliveStatus(room, connection);
+        }
+
+        /// <summary>
+        /// 房间已经 Finished 时，把"这个玩家自己那一条"终局结果补发给他。
+        ///
+        /// `SendBattleFinishToPlayer` 只在结算那一刻发一次；如果那一瞬间这个玩家的
+        /// socket 正好是断的（日志里的 `sent=False`），消息就永远发不出去了 ——
+        /// 因为重连路径上的补发被 `room.State != RoomState.Finished` 挡住了。
+        /// 客户端于是卡在"等结算"的状态里反复重连。
+        /// </summary>
+        private void ResendFinishedResultIfNeeded(SocketIoConnection connection, GameRoom room)
+        {
+            if (connection == null || room == null || room.State != RoomState.Finished)
+                return;
+            if (string.IsNullOrEmpty(connection.PlayerId))
+                return;
+
+            BattleSession session = _messageRouter.GetOrCreate(room.RoomId);
+            if (session == null ||
+                !session.TryGetOutcome(
+                    out string winner,
+                    out int winnerResult,
+                    out string loser,
+                    out int loserResult))
+            {
+                return;
+            }
+
+            if (string.Equals(connection.PlayerId, winner, StringComparison.Ordinal))
+            {
+                Plugin.Logger.LogInfo(
+                    $"[SocketIO] Re-sending the finished battle result to {connection.PlayerId} " +
+                    $"(winner, result={winnerResult}) because it did not get one when the battle ended.");
+                SendBattleFinishToPlayer(session, room, winner, loser, winnerResult);
+            }
+            else if (string.Equals(connection.PlayerId, loser, StringComparison.Ordinal))
+            {
+                Plugin.Logger.LogInfo(
+                    $"[SocketIO] Re-sending the finished battle result to {connection.PlayerId} " +
+                    $"(loser, result={loserResult}) because it did not get one when the battle ended.");
+                SendBattleFinishToPlayer(session, room, loser, winner, loserResult);
+            }
         }
 
         private void HandleAlivePacket(SocketIoConnection connection, byte[] binary, int? packetId)
@@ -1867,19 +2130,105 @@ namespace Shadowbus.Server.SocketIO
 
         private JObject CreateAliveResponse(SocketIoConnection target, GameRoom room)
         {
-            bool hasOpponent = false;
-            foreach (SocketIoConnection peer in GetRoomPeers(target))
-            {
-                hasOpponent = true;
-                break;
-            }
+            Player opponent = FindOpponent(target, room);
+            bool hasOpponentSlot = opponent != null;
 
             return new JObject
             {
                 ["uri"] = "Gungnir",
                 ["scs"] = "ONLINE",
-                ["ocs"] = hasOpponent ? "ONLINE" : "WAITING"
+                ["ocs"] = DescribeOpponentStatus(target, opponent, hasOpponentSlot)
             };
+        }
+
+        /// <summary>
+        /// 对手的存活状态，按游戏 `Gungnir.ReceiveGungnir` 认的取值来给：
+        ///
+        ///   ONLINE   —— 对手的 socket 在，而且最近还在发数据；
+        ///   WAITING  —— 房间里还没有对手这个槽位（还没进来）；
+        ///   TIMEOUT  —— 槽位在、socket 也在，但已经静默超过
+        ///               <see cref="PeerTimeoutReportSeconds"/> 秒（游戏会走 OnOpponentTimeOut）；
+        ///   OFFLINE  —— 槽位在但 socket 已经没了（对手掉线）。
+        ///
+        /// 之前这里只看"房间里有没有对手的槽位"，于是对手**静默掉线时永远报 ONLINE**，
+        /// 还在的那个人就一直对着不动的牌桌等下去。真正把人卡住的就是这一点。
+        /// </summary>
+        private string DescribeOpponentStatus(
+            SocketIoConnection target,
+            Player opponent,
+            bool hasOpponentSlot)
+        {
+            if (!hasOpponentSlot)
+            {
+                return "WAITING";
+            }
+
+            SocketIoConnection peer = FindActiveConnection(target.BattleId, opponent.PlayerId);
+            if (peer == null)
+            {
+                return "OFFLINE";
+            }
+
+            double idle = peer.IdleSeconds;
+            if (idle >= PeerTimeoutReportSeconds)
+            {
+                ReportPeerStatusChange(opponent, "TIMEOUT", idle);
+                return "TIMEOUT";
+            }
+
+            ReportPeerStatusChange(opponent, "ONLINE", idle);
+            return "ONLINE";
+        }
+
+        /// <summary>状态变化时才打日志，免得 5 秒一次的心跳把日志刷爆。</summary>
+        private void ReportPeerStatusChange(Player opponent, string status, double idle)
+        {
+            string last;
+            lock (_connectionLock)
+            {
+                _peerStatus.TryGetValue(opponent.PlayerId, out last);
+                if (string.Equals(last, status, StringComparison.Ordinal))
+                    return;
+                _peerStatus[opponent.PlayerId] = status;
+            }
+
+            if (string.Equals(status, "ONLINE", StringComparison.Ordinal))
+            {
+                Plugin.Logger.LogInfo(
+                    $"[SocketIO] Opponent {opponent.PlayerId} is responding again (idle={idle:F1}s).");
+            }
+            else
+            {
+                Plugin.Logger.LogWarning(
+                    $"[SocketIO] Opponent {opponent.PlayerId} has been silent for {idle:F0}s; " +
+                    "reporting TIMEOUT in the Gungnir heartbeat so the local client stops waiting " +
+                    "for a peer that is not answering.");
+            }
+        }
+
+        private readonly Dictionary<string, string> _peerStatus =
+            new Dictionary<string, string>(StringComparer.Ordinal);
+
+        private void RecordBattleFrame(
+            SocketIoConnection connection,
+            string eventName,
+            string uri,
+            int sequence)
+        {
+            if (connection == null || string.IsNullOrEmpty(connection.BattleId))
+                return;
+
+            lock (_connectionLock)
+            {
+                _lastBattleFrame[connection.BattleId] = new BattleFrameStamp
+                {
+                    Utc = DateTime.UtcNow,
+                    EventName = eventName,
+                    Uri = uri ?? "<unknown>",
+                    Sequence = sequence,
+                    FromPlayerId = connection.PlayerId
+                };
+            }
         }
 
         private void AcceptLoop()
@@ -1917,6 +2266,7 @@ namespace Shadowbus.Server.SocketIO
         private void HandleClient(TcpClient client)
         {
             NetworkStream stream = null;
+            bool upgradeAccepted = false;
             try
             {
                 stream = client.GetStream();
@@ -1937,9 +2287,11 @@ namespace Shadowbus.Server.SocketIO
                     connectionHeader.IndexOf("upgrade", StringComparison.OrdinalIgnoreCase) >= 0 &&
                     !string.IsNullOrEmpty(websocketKey);
 
-                Plugin.Logger.LogInfo($"[SocketIO] HTTP request: {requestLine}; target={requestTarget}; websocket={isWebSocketRequest}; upgrade={upgrade}; connection={connectionHeader}; key={(string.IsNullOrEmpty(websocketKey) ? "missing" : "present")}; version={websocketVersion}");
+                LogHandshakeRequest(requestLine, requestTarget, isWebSocketRequest, upgrade, connectionHeader, websocketKey, websocketVersion);
                 if (!isWebSocketRequest)
                 {
+                    // 客户端重连风暴时这里会被打很多次（例如被中途中断的升级请求），
+                    // 属于正常噪声：回一个干净的 400 就够，不必刷屏。
                     WriteHttpError(stream, 400, "Bad Request");
                     return;
                 }
@@ -1953,6 +2305,7 @@ namespace Shadowbus.Server.SocketIO
                 byte[] responseBytes = Encoding.ASCII.GetBytes(response);
                 stream.Write(responseBytes, 0, responseBytes.Length);
                 stream.Flush();
+                upgradeAccepted = true;
                 client.ReceiveTimeout = 0;
                 Plugin.Logger.LogInfo("[SocketIO] WebSocket handshake accepted");
 
@@ -1967,15 +2320,25 @@ namespace Shadowbus.Server.SocketIO
             }
             catch (Exception ex)
             {
-                Plugin.Logger.LogError($"[SocketIO] WebSocket handshake failed: {ex.Message}");
-                if (stream != null)
+                // 关键：升级**已经完成**之后再出错，就绝不能再往这个 socket 写 HTTP 500
+                // （那会把 WebSocket 流写坏，客户端只看到"连接莫名其妙断了"然后无限重连）。
+                // 这种情况正确做法是直接关掉，让客户端下一次重试拿到一条干净的新连接。
+                if (upgradeAccepted)
                 {
-                    try
+                    LogHandshakeFailure($"bind failed after upgrade ({ex.GetType().Name}: {ex.Message})");
+                }
+                else
+                {
+                    LogHandshakeFailure($"{ex.GetType().Name}: {ex.Message}");
+                    if (stream != null)
                     {
-                        WriteHttpError(stream, 500, "Internal Server Error");
-                    }
-                    catch
-                    {
+                        try
+                        {
+                            WriteHttpError(stream, 400, "Bad Request");
+                        }
+                        catch
+                        {
+                        }
                     }
                 }
             }
@@ -1984,6 +2347,53 @@ namespace Shadowbus.Server.SocketIO
                 client?.Close();
                 stream?.Dispose();
             }
+        }
+
+        /// <summary>
+        /// 握手/绑定失败的日志：前几条打全（含堆栈），之后按次数限流。
+        /// 玩家重连风暴时这里一秒能来好几次，不限流会把玩家日志淹掉。
+        /// </summary>
+        private void LogHandshakeFailure(string detail)
+        {
+            int count = Interlocked.Increment(ref _handshakeFailureCount);
+            if (count <= 5)
+            {
+                Plugin.Logger.LogWarning($"[SocketIO] WebSocket handshake failed: {detail}");
+            }
+            else if (count == 6)
+            {
+                Plugin.Logger.LogWarning(
+                    "[SocketIO] Further handshake failures are counted silently " +
+                    "(usually a client reconnect storm; see the reconnect logs around it).");
+            }
+            else if (count % 50 == 0)
+            {
+                Plugin.Logger.LogWarning($"[SocketIO] WebSocket handshake failures so far: {count}");
+            }
+        }
+
+        private static void LogHandshakeRequest(
+            string requestLine,
+            string requestTarget,
+            bool isWebSocketRequest,
+            string upgrade,
+            string connectionHeader,
+            string websocketKey,
+            string websocketVersion)
+        {
+            if (!isWebSocketRequest)
+            {
+                // 只留一行简要信息：这多半是被中断的探测/轮询请求。
+                Plugin.Logger.LogInfo(
+                    $"[SocketIO] Non-websocket request: {requestLine}; target={requestTarget}; " +
+                    $"upgrade={upgrade}; connection={connectionHeader}; " +
+                    $"key={(string.IsNullOrEmpty(websocketKey) ? "missing" : "present")}; version={websocketVersion}");
+                return;
+            }
+
+            Plugin.Logger.LogInfo(
+                $"[SocketIO] HTTP request: {requestLine}; target={requestTarget}; websocket=True; " +
+                $"upgrade={upgrade}; connection={connectionHeader}; key=present; version={websocketVersion}");
         }
 
         private IEnumerable<SocketIoConnection> GetRoomPeers(SocketIoConnection source)
@@ -2004,7 +2414,33 @@ namespace Shadowbus.Server.SocketIO
             return result;
         }
 
+        /// <summary>
+        /// 找这个槽位**当前活跃**的连接。静默太久的不算：往一条已经哑掉的 socket 里写
+        /// 数据不会报错（会进对端缓冲区），消息会被当成"已送达"而丢掉；
+        /// 不算活跃则消息留在 pending 里，等对方重连时由 FlushPendingMessages 补发。
+        /// </summary>
         private SocketIoConnection FindActiveConnection(string battleId, string playerId)
+        {
+            if (string.IsNullOrEmpty(battleId) || string.IsNullOrEmpty(playerId))
+                return null;
+
+            lock (_connectionLock)
+            {
+                foreach (SocketIoConnection connection in _connections.Values)
+                {
+                    if (IsLiveBinding(connection) &&
+                        string.Equals(connection.BattleId, battleId, StringComparison.Ordinal) &&
+                        string.Equals(connection.PlayerId, playerId, StringComparison.Ordinal))
+                    {
+                        return connection;
+                    }
+                }
+            }
+            return null;
+        }
+
+        /// <summary>这个槽位上**还开着的**连接（不管是否已经哑掉），用于重连接管判断。</summary>
+        private SocketIoConnection FindBoundConnection(string battleId, string playerId)
         {
             if (string.IsNullOrEmpty(battleId) || string.IsNullOrEmpty(playerId))
                 return null;
@@ -2066,13 +2502,16 @@ namespace Shadowbus.Server.SocketIO
             {
                 foreach (SocketIoConnection connection in _connections.Values)
                 {
-                    if (connection.IsOpen &&
-                        string.Equals(connection.BattleId, battleId, StringComparison.Ordinal))
-                    {
+                    if (!string.Equals(connection.BattleId, battleId, StringComparison.Ordinal))
+                        continue;
+
+                    // "有没有人来过这个房间"用 IsOpen（含哑掉的连接），
+                    // 但"槽位被占着"只看活跃连接：哑连接不该挡住重连。
+                    if (connection.IsOpen)
                         hasRoomConnection = true;
-                        if (!string.IsNullOrEmpty(connection.PlayerId))
-                            boundPlayerIds.Add(connection.PlayerId);
-                    }
+
+                    if (IsLiveBinding(connection) && !string.IsNullOrEmpty(connection.PlayerId))
+                        boundPlayerIds.Add(connection.PlayerId);
                 }
             }
 
@@ -2151,24 +2590,16 @@ namespace Shadowbus.Server.SocketIO
             return null;
         }
 
-        private bool IsPlayerConnected(string playerId, string battleId)
+        /// <summary>
+        /// 这个连接还能不能算"这个槽位的主人"。静默太久（对端悄悄消失，TCP 不会报错）
+        /// 就不算 —— 否则重连的玩家会被顶到另一个槽位或者被判 room_full，
+        /// 于是反复重试（玩家日志里那一百多行重连风暴）。
+        /// </summary>
+        private static bool IsLiveBinding(SocketIoConnection connection)
         {
-            if (string.IsNullOrEmpty(playerId) || string.IsNullOrEmpty(battleId))
-                return false;
-
-            lock (_connectionLock)
-            {
-                foreach (SocketIoConnection connection in _connections.Values)
-                {
-                    if (connection.IsOpen &&
-                        string.Equals(connection.BattleId, battleId, StringComparison.Ordinal) &&
-                        string.Equals(connection.PlayerId, playerId, StringComparison.Ordinal))
-                    {
-                        return true;
-                    }
-                }
-            }
-            return false;
+            return connection != null &&
+                   connection.IsOpen &&
+                   connection.IdleSeconds < StaleConnectionSeconds;
         }
 
         private bool SendRoutedMessage(SocketIoConnection target, RoutedMessage routed)
@@ -2373,6 +2804,8 @@ namespace Shadowbus.Server.SocketIO
                     continue;
                 string[] pair = part.Split(new[] { '=' }, 2);
                 string key = Uri.UnescapeDataString(pair[0].Replace('+', ' '));
+                if (string.IsNullOrEmpty(key))
+                    continue;
                 string value = pair.Length == 1 ? string.Empty : Uri.UnescapeDataString(pair[1].Replace('+', ' '));
                 result[key] = value;
             }
@@ -2443,6 +2876,8 @@ namespace Shadowbus.Server.SocketIO
                 if (colon <= 0)
                     continue;
                 string name = lines[i].Substring(0, colon).Trim();
+                if (name.Length == 0)
+                    continue;
                 string value = lines[i].Substring(colon + 1).Trim();
                 headers[name] = value;
             }

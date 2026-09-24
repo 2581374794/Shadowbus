@@ -1,4 +1,4 @@
-using BepInEx;
+﻿using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using BepInEx.Unity.Mono;
@@ -9,10 +9,11 @@ using UnityEngine;
 
 namespace Shadowbus;
 
-[BepInPlugin("08c8e386-a794-442f-a98c-aec65a183898", "GeorgesZebit.Shadowbus", "2.5.6")]
+[BepInPlugin("08c8e386-a794-442f-a98c-aec65a183898", "GeorgesZebit.Shadowbus", "2.5.7")]
 public class Plugin : BaseUnityPlugin
 {
-    public static new ManualLogSource Logger;
+    // 日志：包一层带锁的转发（见 LockedLogSource），避免多线程写日志时整行被插花。
+    public static new LockedLogSource Logger;
     public static readonly string ModPath = System.IO.Path.Combine(Paths.GameRootPath, "Mods");
     public static readonly string UnlimitedDeckPath = System.IO.Path.Combine(ModPath, "UnlimitedDecks");
     public static readonly string CardMasterPath = System.IO.Path.Combine(ModPath, "CardMaster");
@@ -72,7 +73,7 @@ public class Plugin : BaseUnityPlugin
     {
         Instance = this;
         // Plugin startup logic
-        Logger = base.Logger;
+        Logger = new LockedLogSource(base.Logger);
         Logger.LogInfo($"Plugin Shadowbus is loaded!");
         // 构建时间横幅：判断日志是不是最新 DLL 产生的，一眼就能看出来
         // （之前出现过"代码改了但日志里没有新日志"，就是因为加载的还是旧 dll）。
@@ -393,6 +394,11 @@ public class Plugin : BaseUnityPlugin
             Harmony.CreateAndPatchAll(typeof(ReplayOfflineData));
             // 临时诊断（定位完就删）：回放播放停在换牌界面时打印 op / 换牌 / 开战 / 暂停日志。
             Harmony.CreateAndPatchAll(typeof(ReplayPlaybackTrace));
+            // 回放兜底：融合这类"记录与状态对不上"的操作不再把整场回放钉死。
+            Harmony.CreateAndPatchAll(typeof(ReplayPlaybackGuards));
+            // 失焦诊断：窗口一失焦游戏就会暂停对局并屏蔽战斗输入（网络与回合计时器照跑），
+            // 这条日志让玩家反馈的"联机卡死"一眼就能定性。
+            Harmony.CreateAndPatchAll(typeof(FocusDiagnostics));
             Harmony.CreateAndPatchAll(typeof(ProfileOfflineData));
             Harmony.CreateAndPatchAll(typeof(ResourceRootPatches));
             Harmony.CreateAndPatchAll(typeof(DeckFormatUI));

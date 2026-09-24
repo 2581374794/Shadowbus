@@ -378,11 +378,38 @@ After the first launch, the `[SocketIO]` section of this plugin's file under `Be
 - `AdvertisedAddress` — the address written into the connection code. When empty, an explicitly configured `BindAddress` is preferred, otherwise a local address of the same family is chosen automatically. Set it explicitly across the public internet or on a virtual LAN. When using IPv6, both entries must be IPv6 addresses.
 - `Port` — the Socket.IO port the host listens on, default `29600`.
 
-Currently supported: standard-constructed Open Room BO1 and Room Two Pick BO1 with custom rules. Not supported: HOF, Windfall, Avatar, stock Backdraft/Cube/Chaos Two Pick, BO3/BO5, spectating, reconnection, rewards and anti-cheat.
+Currently supported: standard-constructed Open Room BO1 and Room Two Pick BO1 with custom rules. Not supported: HOF, Windfall, Avatar, stock Backdraft/Cube/Chaos Two Pick, BO3/BO5, spectating, rewards and anti-cheat.
 
 Each JSON file under `Mods/TwoPick` is one two-pick mode selectable when creating a room, with `displayName` as the label. Both players draft locally; the host syncs the full ruleset to the guest, and the final decks then enter matchmaking. If the connection drops mid-battle, the player still online wins by default.
 
 Every game installation keeps its own player ID in `Mods/P2PIdentity.json` and its edited name, title, emblem and region in `Mods/Profile.json`. Do not copy a generated identity file to another player or to a second test instance.
+
+### Focus loss, disconnects and stalled battles (2.5.7)
+
+**Keep the game window focused while playing online.** When the window loses focus the game itself pauses the
+battle and blocks every card action (`UnityEventAgent.OnApplicationFocus(false)` → `m_battleMgr.Pause()`, and
+every touch processor checks `HasFocus`), while the Socket.IO heartbeat, the server relaying and the turn timer
+all keep running — so alt-tabbing can cost you the turn by timeout. Since 2.5.7 the plugin says so explicitly:
+
+```
+[Focus] 游戏窗口失去焦点：对局已暂停，牌桌不再接受任何操作，但回合计时器与网络连接仍在继续……
+[Focus] 游戏窗口重新获得焦点：对局恢复，可以继续操作。
+```
+
+Disconnect handling added/strengthened in 2.5.7:
+
+- **Half-dead connections are reaped.** When a peer vanishes silently (unplugged cable, dropped VPN, killed
+  process) TCP never reports it and the socket stays established. The server now tracks the last received
+  packet: a slot stops counting as live after **30 s** of silence and the connection is closed after **45 s**.
+- **Slot takeover.** A reconnect whose old connection has been silent for more than **8 s** takes the slot over
+  (no more endless `already connected` retries), and the superseded connection is *not* settled as a
+  disconnect loss.
+- **Terminal result re-delivery.** A player who happened to be offline at the moment the battle ended gets their
+  own `BattleFinish` re-sent on reconnect instead of looping in a "waiting for the result" reconnect storm.
+- **Honest opponent status.** The heartbeat now reports `ONLINE / TIMEOUT / OFFLINE / WAITING` from the
+  opponent's last heartbeat, so a silent peer no longer looks online forever.
+- **Stalled-battle warning.** If an in-game room goes **150 s** without a single battle frame, the log gets an
+  `[Online]` warning with the last frame, both sides' idle time and the local window focus state.
 
 ## Enhanced logging
 
@@ -426,6 +453,31 @@ watches `NetworkManager.lastRequestTask` every frame from `Plugin.Update`:
   every 5 s while one task stays pending, at most 12 lines per battle.
 
 Read-only, log-only. The next freeze will name the stuck task, the network flags and what the plugin is doing.
+
+### Online freeze forensics (new in 2.5.7)
+
+- `[Focus] …` — records that the game window lost focus, which is what makes the board accept no input while
+  the heartbeat and turn timer keep running. Both reported "online freezes" turned out to be exactly this.
+- `[Online] room <id> has received no battle frame for N seconds…` — fired after 150 s without any battle frame
+  while in game, including the last frame (uri/seq/sender), both sides' idle time and the local focus state.
+- `[SocketIO] Closing a silent connection…` / `Opponent … has been silent for Ns` — half-dead reaping and
+  honest peer-timeout reporting.
+- Plugin logging is now serialised through a single lock (`LockedLogSource`), so concurrent writers
+  (Socket.IO threads, the watchdog, the main thread) no longer interleave half-lines in player-submitted logs.
+
+### Verifying patches before release (`_tools/PatchCheck`)
+
+Harmony injects parameters by name; a typo makes the whole patch silently fail to attach and the compiler
+cannot see it. `_tools/PatchCheck/` loads the plugin plus `Assembly-CSharp` and checks every `[HarmonyPatch]`
+target and every injected parameter / `___field`:
+
+```powershell
+dotnet build _tools/PatchCheck/PatchCheck.csproj -c Release
+_tools/PatchCheck/bin/Release/net48/PatchCheck.exe `
+    "<game>\BepInEx\plugins\Shadowbus.dll" `
+    "<game>\Shadowverse_Data\Managed\Assembly-CSharp.dll"
+# patch definition(s): 268, patched target method(s): 269, mismatch(es): 0
+```
 
 Shadowbus formats logging at BepInEx's global dispatch boundary, so ordinary modules, forwarded Unity/BepInEx messages and online logs all share one format. BepInEx's own `[Level:Source]` prefix is kept only once; level colours are applied only at the external console boundary, so text logs never contain ANSI escapes. Overlong content is wrapped according to the configuration, reserving width for the prefix.
 

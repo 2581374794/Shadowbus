@@ -242,6 +242,9 @@ namespace Shadowbus
         /// <summary>已经报过「牌组里有不存在的卡号」的牌组（按卡号集合去重，免得每次读盘都刷屏）。</summary>
         private static readonly HashSet<string> ReportedUnknownCards = new HashSet<string>();
 
+        /// <summary>已经报过「卡表还没就绪，暂时不校验卡号」的牌组（同样按卡号集合去重）。</summary>
+        private static readonly HashSet<string> ReportedNotReadyDecks = new HashSet<string>();
+
         /// <summary>
         /// 牌组里引用了**当前卡表里已经不存在的卡号**时，游戏那条链是直接解引用的：
         ///
@@ -252,6 +255,12 @@ namespace Shadowbus
         /// 结果是**整份本地牌组都注入不进去**（DeckInfoTask 直接报错、牌组列表打不开）。
         /// 这里在交给游戏之前把这些卡号剔掉，并打一行日志说清是哪份牌组、少了哪些卡号 ——
         /// 牌组还能打开编辑，只是少了几张已经没了的卡。
+        ///
+        /// **但是**：卡表本身没就绪时（`CardMaster` 还没加载 / 还没应用 `CardMaster` mod），
+        /// 任何卡号都会查不到。早期版本在这种情况下会把**整副牌所有卡**都当成"不存在"剔掉
+        /// （实测日志里每份牌组都报 "uses 40/100 card id(s) that are not in the card master"，
+        /// 而那些卡在 `Reference/card_skills.csv` 里明明都在）。所以现在先确认卡表可用：
+        /// 只有当至少一套卡表**确实装着卡**时才做剔除，否则原样放行。
         /// </summary>
         private static void DropUnknownCards(string file, JsonData deck)
         {
@@ -263,12 +272,25 @@ namespace Shadowbus
                     return;
                 }
 
+                if (!TryGetUsableCardMasters(out List<CardMaster> masters))
+                {
+                    string key = Path.GetFileName(file);
+                    if (ReportedNotReadyDecks.Add(key))
+                    {
+                        Plugin.Logger.LogInfo(
+                            $"[CustomFormats] {key}: card master is not loaded yet, so the card ids " +
+                            "were left untouched (no card was removed).");
+                    }
+
+                    return;
+                }
+
                 List<int> unknown = null;
                 var kept = new List<int>(cardIds.Count);
                 for (int i = 0; i < cardIds.Count; i++)
                 {
                     int cardId = cardIds[i].ToInt();
-                    if (CardExists(cardId))
+                    if (IsKnownCard(masters, cardId))
                     {
                         kept.Add(cardId);
                     }
@@ -285,8 +307,8 @@ namespace Shadowbus
 
                 deck["card_id_array"] = ToJsonArray(kept);
                 unknown.Sort();
-                string key = string.Join(",", unknown.Distinct());
-                if (!ReportedUnknownCards.Add(key))
+                string unknownKey = string.Join(",", unknown.Distinct());
+                if (!ReportedUnknownCards.Add(unknownKey))
                 {
                     return;
                 }
@@ -306,36 +328,85 @@ namespace Shadowbus
             }
         }
 
-        /// <summary>这张卡号在游戏当前的两套卡表里能不能查到（查不到才会被剔掉，保守处理）。</summary>
-        private static bool CardExists(int cardId)
+        /// <summary>
+        /// 取当前可用的卡表（`Default` 与对战用的那套）。**只有真的装着卡的卡表才算可用**：
+        /// 卡表对象存在但 `GetAllCardIds()` 为空，说明还没加载，这时任何卡号都查不到，
+        /// 拿它做存在性判断只会把整副牌误剔。
+        /// </summary>
+        private static bool TryGetUsableCardMasters(out List<CardMaster> masters)
         {
-            if (cardId <= 0)
+            // 卡表一旦装好就不会再变空，所以只缓存"可用"这个正结果；
+            // 未就绪时每次都重新问，等它加载好了立刻就能正常校验。
+            if (_usableCardMasters != null)
+            {
+                masters = _usableCardMasters;
+                return true;
+            }
+
+            masters = new List<CardMaster>(2);
+            AddIfUsable(masters, CardMaster.CardMasterId.Default);
+            try
+            {
+                AddIfUsable(masters, CardMaster.BatttleCardMasterId);
+            }
+            catch (Exception)
+            {
+            }
+
+            if (masters.Count == 0)
             {
                 return false;
             }
 
+            _usableCardMasters = masters;
+            return true;
+        }
+
+        private static List<CardMaster> _usableCardMasters;
+
+        private static void AddIfUsable(List<CardMaster> masters, CardMaster.CardMasterId id)
+        {
             try
             {
-                CardMaster def = CardMaster.GetInstance(CardMaster.CardMasterId.Default);
-                if (def != null && def.GetCardParameterFromId(cardId) != null)
+                CardMaster master = CardMaster.GetInstance(id);
+                if (master == null || masters.Contains(master))
                 {
-                    return true;
+                    return;
                 }
+
+                List<int> ids = master.GetAllCardIds();
+                if (ids == null || ids.Count == 0)
+                {
+                    return;
+                }
+
+                masters.Add(master);
             }
             catch (Exception)
             {
+            }
+        }
+
+        /// <summary>这张卡号在已就绪的卡表里能不能查到（查不到才会被剔掉，保守处理）。</summary>
+        private static bool IsKnownCard(List<CardMaster> masters, int cardId)
+        {
+            if (cardId <= 0 || masters == null)
+            {
+                return false;
             }
 
-            try
+            foreach (CardMaster master in masters)
             {
-                CardMaster battle = CardMaster.GetInstanceForBattle();
-                if (battle != null && battle.GetCardParameterFromId(cardId) != null)
+                try
                 {
-                    return true;
+                    if (master.GetCardParameterFromId(cardId) != null)
+                    {
+                        return true;
+                    }
                 }
-            }
-            catch (Exception)
-            {
+                catch (Exception)
+                {
+                }
             }
 
             return false;
