@@ -32,7 +32,10 @@ Shadowverse 国际服的单机化与卡牌 Mod 工具，基于 BepInEx 6 开发�
 
 ### 使用成品包
 
-从[百度网盘](https://pan.baidu.com/s/1iNJ7HMVR2cbV1aKvLzI2AA?pwd=7ejh)下载 BepInEx 和插件压缩包，解压到 Shadowverse 游戏根目录。
+从[百度网盘](https://pan.baidu.com/s/1XFHgqPeRUskWGKOZ0Wnilg?pwd=kbga)下载 BepInEx 和插件压缩包，解压到 Shadowverse 游戏根目录。
+
+> 提取码：`kbga`
+> 网盘链接如失效，请到 [Issues](https://github.com/2581374794/Shadowbus/issues) 反馈，或按下文「手动安装」自行搭建。
 
 ### 手动安装
 

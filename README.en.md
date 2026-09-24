@@ -30,7 +30,10 @@ Only Unlimited decks are supported for now. AI improvements are ongoing.
 
 ### Prebuilt package
 
-Download the BepInEx and plugin archives from [Baidu Netdisk](https://pan.baidu.com/s/1iNJ7HMVR2cbV1aKvLzI2AA?pwd=7ejh) and extract them into the Shadowverse game root.
+Download the BepInEx and plugin archives from [Baidu Netdisk](https://pan.baidu.com/s/1XFHgqPeRUskWGKOZ0Wnilg?pwd=kbga) and extract them into the Shadowverse game root.
+
+> Extraction code: `kbga`
+> If the link expires, please open an [issue](https://github.com/2581374794/Shadowbus/issues), or follow the manual steps below.
 
 ### Manual
 
