@@ -335,14 +335,6 @@ namespace Shadowbus
         /// </summary>
         private static bool TryGetUsableCardMasters(out List<CardMaster> masters)
         {
-            // 卡表一旦装好就不会再变空，所以只缓存"可用"这个正结果；
-            // 未就绪时每次都重新问，等它加载好了立刻就能正常校验。
-            if (_usableCardMasters != null)
-            {
-                masters = _usableCardMasters;
-                return true;
-            }
-
             masters = new List<CardMaster>(2);
             AddIfUsable(masters, CardMaster.CardMasterId.Default);
             try
@@ -353,16 +345,16 @@ namespace Shadowbus
             {
             }
 
-            if (masters.Count == 0)
-            {
-                return false;
-            }
-
-            _usableCardMasters = masters;
-            return true;
+            return masters.Count > 0;
         }
 
-        private static List<CardMaster> _usableCardMasters;
+        /// <summary>
+        /// 已经确认"装着卡"的卡表实例（按 id 记）。热重载 / `DeleteAllInstance` 会把实例换掉，
+        /// 所以每次都要先比一下实例是不是同一个：**换了实例就重新判一次就绪**，
+        /// 免得拿着旧卡表去判"这张卡不存在"，把刚加进来的自制卡剔掉。
+        /// </summary>
+        private static readonly Dictionary<CardMaster.CardMasterId, CardMaster> ReadyCardMasters =
+            new Dictionary<CardMaster.CardMasterId, CardMaster>();
 
         private static void AddIfUsable(List<CardMaster> masters, CardMaster.CardMasterId id)
         {
@@ -374,10 +366,15 @@ namespace Shadowbus
                     return;
                 }
 
-                List<int> ids = master.GetAllCardIds();
-                if (ids == null || ids.Count == 0)
+                if (!ReferenceEquals(GetReadyMaster(id), master))
                 {
-                    return;
+                    List<int> ids = master.GetAllCardIds();
+                    if (ids == null || ids.Count == 0)
+                    {
+                        return;
+                    }
+
+                    ReadyCardMasters[id] = master;
                 }
 
                 masters.Add(master);
@@ -385,6 +382,11 @@ namespace Shadowbus
             catch (Exception)
             {
             }
+        }
+
+        private static CardMaster GetReadyMaster(CardMaster.CardMasterId id)
+        {
+            return ReadyCardMasters.TryGetValue(id, out CardMaster master) ? master : null;
         }
 
         /// <summary>这张卡号在已就绪的卡表里能不能查到（查不到才会被剔掉，保守处理）。</summary>
