@@ -560,9 +560,11 @@ namespace Shadowbus
                         continue;
                     }
 
-                    registered += Register(manager, root, Path.Combine("a", $"ui_class_{skinId}.unity3d"));
+                    registered += Register(manager, root, $"a/ui_class_{skinId}.unity3d",
+                        $"ui_class_{skinId}.unity3d");
                     registered += Register(manager, root,
-                        Path.Combine("a", $"master_emote_chara_{charaId}.unity3d"));
+                        $"a/master_emote_chara_{charaId}.unity3d",
+                        $"master_emote_chara_{charaId}.unity3d");
                     registered += RegisterVoiceFiles(manager, root, charaId);
                 }
 
@@ -578,7 +580,13 @@ namespace Shadowbus
             }
         }
 
-        private static int Register(Cute.AssetManager manager, string root, string relative)
+        /// <summary>
+        /// 登记本地哈希（<c>SaveLocalDatahash</c>）。键必须是游戏的"逻辑素材名"
+        /// （素材包是裸名 <c>ui_class_x.unity3d</c>，语音自带 <c>v/</c>），因为
+        /// <c>AssetHandle.dataHash</c> 查的就是 <c>directory + filename</c>。
+        /// 哈希和磁盘不一致时刷新 —— 我们重做过素材包，旧哈希不能留着。
+        /// </summary>
+        private static int Register(Cute.AssetManager manager, string root, string relative, string key)
         {
             try
             {
@@ -588,16 +596,20 @@ namespace Shadowbus
                     return 0;
                 }
 
-                string key = relative.Replace('\\', '/');
-                if (!string.IsNullOrEmpty(manager.GetLocalDatahash(key)))
+                if (string.IsNullOrEmpty(key))
                 {
-                    return 0;
+                    key = relative.Replace('\\', '/');
                 }
 
                 using (var md5 = System.Security.Cryptography.MD5.Create())
                 using (FileStream stream = File.OpenRead(path))
                 {
                     string hash = string.Concat(md5.ComputeHash(stream).Select(b => b.ToString("x2")));
+                    if (string.Equals(manager.GetLocalDatahash(key), hash, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return 0;
+                    }
+
                     manager.SaveLocalDatahash(key, hash);
                     return 1;
                 }
@@ -622,11 +634,12 @@ namespace Shadowbus
 
                 foreach (string file in Directory.GetFiles(directory, $"vo_{charaId}_*.acb"))
                 {
-                    count += Register(manager, root, Path.Combine("v", Path.GetFileName(file)));
+                    // 语音的素材名本身就带目录（v/xxx.acb），所以读文件和键都用同一个。
+                    count += Register(manager, root, "v/" + Path.GetFileName(file), null);
                 }
 
                 // 选择主战者时的语音（vo_char_select_<角色号>.acb）
-                count += Register(manager, root, Path.Combine("v", $"vo_char_select_{charaId}.acb"));
+                count += Register(manager, root, $"v/vo_char_select_{charaId}.acb", null);
             }
             catch (Exception exception)
             {
