@@ -157,6 +157,9 @@ namespace Shadowbus
         private static readonly HashSet<string> Logged = new HashSet<string>(StringComparer.Ordinal);
         private static int _substitutionCount;
 
+        // 每次 GetAssetTypePath 都要递归调用原方法取包名/对象路径，用这个标记避免重入。
+        // 用 ThreadStatic：万一游戏从别的线程调用，也不会把标记串到主线程上。
+        [ThreadStatic]
         private static bool _resolving;
 
         [HarmonyPatch(typeof(ResourcesManager), nameof(ResourcesManager.GetAssetTypePath))]
@@ -274,8 +277,9 @@ namespace Shadowbus
         }
 
         /// <summary>
-        /// 同一角色的其它皮肤号（角色表里 <c>chara_name</c> 是本地化显示名，同名即同一角色，
-        /// 例：月影本体 500405 与月影2 的 2505）。按皮肤号距离排序，先试更接近的。
+        /// 同一角色的其它皮肤号：必须**同名 + 同职业 + 名字不是占位符**。同名的占位行
+        /// （名字就是「？？？」的那批非可选主战者）不算同一角色，否则会互相借图。
+        /// 角色表还没加载好时返回空且**不写缓存**（否则会把"暂时没有"永久缓存成"没有"）。
         /// </summary>
         private static List<int> SiblingsOf(int skinId)
         {
@@ -288,24 +292,55 @@ namespace Shadowbus
             try
             {
                 List<ClassCharacterMasterData> leaders = Data.Master?.ClassCharacterList;
-                string name = leaders?.FirstOrDefault(item => item != null && item.skin_id == skinId)?.chara_name;
-                if (!string.IsNullOrEmpty(name))
+                if (leaders == null || leaders.Count == 0)
                 {
-                    siblings.AddRange(leaders
-                        .Where(item => item != null && item.skin_id > 0 && item.skin_id != skinId &&
-                                       string.Equals(item.chara_name, name, StringComparison.Ordinal))
-                        .Select(item => item.skin_id)
-                        .Distinct()
-                        .OrderBy(id => Math.Abs(id - skinId)));
+                    return siblings;
                 }
+
+                ClassCharacterMasterData self = leaders.FirstOrDefault(item => item != null && item.skin_id == skinId);
+                string name = self?.chara_name;
+                if (self == null || string.IsNullOrEmpty(name) || IsPlaceholderName(name))
+                {
+                    SiblingCache[skinId] = siblings;
+                    return siblings;
+                }
+
+                siblings.AddRange(leaders
+                    .Where(item => item != null && item.skin_id > 0 && item.skin_id != skinId &&
+                                   item.class_id == self.class_id &&
+                                   !IsPlaceholderName(item.chara_name) &&
+                                   string.Equals(item.chara_name, name, StringComparison.Ordinal))
+                    .Select(item => item.skin_id)
+                    .Distinct()
+                    .OrderBy(id => Math.Abs(id - skinId)));
             }
             catch (Exception exception)
             {
                 Plugin.Logger.LogDebug($"[SkinFallback] Could not list the sibling skins of {skinId}: {exception.Message}");
+                return siblings;
             }
 
             SiblingCache[skinId] = siblings;
             return siblings;
+        }
+
+        /// <summary>名字整串都是「？」/「?」＝官方占位行，不是真正的角色名。</summary>
+        private static bool IsPlaceholderName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+            {
+                return true;
+            }
+
+            foreach (char character in name)
+            {
+                if (character != '？' && character != '?')
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         /// <summary>
