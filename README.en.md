@@ -501,7 +501,16 @@ Emote-text lookups for story battles no longer flood the log: the hundreds of pe
 
 ## Custom practice
 
-Go to **Solo > Battle** and click the blue "**自定义对手**" button centred above the class buttons on the opponent class selection page. The setup page has two columns:
+Go to **Solo > Battle**. On the opponent class selection page there are now **two** blue buttons — "**自定义对手**" (Custom Opponent) and, one cell to its right, "**斗蛐蛐**" (AI vs AI):
+
+| Button | What it does |
+| --- | --- |
+| **自定义对手** | Configures the **opponent** AI (deck / official AI preset / three CSVs / story AI / logic / life / LLM); you still play your own side by hand |
+| **斗蛐蛐** | Opens the **same** setup page, but your side is played by an AI too (AI versus AI) |
+
+Both labels follow the game's text language: `自定义对手 / 自訂對手 / Custom Opponent` and `斗蛐蛐 / 鬥蛐蛐 / AI vs AI`.
+
+The setup page has two columns:
 
 - **Left**
   - "我方设置" → **我方卡组**
@@ -511,7 +520,9 @@ Go to **Solo > Battle** and click the blue "**自定义对手**" button centred 
   - "LLM AI" switch (top row)
   - "自定义对手 AI 数据" → **选择官方预设AI**, **AI 逻辑** (weak / middle / strong), **牌组 / 风格 / 表情 CSV**, **刷新 CSV**
 
-Only the **opponent** AI is configurable: the player AI is permanently off, so the page has no player-AI switch, no player-AI CSV rows and no "player stock preset" — those were **deleted**, not hidden.
+Only the **opponent** AI is configured in this page; the "斗蛐蛐" button uses the same page and additionally hands **your** side to an AI (your class's official preset / local CSVs).
+
+The first click on either button no longer stutters: the official practice-AI master, the AI deck bundles and every deck's expanded card table are warmed up in the background (a few decks per frame) as soon as the practice page shows the buttons, and the click path just reads the result (bounded to 0.5 s as a fallback). A deck/CardMaster hot reload invalidates and restarts the warm-up.
 
 "**选择剧情AI**" picks one of the official scripted-story enemy AIs from the master's `story_ai_setting` table (using the CSVs exported into the resource folder's `story_ai/`). The first entry is a fixed "**无**" (none) that cancels story-AI mode. Selecting one hands the **enemy leader, class, deck, AI data and logic level** to that story AI, and pulls the life limit back to the official default of **20**. Mutual exclusion:
 

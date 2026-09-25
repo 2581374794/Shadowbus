@@ -60,12 +60,23 @@ namespace Shadowbus
 
         private sealed class LocalLeaderSkinSetting
         {
+            /// <summary>当前使用的主战者（chara id，不是 skin id）。</summary>
             [JsonProperty("current_chara_id")]
             public int CurrentCharaId { get; set; }
 
+            /// <summary>是否随机主战者。</summary>
             [JsonProperty("is_random")]
             public bool IsRandom { get; set; }
 
+            /// <summary>
+            /// **随机主战者池**（skin id 列表），只在 <see cref="IsRandom"/> 为真时有意义。
+            ///
+            /// 注意：它**不是**"拥有的皮肤列表"。早期版本把「换一个主战者皮肤」这个单向选择
+            /// 也塞进这里，于是每次选完皮肤，这个列表就只剩刚选的那一个，而
+            /// <see cref="CreateProfileData"/> 又把它当成"拥有的皮肤"回给客户端 ——
+            /// 结果就是：玩家选过一次皮肤之后，那一职业的其它皮肤（例如死灵法师的「月影」）
+            /// 在皮肤选择界面里全部消失。
+            /// </summary>
             [JsonProperty("skin_ids")]
             public List<int> SkinIds { get; set; } = new List<int>();
         }
@@ -510,13 +521,24 @@ namespace Shadowbus
                         ? leaderSetting.CurrentCharaId
                         : currentCharaId;
                     isRandom = leaderSetting.IsRandom;
-                    skinIds = leaderSetting.SkinIds?.Where(id => id > 0).Distinct().ToList() ??
-                        new List<int>();
+
+                    // 随机池只在"确实开着随机"时才是皮肤列表；否则一律回完整的可拥有列表，
+                    // 不然玩家选过一次皮肤之后，这一职业的其它皮肤就从界面上消失了
+                    // （实测：死灵法师的「月影」）。
+                    if (isRandom && leaderSetting.SkinIds != null && leaderSetting.SkinIds.Count > 0)
+                    {
+                        skinIds = leaderSetting.SkinIds.Where(id => id > 0).Distinct().ToList();
+                    }
                 }
-                if (skinIds.Count == 0)
+                else if (isRandom && skinIds.Count > 0)
                 {
-                    skinIds.Add(classParameter.CurrentCharaData?.skin_id ?? classId);
+                    // 没有任何本地记录、但客户端当前是随机状态：沿用客户端自己的池。
+                    skinIds = skinIds.Where(id => id > 0).Distinct().ToList();
                 }
+
+                // 兜底 + 合并：无论如何都要把"这一职业所有可用皮肤"补进来，
+                // 否则界面上会出现"明明是自己的皮肤却选不到"。
+                skinIds = MergeClassSkinIds(classId, skinIds, currentCharaId);
 
                 classList.Add(new Dictionary<string, object>
                 {
@@ -538,6 +560,76 @@ namespace Shadowbus
             };
         }
 
+        /// <summary>
+        /// 把「这一职业所有可用的主战者皮肤」合并进皮肤列表。
+        ///
+        /// 卡表里的 <c>ClassCharacterList</c> 是皮肤的唯一权威来源（每行一个皮肤，
+        /// <c>class_id</c> 是职业、<c>skin_id</c> 是皮肤号、<c>chara_id</c> 是主战者号）。
+        /// 插件已经把所有主战者标成"已拥有"，所以这里直接把整职业的可用皮肤都给出去，
+        /// 只会**变多**不会变少 —— 不会再出现皮肤"不显示"。
+        /// </summary>
+        private static List<int> MergeClassSkinIds(int classId, List<int> skinIds, int currentCharaId)
+        {
+            var merged = new List<int>();
+            var seen = new HashSet<int>();
+
+            void Add(int id)
+            {
+                if (id > 0 && seen.Add(id))
+                {
+                    merged.Add(id);
+                }
+            }
+
+            foreach (int id in skinIds ?? new List<int>())
+            {
+                Add(id);
+            }
+
+            try
+            {
+                foreach (ClassCharacterMasterData leader in Data.Master?.ClassCharacterList ?? new List<ClassCharacterMasterData>())
+                {
+                    if (leader == null || !leader.is_usable || leader.class_id != classId)
+                    {
+                        continue;
+                    }
+
+                    Add(leader.skin_id);
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning(
+                    $"[Profile] Could not enumerate the leader skins of class {classId}: {exception.Message}");
+            }
+
+            // 当前选中的主战者（chara id）必须至少能在列表里出现一次，
+            // 否则客户端会认为"这个皮肤你没有"而回落到默认主战者。
+            if (currentCharaId > 0 && !merged.Contains(currentCharaId))
+            {
+                try
+                {
+                    ClassCharacterMasterData current =
+                        GameMgr.GetIns().GetDataMgr().GetCharaPrmByCharaId(currentCharaId);
+                    Add(current?.skin_id ?? 0);
+                }
+                catch (Exception)
+                {
+                }
+            }
+
+            if (merged.Count == 0)
+            {
+                Add(classId);
+            }
+
+            Plugin.Logger.LogInfo(
+                $"[Profile] Class {classId}: reporting {merged.Count} leader skin(s) " +
+                $"(current chara {currentCharaId}); merged=<{string.Join(",", merged)}>.");
+            return merged;
+        }
+
         private static object CreateLeaderSkinUpdateData(
             LeaderSkinUpdateTask.LeaderSkinUpdateTaskParam param)
         {
@@ -557,6 +649,19 @@ namespace Shadowbus
                 GameMgr.GetIns().GetDataMgr().GetCharaPrmBySkinId(selectedSkinId);
             int currentCharaId = selectedSkin?.chara_id ?? selectedSkinId;
 
+            // 非随机的那一次选择只代表"当前用哪个皮肤"，**不代表拥有的皮肤只有这一个**。
+            // 以前把它整份存进 SkinIds，下一次 CreateProfileData 就把它当成拥有列表回给客户端，
+            // 于是玩家选过一次皮肤之后，那一职业的其它皮肤全部从界面上消失。
+            List<int> ownedSkinIds = param.is_random_leader_skin
+                ? skinIds
+                : MergeClassSkinIds(
+                    param.class_id,
+                    LoadSettings().LeaderSkins != null &&
+                    LoadSettings().LeaderSkins.TryGetValue(param.class_id, out LocalLeaderSkinSetting previous)
+                        ? previous.SkinIds
+                        : new List<int>(),
+                    currentCharaId);
+
             UpdateSettings(settings =>
             {
                 if (settings.LeaderSkins == null)
@@ -567,7 +672,7 @@ namespace Shadowbus
                 {
                     CurrentCharaId = currentCharaId,
                     IsRandom = param.is_random_leader_skin,
-                    SkinIds = skinIds
+                    SkinIds = param.is_random_leader_skin ? skinIds : new List<int>()
                 };
             });
 
@@ -575,7 +680,9 @@ namespace Shadowbus
             {
                 ["is_random_leader_skin"] = param.is_random_leader_skin,
                 ["leader_skin_id"] = selectedSkinId,
-                ["leader_skin_id_list"] = skinIds
+                // 回给客户端的列表永远是"这个职业可用的全部皮肤"：
+                // 客户端会把它当成 LeaderSkinIdList，给少了界面就少皮肤。
+                ["leader_skin_id_list"] = ownedSkinIds
             };
         }
 

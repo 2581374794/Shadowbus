@@ -79,6 +79,10 @@ namespace Shadowbus
 
             stopwatch.Stop();
             Plugin.Logger.LogInfo($"[DeckListHotReload] Refresh finished in {stopwatch.ElapsedMilliseconds} ms.");
+
+            // 牌组 / 卡表都重建过了，自定义练习那边缓存的卡组列表与 AI 牌组也就过期了：
+            // 让下一次进练习页重新预热，避免列表里还是旧卡组。
+            AIManager.InvalidatePracticeWarmup();
         }
 
         /// <summary>强制下一次打开卡组列表时重建（正常靠文件时间戳就够，留给别的写文件的路径用）。</summary>

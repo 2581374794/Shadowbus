@@ -78,6 +78,8 @@ namespace Shadowbus
         private int _logicLevel;
         private int _maxLife;
         private bool _enableLLMAI;
+        /// <summary>「斗蛐蛐」模式：我方也交给 AI 打（AI 对 AI）。</summary>
+        private bool _dualAi;
         private bool _isStarting;
         private bool _updatingLifeSlider;
         private bool _isDestroyed;
@@ -120,11 +122,13 @@ namespace Shadowbus
         public void Initialize(
             DialogBase dialog,
             ClassSelectionPage page,
-            List<AIManager.CustomPracticeDeckChoice> decks)
+            List<AIManager.CustomPracticeDeckChoice> decks,
+            bool dualAi = false)
         {
             _dialog = dialog;
             _page = page;
             _decks = decks;
+            _dualAi = dualAi;
             _playerDecks = BuildPlayerDeckChoices(decks);
             _logicLevel = 2;
             _maxLife = 20;
@@ -1641,13 +1645,20 @@ namespace Shadowbus
                 LogicLevel = storyAi != null ? storyAi.Setting.LogicLevel : _logicLevel,
                 MaxLife = _maxLife,
                 EnableLLMAI = _enableLLMAI,
-                // 只需要配置对手 AI：我方 AI 恒为关闭。
-                EnablePlayerAI = false,
+                // 「斗蛐蛐」：我方也交给 AI（用我方职业对应的官方预设 / 本地 CSV）。
+                // 普通「自定义对手」仍然只配置对手 AI。
+                EnablePlayerAI = _dualAi,
                 PlayerAIUseLocalCsv = false,
                 LocalPlayerDeckCsvPath = null,
                 LocalPlayerStyleCsvPath = null,
                 LocalPlayerEmoteCsvPath = null
             };
+
+            if (_dualAi)
+            {
+                Plugin.Logger.LogInfo(
+                    "[AIManager] 斗蛐蛐（AI 对 AI）：我方也会由 AI 接管，敌方配置照旧生效。");
+            }
 
             if (storyAi != null)
             {

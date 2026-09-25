@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <!-- 本机游戏目录：可选。不想设环境变量也不想改这个文件，就在同目录放一个
        Shadowverse.local.props（已 gitignore），内容是
@@ -9,7 +9,7 @@
     <TargetFramework>net46</TargetFramework>
     <AssemblyName>Shadowbus</AssemblyName>
     <Product>My first plugin</Product>
-    <Version>2.5.7</Version>
+    <Version>2.5.8</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <LangVersion>latest</LangVersion>
     <RestoreAdditionalProjectSources>

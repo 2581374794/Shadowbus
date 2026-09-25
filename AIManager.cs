@@ -13,25 +13,53 @@ using Wizard.Dialog.Setting;
 
 namespace Shadowbus
 {
+    /// <summary>
+    /// 入口按钮的文字守卫：把标签固定成我们自己写的那串（按钮模板可能带 UILocalize 会把它改回去），
+    /// 并且**跟随游戏的文本语言**（简体 / 繁体 / 英文）重新解析。
+    ///
+    /// 语言每 0.5 秒复查一次：`CustomPreference.GetTextLanguage()` 不适合每帧调用，
+    /// 而这个节奏足够让玩家切语言后立刻看到正确的按钮文字。
+    /// </summary>
     internal sealed class CustomPracticeButtonLabelGuard : MonoBehaviour
     {
-        private const string CustomLabelText = "自定义对手";
+        private const int LanguageCheckIntervalFrames = 30;
 
-        internal const string Label = CustomLabelText;
         private UILabel _label;
+        private string _simplified;
+        private string _traditional;
+        private string _english;
+        private int _framesUntilLanguageCheck;
+        private string _applied;
 
-        public void Initialize(UILabel label)
+        public void Initialize(UILabel label, string simplified, string traditional, string english)
         {
             _label = label;
+            _simplified = simplified;
+            _traditional = traditional;
+            _english = english;
+            _framesUntilLanguageCheck = 0;
             ApplyLabel();
         }
 
         private void LateUpdate()
         {
-            if (_label != null && _label.text != CustomLabelText)
+            if (_label == null)
             {
-                ApplyLabel();
+                return;
             }
+
+            if (_framesUntilLanguageCheck-- > 0)
+            {
+                if (_label.text != _applied)
+                {
+                    ApplyLabel();
+                }
+
+                return;
+            }
+
+            _framesUntilLanguageCheck = LanguageCheckIntervalFrames;
+            ApplyLabel();
         }
 
         private void ApplyLabel()
@@ -41,7 +69,8 @@ namespace Shadowbus
                 return;
             }
 
-            _label.text = CustomLabelText;
+            _applied = StoryTextLanguagePatches.ResolveUiText(_simplified, _traditional, _english);
+            _label.text = _applied;
             _label.overflowMethod = UILabel.Overflow.ShrinkContent;
         }
     }
@@ -49,6 +78,17 @@ namespace Shadowbus
     public class AIManager
     {
         private const string CustomPracticeButtonName = "ShadowbusCustomPracticeButton";
+
+        /// <summary>「斗蛐蛐」：AI 对 AI（我方也交给 AI 打）。放在「自定义对手」右边。</summary>
+        private const string DualAiButtonName = "ShadowbusDualAiPracticeButton";
+
+        private const string CustomPracticeButtonLabelSimplified = "自定义对手";
+        private const string CustomPracticeButtonLabelTraditional = "自訂對手";
+        private const string CustomPracticeButtonLabelEnglish = "Custom Opponent";
+
+        private const string DualAiButtonLabelSimplified = "斗蛐蛐";
+        private const string DualAiButtonLabelTraditional = "鬥蛐蛐";
+        private const string DualAiButtonLabelEnglish = "AI vs AI";
 
         // 配置页按钮（CustomPracticeSetupWindow.SetButtonSelected）用的就是这一对精灵，
         // 它们是设置页那种蓝色；设置页 ItemButton 模板自带的精灵名不一定是这套。
@@ -243,12 +283,36 @@ namespace Shadowbus
                 ResourcesManager resourcesManager = Toolbox.ResourcesManager;
 
                 // 位置：法师（class 3）与龙族（class 4）两个职业按钮的中点，往上一个按钮高度。
+                // 「斗蛐蛐」在它右边一格。
                 Vector3 customGridPosition = ResolveCustomPracticeGridPosition(__instance);
+                float cellWidth = __instance._classButtonGrid != null ? __instance._classButtonGrid.cellWidth : 105f;
+                Vector3 dualAiGridPosition = customGridPosition + new Vector3(cellWidth, 0f, 0f);
 
                 // 样式：用设置页那个蓝色按钮（OptionSettingPrefab.m_itemButton），
                 // 而不是原来克隆的职业选择方块。拿不到模板时退回旧的克隆方式。
-                if (TryCreateBlueCustomPracticeButton(__instance, customButtonParent, customGridPosition))
+                if (TryCreateBlueCustomPracticeButton(
+                        __instance,
+                        customButtonParent,
+                        customGridPosition,
+                        CustomPracticeButtonName,
+                        CustomPracticeButtonLabelSimplified,
+                        CustomPracticeButtonLabelTraditional,
+                        CustomPracticeButtonLabelEnglish,
+                        dualAi: false))
                 {
+                    TryCreateBlueCustomPracticeButton(
+                        __instance,
+                        customButtonParent,
+                        dualAiGridPosition,
+                        DualAiButtonName,
+                        DualAiButtonLabelSimplified,
+                        DualAiButtonLabelTraditional,
+                        DualAiButtonLabelEnglish,
+                        dualAi: true);
+
+                    // 顺手把「官方练习 AI 牌组」的加载放到后台做掉：
+                    // 以前是点按钮时才加载，第一次点必然卡一下（之后就快了）。
+                    BeginPracticeWarmup(__instance);
                     return;
                 }
 
@@ -274,7 +338,7 @@ namespace Shadowbus
                     delegate
                     {
                         GameMgr.GetIns().GetSoundMgr().PlaySe(Se.TYPE.SYS_TOGGLE_ON, false);
-                        ShowDeckSelection(__instance);
+                        ShowDeckSelection(__instance, false);
                     },
                     false,
                     false,
@@ -288,7 +352,12 @@ namespace Shadowbus
                 }
                 button._usedLabel.gameObject.SetActive(true);
                 button._button.isEnabled = true;
-                buttonObject.AddComponent<CustomPracticeButtonLabelGuard>().Initialize(button._usedLabel);
+                buttonObject.AddComponent<CustomPracticeButtonLabelGuard>().Initialize(
+                    button._usedLabel,
+                    CustomPracticeButtonLabelSimplified,
+                    CustomPracticeButtonLabelTraditional,
+                    CustomPracticeButtonLabelEnglish);
+                BeginPracticeWarmup(__instance);
 
                 Plugin.Logger.LogInfo(
                     $"[AIManager] Added the custom practice button outside the class grid " +
@@ -353,7 +422,12 @@ namespace Shadowbus
         private static bool TryCreateBlueCustomPracticeButton(
             ClassSelectionPage page,
             Transform parent,
-            Vector3 gridPosition)
+            Vector3 gridPosition,
+            string buttonName,
+            string labelSimplified,
+            string labelTraditional,
+            string labelEnglish,
+            bool dualAi)
         {
             SettingBase settingTemplate = UIManager.GetInstance()?.OptionSettingPrefab;
             if (settingTemplate == null || settingTemplate.m_itemButton == null)
@@ -361,8 +435,13 @@ namespace Shadowbus
                 return false;
             }
 
+            if (parent.Find(buttonName) != null)
+            {
+                return true;
+            }
+
             GameObject buttonObject = NGUITools.AddChild(parent.gameObject, settingTemplate.m_itemButton);
-            buttonObject.name = CustomPracticeButtonName;
+            buttonObject.name = buttonName;
             buttonObject.transform.position = page._classButtonGrid.transform.TransformPoint(gridPosition);
             buttonObject.transform.localScale = Vector3.one;
             buttonObject.SetActive(true);
@@ -387,8 +466,12 @@ namespace Shadowbus
                 item._subLabel.gameObject.SetActive(false);
             }
 
+            string label = StoryTextLanguagePatches.ResolveUiText(
+                labelSimplified,
+                labelTraditional,
+                labelEnglish);
             int fontSize = Mathf.Max(12, item._label.fontSize);
-            int width = Mathf.RoundToInt((fontSize * (CustomPracticeButtonLabelGuard.Label.Length + 0.6f) + 16) * 1.05f);
+            int width = Mathf.RoundToInt((fontSize * (label.Length + 0.6f) + 16) * 1.05f);
             int height = Mathf.RoundToInt(Mathf.Max(36, fontSize + 18) * 1.05f);
 
             item._sprite.ResetAnchors();
@@ -402,7 +485,7 @@ namespace Shadowbus
             item._label.overflowMethod = UILabel.Overflow.ShrinkContent;
             item._label.SetDimensions(width - 12, height - 4);
             item._label.transform.localPosition = Vector3.zero;
-            item.SetValue(CustomPracticeButtonLabelGuard.Label);
+            item.SetValue(label);
             if (item._collider != null)
             {
                 item._collider.size = new Vector3(width, height, item._collider.size.z);
@@ -426,7 +509,7 @@ namespace Shadowbus
             blueButton.onClick.Add(new EventDelegate(delegate
             {
                 GameMgr.GetIns().GetSoundMgr().PlaySe(Se.TYPE.SYS_COMMON_BUTTON, false);
-                ShowDeckSelection(page);
+                ShowDeckSelection(page, dualAi);
             }));
 
             // 再挂一个 UIEventListener：万一 ItemButton 的 onClick 被别处清掉，
@@ -434,18 +517,23 @@ namespace Shadowbus
             UIEventListener.Get(buttonObject).onClick = delegate
             {
                 GameMgr.GetIns().GetSoundMgr().PlaySe(Se.TYPE.SYS_COMMON_BUTTON, false);
-                ShowDeckSelection(page);
+                ShowDeckSelection(page, dualAi);
             };
 
-            buttonObject.AddComponent<CustomPracticeButtonLabelGuard>().Initialize(item._label);
+            buttonObject.AddComponent<CustomPracticeButtonLabelGuard>().Initialize(
+                item._label,
+                labelSimplified,
+                labelTraditional,
+                labelEnglish);
 
             Plugin.Logger.LogInfo(
-                $"[AIManager] Added the blue custom practice button at grid position {gridPosition} " +
+                $"[AIManager] Added the practice button '{buttonName}' (label '{label}', aiVsAi={dualAi}) " +
+                $"at grid position {gridPosition} " +
                 $"(size {width}x{height}, font {fontSize}, sprite '{BlueButtonNormalSprite}').");
             return true;
         }
 
-        private static void ShowDeckSelection(ClassSelectionPage page)
+        private static void ShowDeckSelection(ClassSelectionPage page, bool dualAi)
         {
             if (_loadingOriginalPracticeDeckAssets)
             {
@@ -455,7 +543,7 @@ namespace Shadowbus
             try
             {
                 _loadingOriginalPracticeDeckAssets = true;
-                page.StartCoroutine(ShowDeckSelectionPreloadCoroutine(page));
+                page.StartCoroutine(ShowDeckSelectionPreloadCoroutine(page, dualAi));
             }
             catch (Exception exception)
             {
@@ -465,12 +553,14 @@ namespace Shadowbus
             }
         }
 
-        private static IEnumerator ShowDeckSelectionPreloadCoroutine(ClassSelectionPage page)
+        private static IEnumerator ShowDeckSelectionPreloadCoroutine(ClassSelectionPage page, bool dualAi)
         {
             try
             {
-                yield return PreloadOriginalPracticeDeckAssets();
-                ShowDeckSelectionAfterPreload(page);
+                // 资源预热已经在职业选择页出现按钮时就开始了（见 BeginPracticeWarmup）。
+                // 这里只等一个很短的上限：正常情况早就热好了，点了立刻出界面。
+                yield return WaitForPracticeWarmup(30);
+                ShowDeckSelectionAfterPreload(page, dualAi);
             }
             finally
             {
@@ -478,11 +568,11 @@ namespace Shadowbus
             }
         }
 
-        private static void ShowDeckSelectionAfterPreload(ClassSelectionPage page)
+        private static void ShowDeckSelectionAfterPreload(ClassSelectionPage page, bool dualAi)
         {
             try
             {
-                List<CustomPracticeDeckChoice> decks = GetUnlimitedDeckChoices();
+                List<CustomPracticeDeckChoice> decks = GetPracticeDeckChoices();
 
                 if (decks == null || decks.Count == 0)
                 {
@@ -491,18 +581,173 @@ namespace Shadowbus
                 }
 
                 Plugin.Logger.LogInfo(
-                    $"[AIManager] Custom practice deck selector contains {decks.Count} non-empty Unlimited deck(s).");
+                    $"[AIManager] Custom practice deck selector contains {decks.Count} non-empty Unlimited deck(s) " +
+                    $"(aiVsAi={dualAi}).");
 
                 DialogBase dialog = UIManager.GetInstance().CreateDialogClose(false, false);
                 dialog.SetSize(DialogBase.Size.XL);
-                dialog.SetTitleLabel("自定义练习");
-                dialog.gameObject.AddComponent<CustomPracticeSetupWindow>().Initialize(dialog, page, decks);
+                dialog.SetTitleLabel(dualAi
+                    ? StoryTextLanguagePatches.ResolveUiText("斗蛐蛐（AI 对 AI）", "鬥蛐蛐（AI 對 AI）", "AI vs AI")
+                    : StoryTextLanguagePatches.ResolveUiText("自定义练习", "自訂練習", "Custom Practice"));
+                dialog.gameObject.AddComponent<CustomPracticeSetupWindow>().Initialize(dialog, page, decks, dualAi);
             }
             catch (Exception exception)
             {
                 Plugin.Logger.LogError($"[AIManager] Failed to open the custom deck selector.\n{exception}");
                 ShowMessage("自定义练习", "读取无限制卡组失败，请查看 BepInEx 日志。");
             }
+        }
+
+        // ---------------------------------------------------------------- 后台预热
+        //
+        // 为什么要预热：这一套界面要用的东西（官方练习 AI 的 master 表、几十个 AI 牌组
+        // bundle、每副牌展开出来的卡表）以前都是在**点按钮那一刻**才加载的，于是每次
+        // 开游戏后的第一次点击必然卡一下（之后就都命中了缓存，不卡了）。
+        // 现在改成：职业选择页一出现按钮就开始在后台分批做完，点击时直接拿结果。
+
+        private static readonly List<CustomPracticeDeckChoice> CachedDeckChoices =
+            new List<CustomPracticeDeckChoice>();
+
+        private static bool _warmupStarted;
+        private static ClassSelectionPage _warmupPage;
+        private static bool _warmupAssetsReady;
+        private static bool _warmupChoicesReady;
+        private static int _warmupWaiters;
+
+        private static void BeginPracticeWarmup(ClassSelectionPage page)
+        {
+            if (page == null)
+            {
+                return;
+            }
+
+            // 重新进练习页（或卡组刚被热重载过）时缓存已经过期：丢掉重来。
+            if (_warmupStarted && ReferenceEquals(_warmupPage, page))
+            {
+                return;
+            }
+
+            if (_warmupStarted)
+            {
+                InvalidatePracticeWarmup();
+            }
+
+            _warmupStarted = true;
+            _warmupPage = page;
+            try
+            {
+                page.StartCoroutine(PracticeWarmupCoroutine());
+                Plugin.Logger.LogInfo("[AIManager] Practice warm-up started in the background.");
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[AIManager] Could not start the practice warm-up: {exception.Message}");
+            }
+        }
+
+        /// <summary>牌组或卡表被热重载后调用：下次进练习页重新预热。</summary>
+        internal static void InvalidatePracticeWarmup()
+        {
+            _warmupStarted = false;
+            _warmupPage = null;
+            _warmupAssetsReady = false;
+            _warmupChoicesReady = false;
+            CachedDeckChoices.Clear();
+        }
+
+        private static IEnumerator PracticeWarmupCoroutine()
+        {
+            EnsureOriginalPracticeAIMasters();
+            yield return null;
+
+            yield return PreloadOriginalPracticeDeckAssets();
+            _warmupAssetsReady = true;
+
+            // 分批构建：每帧几副牌，避免在玩家挑职业的时候掉帧。
+            List<CustomPracticeDeckChoice> unlimited = null;
+            try
+            {
+                unlimited = GetUnlimitedDeckChoicesWithoutOriginal();
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[AIManager] Practice warm-up could not list local decks: {exception.Message}");
+            }
+
+            if (unlimited != null)
+            {
+                CachedDeckChoices.AddRange(unlimited);
+            }
+
+            yield return BuildOriginalPracticeDeckChoicesChunked(4);
+
+            _warmupChoicesReady = true;
+            Plugin.Logger.LogInfo(
+                $"[AIManager] Practice warm-up finished: {CachedDeckChoices.Count} deck choice(s) ready " +
+                $"(assetsPreloaded={_warmupAssetsReady}, waiters={_warmupWaiters}).");
+        }
+
+        /// <summary>等预热完成，最多等 <paramref name="maxFrames"/> 帧（约 60 帧 = 1 秒）。</summary>
+        private static IEnumerator WaitForPracticeWarmup(int maxFrames)
+        {
+            if (_warmupChoicesReady)
+            {
+                yield break;
+            }
+
+            _warmupWaiters++;
+            int frames = 0;
+            while (!_warmupChoicesReady && frames++ < maxFrames)
+            {
+                yield return null;
+            }
+
+            _warmupWaiters--;
+            if (!_warmupChoicesReady)
+            {
+                Plugin.Logger.LogWarning(
+                    "[AIManager] The practice warm-up is still running; opening the selector with whatever is ready " +
+                    "(the rest is loaded on demand).");
+                // 兜底：把还没算出来的部分同步补出来，避免列表里少了原作练习卡组。
+                CompleteWarmupSynchronously();
+            }
+        }
+
+        private static void CompleteWarmupSynchronously()
+        {
+            if (_warmupChoicesReady)
+            {
+                return;
+            }
+
+            try
+            {
+                if (CachedDeckChoices.Count == 0)
+                {
+                    CachedDeckChoices.AddRange(GetUnlimitedDeckChoicesWithoutOriginal());
+                }
+
+                CachedDeckChoices.AddRange(GetOriginalPracticeDeckChoices());
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[AIManager] Practice warm-up fallback failed: {exception.Message}");
+            }
+            finally
+            {
+                _warmupChoicesReady = true;
+            }
+        }
+
+        private static List<CustomPracticeDeckChoice> GetPracticeDeckChoices()
+        {
+            if (_warmupChoicesReady && CachedDeckChoices.Count > 0)
+            {
+                return new List<CustomPracticeDeckChoice>(CachedDeckChoices);
+            }
+
+            CompleteWarmupSynchronously();
+            return new List<CustomPracticeDeckChoice>(CachedDeckChoices);
         }
 
         private static IEnumerator PreloadOriginalPracticeDeckAssets()
@@ -564,12 +809,20 @@ namespace Shadowbus
 
         private static List<CustomPracticeDeckChoice> GetUnlimitedDeckChoices()
         {
+            List<CustomPracticeDeckChoice> choices = GetUnlimitedDeckChoicesWithoutOriginal();
+            choices.AddRange(GetOriginalPracticeDeckChoices());
+            return choices;
+        }
+
+        /// <summary>本地的无限制卡组（不含「原作练习」那些官方 AI 牌组）。</summary>
+        private static List<CustomPracticeDeckChoice> GetUnlimitedDeckChoicesWithoutOriginal()
+        {
             DeckGroup deckGroup = DeckListUtility.DeckGroupDataBase?.FirstOrDefault(group =>
                 group != null &&
                 group.DeckFormat == Format.Unlimited &&
                 group.AttributeType == DeckAttributeType.CustomDeck);
 
-            var choices = deckGroup?.DeckDataList?
+            return deckGroup?.DeckDataList?
                 .Where(deck =>
                     deck != null &&
                     deck.GetCardIdList() != null &&
@@ -580,14 +833,62 @@ namespace Shadowbus
                     EnemyClassId = ResolveEnemyClassId(deck)
                 })
                 .ToList() ?? new List<CustomPracticeDeckChoice>();
-
-            choices.AddRange(GetOriginalPracticeDeckChoices());
-            return choices;
         }
 
+        /// <summary>
+        /// 「原作练习」卡组列表（每个官方练习 AI 一副）。每副牌都要读一个 TextAsset 并展开，
+        /// 一次性做完会卡帧，所以预热时不走这里，而是走
+        /// <see cref="BuildOriginalPracticeDeckChoicesChunked"/>。
+        /// </summary>
         private static List<CustomPracticeDeckChoice> GetOriginalPracticeDeckChoices()
         {
             var choices = new List<CustomPracticeDeckChoice>();
+            List<PracticeAISettingData> settings = ResolveOriginalPracticeSettings();
+            int choiceNumber = 0;
+            foreach (PracticeAISettingData setting in settings)
+            {
+                CustomPracticeDeckChoice choice = CreateOriginalPracticeDeckChoice(setting, ref choiceNumber);
+                if (choice != null)
+                {
+                    choices.Add(choice);
+                }
+            }
+
+            Plugin.Logger.LogInfo(
+                $"[AIManager] Added {choices.Count} original practice AI deck choice(s).");
+            return choices;
+        }
+
+        /// <summary>每帧做几副，避免预热时在职业选择页掉帧。</summary>
+        private static IEnumerator BuildOriginalPracticeDeckChoicesChunked(int perFrame)
+        {
+            List<PracticeAISettingData> settings = ResolveOriginalPracticeSettings();
+            int choiceNumber = 0;
+            int processedInFrame = 0;
+            int added = 0;
+            foreach (PracticeAISettingData setting in settings)
+            {
+                CustomPracticeDeckChoice choice = CreateOriginalPracticeDeckChoice(setting, ref choiceNumber);
+                if (choice != null)
+                {
+                    CachedDeckChoices.Add(choice);
+                    added++;
+                }
+
+                if (++processedInFrame >= Mathf.Max(1, perFrame))
+                {
+                    processedInFrame = 0;
+                    yield return null;
+                }
+            }
+
+            Plugin.Logger.LogInfo(
+                $"[AIManager] Added {added} original practice AI deck choice(s) (chunked build).");
+        }
+
+        /// <summary>原作练习 AI 设置表 → 已排好序、只保留可用职业的那一份清单。</summary>
+        private static List<PracticeAISettingData> ResolveOriginalPracticeSettings()
+        {
             EnsureOriginalPracticeAIMasters();
 
             List<PracticeAISettingData> settingTable = Data.Master?.PracticeAISettingList?
@@ -612,7 +913,7 @@ namespace Shadowbus
                 $"classBound={classBoundSettings}, stockDeckIds={stockDeckSettings}, " +
                 $"sample=[{settingSample}].");
 
-            IEnumerable<PracticeAISettingData> settings = nonNullSettings
+            List<PracticeAISettingData> settings = nonNullSettings
                 .Where(setting => setting.ClassId >= 1 && setting.ClassId <= 8)
                 .OrderBy(setting => setting.ClassId)
                 .ThenBy(setting => setting.Difficulty)
@@ -621,7 +922,7 @@ namespace Shadowbus
 
             // A partially initialized/offline master can expose the deck ids before the
             // class column is available. Stock practice ids still identify the classes.
-            if (!settings.Any() && stockDeckSettings > 0)
+            if (settings.Count == 0 && stockDeckSettings > 0)
             {
                 settings = nonNullSettings
                     .Where(setting => setting.DeckId >= 9100 && setting.DeckId <= 9899)
@@ -631,48 +932,49 @@ namespace Shadowbus
                     "[AIManager] Practice settings had no usable class ids; falling back to stock practice deck ids.");
             }
 
-            int choiceNumber = 0;
-            foreach (PracticeAISettingData setting in settings)
+            return settings;
+        }
+
+        /// <summary>一副官方练习 AI 牌组 → 一条可选的卡组数据。失败返回 null（并记一行日志）。</summary>
+        private static CustomPracticeDeckChoice CreateOriginalPracticeDeckChoice(
+            PracticeAISettingData setting,
+            ref int choiceNumber)
+        {
+            try
             {
-                try
+                List<int> cardIds = GetOriginalPracticeDeckCardIds(setting);
+                if (cardIds == null || cardIds.Count == 0)
                 {
-                    List<int> cardIds = GetOriginalPracticeDeckCardIds(setting);
-                    if (cardIds == null || cardIds.Count == 0)
-                    {
-                        continue;
-                    }
-
-                    int enemyClassId = ResolveOriginalPracticeClassId(setting);
-                    string className = GameMgr.GetIns().GetDataMgr().GetClanNameByKey(enemyClassId);
-                    string fileName = GetAIDeckFileName(setting.DeckId);
-                    var deck = new DeckData(Format.Unlimited, DeckAttributeType.CustomDeck);
-                    deck.SetDeckID(-100000000 - choiceNumber++);
-                    deck.SetDeckName($"原作练习 {className} / 难度 {setting.Difficulty + 1} [{fileName}]");
-                    deck.SetDeckClassID(enemyClassId);
-                    deck.SetDeckSubClassID(10);
-                    deck.SetDeckSleeveID(3000011L);
-                    deck.SetDeckIsComplete(true);
-                    deck.SetCardIdList(cardIds);
-
-                    choices.Add(new CustomPracticeDeckChoice
-                    {
-                        Deck = deck,
-                        EnemyClassId = enemyClassId,
-                        IsOriginalPracticeDeck = true,
-                        OriginalAIPreset = setting
-                    });
+                    return null;
                 }
-                catch (Exception exception)
+
+                int enemyClassId = ResolveOriginalPracticeClassId(setting);
+                string className = GameMgr.GetIns().GetDataMgr().GetClanNameByKey(enemyClassId);
+                string fileName = GetAIDeckFileName(setting.DeckId);
+                var deck = new DeckData(Format.Unlimited, DeckAttributeType.CustomDeck);
+                deck.SetDeckID(-100000000 - choiceNumber++);
+                deck.SetDeckName($"原作练习 {className} / 难度 {setting.Difficulty + 1} [{fileName}]");
+                deck.SetDeckClassID(enemyClassId);
+                deck.SetDeckSubClassID(10);
+                deck.SetDeckSleeveID(3000011L);
+                deck.SetDeckIsComplete(true);
+                deck.SetCardIdList(cardIds);
+
+                return new CustomPracticeDeckChoice
                 {
-                    Plugin.Logger.LogWarning(
-                        $"[AIManager] Failed to expose original practice deck {setting.DeckId}: " +
-                        exception.Message);
-                }
+                    Deck = deck,
+                    EnemyClassId = enemyClassId,
+                    IsOriginalPracticeDeck = true,
+                    OriginalAIPreset = setting
+                };
             }
-
-            Plugin.Logger.LogInfo(
-                $"[AIManager] Added {choices.Count(choice => choice.IsOriginalPracticeDeck)} original practice AI deck choice(s).");
-            return choices;
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning(
+                    $"[AIManager] Failed to expose original practice deck {setting.DeckId}: " +
+                    exception.Message);
+                return null;
+            }
         }
 
         private static int ResolveOriginalPracticeClassId(PracticeAISettingData setting)
