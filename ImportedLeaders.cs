@@ -242,31 +242,53 @@ namespace Shadowbus
                     names.Add($"v/vo_{charaId}_000_001.acb");
                 }
 
-                if (names.Count <= 9)
+                if (names.Count <= 0)
                 {
-                    foreach (string name in names)
-                    {
-                        AssetHandle handle = manager.GetAssetHandle(name, false);
-                        object bundle = manager.GetAssetBundleObject(name);
-                        string expected = null;
-                        try
-                        {
-                            expected = handle?.BuildLocalCachePath();
-                        }
-                        catch (Exception exception)
-                        {
-                            expected = "<" + exception.Message + ">";
-                        }
+                    return;
+                }
 
-                        Plugin.Logger.LogInfo(
-                            $"[ImportDiag] '{name}': handle={handle != null} enabled={manager.IsEnableAssetName(name)} " +
-                            $"loaded={bundle != null} expectedPath='{expected}'");
+                foreach (string name in names)
+                {
+                    AssetHandle handle = manager.GetAssetHandle(name, false);
+                    object bundle = manager.GetAssetBundleObject(name);
+                    string expected = null;
+                    try
+                    {
+                        expected = handle?.BuildLocalCachePath();
+                    }
+                    catch (Exception exception)
+                    {
+                        expected = "<" + exception.Message + ">";
                     }
 
                     Plugin.Logger.LogInfo(
-                        $"[ImportDiag] isCryptAssetFileName={Cute.AssetManager.isCryptAssetFileName}, " +
-                        $"emotionKeys={Data.Master?._emotionDic?.Count ?? -1}");
-                    _diagnosed = true;
+                        $"[ImportDiag] '{name}': handle={handle != null} enabled={manager.IsEnableAssetName(name)} " +
+                        $"loaded={bundle != null} expectedPath='{expected}'");
+                }
+
+                Plugin.Logger.LogInfo(
+                    $"[ImportDiag] isCryptAssetFileName={Cute.AssetManager.isCryptAssetFileName}, " +
+                    $"emotionKeys={Data.Master?._emotionDic?.Count ?? -1}");
+                _diagnosed = true;
+
+                // 主动试加载第一个 spine 包：Unity 到底能不能读我们做出来的包。
+                string probe = names.Count > 0 ? names[0] : null;
+                if (!string.IsNullOrEmpty(probe))
+                {
+                    var list = new List<string> { probe };
+                    Toolbox.ResourcesManager.StartCoroutine_LoadAssetGroupAsync(list, delegate
+                    {
+                        try
+                        {
+                            Plugin.Logger.LogWarning(
+                                $"[ImportDiag] probe load '{probe}': loaded=" +
+                                $"{manager.GetAssetBundleObject(probe) != null}");
+                        }
+                        catch (Exception exception)
+                        {
+                            Plugin.Logger.LogWarning($"[ImportDiag] probe load failed: {exception.Message}");
+                        }
+                    });
                 }
             }
             catch (Exception exception)
@@ -281,7 +303,8 @@ namespace Shadowbus
         /// 表里有了皮肤号，开场/胜负/表情的语音就不会再抛异常，也会真的去播。
         /// </summary>
         private static int InjectEmotionTables(
-            Dictionary<string, Dictionary<ClassCharaPrm.EmotionType, Emotion>> table)
+            Dictionary<string, Dictionary<ClassCharaPrm.EmotionType, Emotion>> table,
+            bool force = false)
         {
             int built = 0;
             foreach (string[] columns in Pending)
@@ -296,7 +319,7 @@ namespace Shadowbus
                     }
 
                     string key = skinId.ToString(CultureInfo.InvariantCulture);
-                    if (table.ContainsKey(key))
+                    if (table.ContainsKey(key) && !force)
                     {
                         continue;
                     }
@@ -720,6 +743,21 @@ namespace Shadowbus
                 }
 
                 Plugin.Logger.LogInfo($"[Import] {added} emote line(s) added to the text table.");
+
+                // 表情对象是在 StartLoadEmoteData 时用 CSV 构造的，构造当时就会把 text_id
+                // 拿去查台词表 —— 那时台词表还没好，于是存下来的是 "ET_xxx_1520" 这种 id。
+                // 台词表补好之后把我们的表重建一遍，字幕才会是真正的台词。
+                Dictionary<string, Dictionary<ClassCharaPrm.EmotionType, Emotion>> emotionTable =
+                    __instance._emotionDic;
+                if (emotionTable != null)
+                {
+                    int rebuilt = InjectEmotionTables(emotionTable, true);
+                    if (rebuilt > 0)
+                    {
+                        Plugin.Logger.LogInfo(
+                            $"[Import] Rebuilt {rebuilt} imported emotion table(s) so the lines resolve.");
+                    }
+                }
             }
             catch (Exception exception)
             {
