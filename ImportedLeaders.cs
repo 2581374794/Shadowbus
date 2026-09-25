@@ -195,10 +195,12 @@ namespace Shadowbus
                 }
 
                 int handles = registered + RegisterOverrideHandles(manager, root);
+                int cues = RegisterVoiceCueSheets(manager, root);
                 _assetsRegistered = true;
-                if (handles > 0)
+                if (handles > 0 || cues > 0)
                 {
-                    Plugin.Logger.LogInfo($"[Import] Registered {handles} local asset(s) with the asset manager.");
+                    Plugin.Logger.LogInfo(
+                        $"[Import] Registered {handles} local asset(s) and {cues} voice cue sheet(s).");
                 }
 
                 DiagnoseLocalAssets(manager);
@@ -271,6 +273,154 @@ namespace Shadowbus
             {
                 Plugin.Logger.LogWarning($"[ImportDiag] failed: {exception.Message}");
             }
+        }
+
+        /// <summary>
+        /// 直接用 <c>Mods/LeaderSkins/&lt;皮肤号&gt;/emote_chara_&lt;角色号&gt;.csv</c> 建表情表。
+        /// 这样不用管素材包能不能被游戏加载（那条路要进清单，很容易又踩坑），
+        /// 表里有了皮肤号，开场/胜负/表情的语音就不会再抛异常，也会真的去播。
+        /// </summary>
+        private static int InjectEmotionTables(
+            Dictionary<string, Dictionary<ClassCharaPrm.EmotionType, Emotion>> table)
+        {
+            int built = 0;
+            foreach (string[] columns in Pending)
+            {
+                try
+                {
+                    int charaId = ParseInt(columns, 0, 0);
+                    int skinId = ParseInt(columns, 7, 0);
+                    if (charaId <= 0 || skinId <= 0)
+                    {
+                        continue;
+                    }
+
+                    string key = skinId.ToString(CultureInfo.InvariantCulture);
+                    if (table.ContainsKey(key))
+                    {
+                        continue;
+                    }
+
+                    string path = Path.Combine(
+                        Path.Combine(PathHelper.ModPath, SubDirectory),
+                        skinId.ToString(CultureInfo.InvariantCulture),
+                        $"emote_chara_{charaId}.csv");
+                    if (!File.Exists(path))
+                    {
+                        continue;
+                    }
+
+                    var emotions = new Dictionary<ClassCharaPrm.EmotionType, Emotion>();
+                    bool first = true;
+                    foreach (string line in File.ReadLines(path))
+                    {
+                        if (first)
+                        {
+                            first = false;
+                            continue;
+                        }
+
+                        if (string.IsNullOrWhiteSpace(line))
+                        {
+                            continue;
+                        }
+
+                        string[] cells = line.Split(',');
+                        if (cells.Length < 5)
+                        {
+                            continue;
+                        }
+
+                        var emotion = new Emotion(cells);
+                        var type = (ClassCharaPrm.EmotionType)emotion.emotion_id;
+                        if (!emotions.ContainsKey(type))
+                        {
+                            emotions[type] = emotion;
+                        }
+                    }
+
+                    if (emotions.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    table[key] = emotions;
+                    built++;
+                }
+                catch (Exception exception)
+                {
+                    Plugin.Logger.LogWarning(
+                        $"[Import] Could not build an emotion table from CSV: {exception.Message}");
+                }
+            }
+
+            return built;
+        }
+
+        /// <summary>登记本地语音的 cue sheet（照剧情本地语音那套，幂等）。</summary>
+        private static int RegisterVoiceCueSheets(Cute.AssetManager manager, string root)
+        {
+            int registered = 0;
+            try
+            {
+                AudioManager audio = Toolbox.AudioManager;
+                if (audio == null)
+                {
+                    return 0;
+                }
+
+                foreach (string[] columns in Pending)
+                {
+                    int charaId = ParseInt(columns, 0, 0);
+                    if (charaId <= 0)
+                    {
+                        continue;
+                    }
+
+                    foreach (string name in VoiceFileNames(root, charaId))
+                    {
+                        AssetHandle handle = manager.GetAssetHandle(name, false);
+                        if (handle == null)
+                        {
+                            continue;
+                        }
+
+                        if (audio.AddCueSheet(handle.filename, Path.GetFileName(handle.filename),
+                                handle.directory, string.Empty))
+                        {
+                            registered++;
+                        }
+                    }
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogDebug($"[Import] Could not register the voice cue sheets: {exception.Message}");
+            }
+
+            return registered;
+        }
+
+        private static IEnumerable<string> VoiceFileNames(string root, int charaId)
+        {
+            var names = new List<string> { $"v/vo_char_select_{charaId}.acb" };
+            try
+            {
+                string directory = Path.Combine(root, "v");
+                if (Directory.Exists(directory))
+                {
+                    foreach (string file in Directory.GetFiles(directory, $"vo_{charaId}_*.acb"))
+                    {
+                        names.Add("v/" + Path.GetFileName(file));
+                    }
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogDebug($"[Import] Could not list the voice files of {charaId}: {exception.Message}");
+            }
+
+            return names;
         }
 
         /// <summary>补图（PNG）不是素材包，走的是我们自己的贴图替换，这里不用注册；留个空实现方便扩展。</summary>
@@ -489,7 +639,17 @@ namespace Shadowbus
                     return;
                 }
 
-                // 先把包加载进来（LoadObject 只在已加载的包里找），再追加进字典。
+                // 首选：直接用我们带过来的 CSV 建表（不依赖素材包能不能被游戏加载）。
+                int built = InjectEmotionTables(table);
+                if (built > 0)
+                {
+                    Plugin.Logger.LogInfo(
+                        $"[Import] {built} imported leader emotion table(s) built from the bundled CSV " +
+                        $"(total {table.Count}).");
+                    return;
+                }
+
+                // 兜底：让游戏自己加载补进去的那些表情包。
                 Toolbox.ResourcesManager.StartCoroutine_LoadAssetGroupSync(bundles, delegate
                 {
                     try
