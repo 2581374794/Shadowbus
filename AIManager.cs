@@ -888,13 +888,6 @@ namespace Shadowbus
             }
         }
 
-        private static List<CustomPracticeDeckChoice> GetUnlimitedDeckChoices()
-        {
-            List<CustomPracticeDeckChoice> choices = GetUnlimitedDeckChoicesWithoutOriginal();
-            choices.AddRange(GetOriginalPracticeDeckChoices());
-            return choices;
-        }
-
         /// <summary>本地的无限制卡组（不含「原作练习」那些官方 AI 牌组）。</summary>
         private static List<CustomPracticeDeckChoice> GetUnlimitedDeckChoicesWithoutOriginal()
         {

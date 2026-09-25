@@ -138,7 +138,7 @@ namespace Shadowbus
         }
 
         /// <summary>把卡组那块 UI 上所有贴图/精灵的状态列出来：哪一块是空的，一眼就能看出来。</summary>
-        private static void DumpDeckWidgets(DeckUI deckUi, DeckData deck, int budget)
+        private static void DumpDeckWidgets(DeckUI deckUi, DeckData deck)
         {
             try
             {
@@ -174,7 +174,7 @@ namespace Shadowbus
 
                 Plugin.Logger.LogWarning(
                     $"[Portrait] deck='{deck.GetDeckName()}' widgets({parts.Count}): {string.Join(" | ", parts)}");
-                _widgetDumps += budget;
+                _widgetDumps++;
             }
             catch (Exception exception)
             {
@@ -265,7 +265,7 @@ namespace Shadowbus
                 // 前几块卡组把整块 UI 的贴图状态也列出来。
                 if (_widgetDumps < 8)
                 {
-                    DumpDeckWidgets(__instance, deck, 1);
+                    DumpDeckWidgets(__instance, deck);
                 }
 
                 CaptureScreenOnce();
