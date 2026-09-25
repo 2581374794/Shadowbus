@@ -176,10 +176,13 @@ namespace Shadowbus
                 return;
             }
 
-            if (!int.TryParse(path, out int skinId) || skinId <= 0)
+            if (!int.TryParse(path, out int requestedId) || requestedId <= 0)
             {
                 return;
             }
+
+            // 导入的主战者：界面有时按主战者号取图，素材是按皮肤号命名的。
+            int skinId = ImportedLeaders.ResolveSkinId(requestedId);
 
             string root = ResourceRootPatches.ResourceRoot;
             if (string.IsNullOrEmpty(root))
@@ -233,6 +236,33 @@ namespace Shadowbus
 
                     _substitutionCount++;
                     LogOnce(skinId, type, candidate.Key, candidate.Value, isfetch);
+                    return;
+                }
+
+                // 一个可用的替代素材包都没有，但有 Mods/LeaderSkins 补图（移植过来的皮肤）：
+                // 预加载先指向确实存在的包（用它自己的 spine 包），对象取不到就换补图。
+                if (OverrideExists(skinId, type))
+                {
+                    if (isfetch)
+                    {
+                        Substitutions[__result] = new Substitution
+                        {
+                            SkinId = skinId,
+                            Requested = type,
+                            Used = type,
+                        };
+                    }
+                    else
+                    {
+                        string placeholder = __instance.GetAssetTypePath(
+                            skinId.ToString(), ResourcesManager.AssetLoadPathType.ClassCharaSpine, false);
+                        if (BundleExists(root, placeholder))
+                        {
+                            __result = placeholder;
+                        }
+                    }
+
+                    LogOnce(skinId, type, skinId, type, isfetch);
                     return;
                 }
 
@@ -426,6 +456,32 @@ namespace Shadowbus
             }
         }
 
+        /// <summary>补图文件路径：先 <c>&lt;皮肤号&gt;/&lt;素材名&gt;.png</c>，再平铺的 <c>&lt;素材名&gt;.png</c>。</summary>
+        private static string ResolveOverridePath(int skinId, ResourcesManager.AssetLoadPathType type)
+        {
+            if (!AssetNameFormat.TryGetValue(type, out string format))
+            {
+                return null;
+            }
+
+            string name = string.Format(format, skinId);
+            string directory = Path.Combine(PathHelper.ModPath, OverrideDirectoryName);
+            string path = Path.Combine(Path.Combine(directory, skinId.ToString()), name + ".png");
+            if (File.Exists(path))
+            {
+                return path;
+            }
+
+            path = Path.Combine(directory, name + ".png");
+            return File.Exists(path) ? path : null;
+        }
+
+        /// <summary>这个皮肤这一类素材有没有补图（移植过来的皮肤用）。</summary>
+        private static bool OverrideExists(int skinId, ResourcesManager.AssetLoadPathType type)
+        {
+            return ResolveOverridePath(skinId, type) != null;
+        }
+
         /// <summary>
         /// <c>Mods/LeaderSkins/&lt;官方素材名&gt;.png</c>：官方客户端没发这张图时，把别的客户端
         /// （或自己做的）同尺寸 PNG 放进去即可生效。贴图与 Unity 版本无关，所以这条路比搬 bundle 靠谱。
@@ -444,17 +500,10 @@ namespace Shadowbus
                 return cached != null ? cached : null;
             }
 
-            string directory = Path.Combine(PathHelper.ModPath, OverrideDirectoryName);
-            // 先找按皮肤号分的子文件夹（Mods/LeaderSkins/4102/class_skin_4102.png），
-            // 再兼容直接平铺在 LeaderSkins 根下的旧放法。
-            string path = Path.Combine(Path.Combine(directory, skinId.ToString()), name + ".png");
-            if (!File.Exists(path))
+            string path = ResolveOverridePath(skinId, type);
+            if (path == null)
             {
-                path = Path.Combine(directory, name + ".png");
-                if (!File.Exists(path))
-                {
-                    return null;
-                }
+                return null;
             }
 
             try
