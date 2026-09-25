@@ -469,6 +469,14 @@ namespace Shadowbus
             return 0;
         }
 
+        /// <summary>
+        /// 把一份本地文件登记进 <c>handleDictionary</c>，否则 <c>AssetManager.CacheAsset</c>
+        /// 里 <c>handleDictionary.TryGetValue</c> 查不到就直接跳过，包永远加载不了
+        /// （战斗里主战者不显示就是这个原因）。<c>AssetHandle</c> 的名字是"逻辑名"，
+        /// 不是磁盘路径：素材包名 <c>ui_class_1110.unity3d</c> 会被 <c>BuildLocalCachePath</c>
+        /// 拼到 <c>&lt;root&gt;/a/</c> 下，语音 <c>v/xxx.acb</c> 拼到 <c>&lt;root&gt;/v/</c> 下。
+        /// 所以存在性检查必须用 <c>BuildLocalCachePath()</c> 的结果，不能直接拼 root。
+        /// </summary>
         private static int RegisterLocalAsset(Cute.AssetManager manager, string root, string name)
         {
             try
@@ -484,11 +492,6 @@ namespace Shadowbus
                     return 0;
                 }
 
-                if (!File.Exists(Path.Combine(root, normalized.Replace('/', Path.DirectorySeparatorChar))))
-                {
-                    return 0;
-                }
-
                 string hash = string.Empty;
                 try
                 {
@@ -499,6 +502,23 @@ namespace Shadowbus
                 }
 
                 var handle = new AssetHandle(normalized, hash, null, null, null, null, false, false);
+                string localPath = null;
+                try
+                {
+                    localPath = handle.BuildLocalCachePath();
+                }
+                catch (Exception exception)
+                {
+                    Plugin.Logger.LogDebug($"[Import] '{normalized}': no local cache path ({exception.Message}).");
+                }
+
+                if (string.IsNullOrEmpty(localPath) || !File.Exists(localPath))
+                {
+                    // 只有真的在磁盘上才登记；否则等于给游戏一个"存在但读不到"的句柄。
+                    Plugin.Logger.LogDebug($"[Import] '{normalized}': not on disk at '{localPath}'.");
+                    return 0;
+                }
+
                 if (manager.RegistHandle(normalized, handle))
                 {
                     return 1;
