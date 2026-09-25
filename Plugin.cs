@@ -1,4 +1,4 @@
-﻿using BepInEx;
+using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using BepInEx.Unity.Mono;
@@ -399,8 +399,6 @@ public class Plugin : BaseUnityPlugin
             // 失焦诊断：窗口一失焦游戏就会暂停对局并屏蔽战斗输入（网络与回合计时器照跑），
             // 这条日志让玩家反馈的"联机卡死"一眼就能定性。
             Harmony.CreateAndPatchAll(typeof(FocusDiagnostics));
-            // 主战者头像诊断（临时）：把卡组头像的皮肤号 / 包名 / 文件是否存在 / 贴图是否取到写进日志。
-            Harmony.CreateAndPatchAll(typeof(LeaderPortraitDiagnostics));
             Harmony.CreateAndPatchAll(typeof(ProfileOfflineData));
             Harmony.CreateAndPatchAll(typeof(ResourceRootPatches));
             Harmony.CreateAndPatchAll(typeof(DeckFormatUI));
