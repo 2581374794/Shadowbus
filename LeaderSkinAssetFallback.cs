@@ -270,7 +270,7 @@ namespace Shadowbus
                         }
                     }
 
-                    LogOnce(skinId, type, skinId, type, isfetch);
+                    LogOverrideOnlyOnce(skinId, type, isfetch);
                     return;
                 }
 
@@ -677,6 +677,21 @@ namespace Shadowbus
 
             ExistingBundles.Add(bundle);
             return true;
+        }
+
+        private static void LogOverrideOnlyOnce(
+            int skinId,
+            ResourcesManager.AssetLoadPathType type,
+            bool isfetch)
+        {
+            if (!Logged.Add($"{skinId}|{type}|override"))
+            {
+                return;
+            }
+
+            Plugin.Logger.LogInfo(
+                $"[SkinFallback] Skin {skinId} '{type}': no local bundle, using the ported artwork " +
+                $"from Mods/{OverrideDirectoryName}/{skinId}/{(AssetNameFormat.TryGetValue(type, out string format) ? string.Format(format, skinId) : "?")}.png.");
         }
 
         private static void LogOnce(
