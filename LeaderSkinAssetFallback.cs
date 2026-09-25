@@ -437,11 +437,9 @@ namespace Shadowbus
         }
 
         /// <summary>
-        /// 把源贴图裁成目标尺寸（只裁不拉伸，所以不会变形）。裁法按素材类型定：
-        ///   方形槽位（皮肤缩略图 512²、选择按钮图 256²）：方形立绘取**上半部分居中**当半身像
-        ///     （官方缩略图就是胸像构图，全图缩进小方格里会变成一个小人）；
-        ///   宽条槽位（卡组立绘 1024×256）：取**上三分之一处的横条**，脸才在框里；
-        ///   源本来就比目标宽：水平居中裁。
+        /// 把源贴图按官方像素尺寸**等比例居中裁切**再缩放到目标尺寸：比例一致的地方原样保留，
+        /// 只截掉多余的一边，绝不拉伸，所以不会变形。缩略图 512×512、按钮图 256×256、
+        /// 卡组立绘 1024×256 这些尺寸都是从官方素材量出来的。
         /// </summary>
         private static Texture FitToSize(Texture source, int width, int height)
         {
@@ -455,36 +453,34 @@ namespace Shadowbus
             float targetAspect = (float)width / height;
             float sourceAspect = sourceWidth / sourceHeight;
 
-            // 裁切区域（像素，原点在左上角）。
-            float cropX;
-            float cropY;
+            // 裁切区域（像素，原点在左上角）：居中。
             float cropWidth;
             float cropHeight;
-            if (targetAspect <= 1.05f)
+            float cropX;
+            float cropY;
+            if (sourceAspect > targetAspect)
             {
-                // 方形目标：取上半部分当半身像；竖向太长的图按宽度取正方形。
-                cropWidth = Mathf.Min(sourceWidth, sourceHeight) * 0.5f;
-                cropHeight = Mathf.Min(sourceWidth, sourceHeight) * 0.5f;
-                cropWidth = Mathf.Min(cropWidth, sourceWidth);
-                cropHeight = Mathf.Min(cropHeight, sourceHeight);
-                cropX = (sourceWidth - cropWidth) * 0.5f;
-                cropY = Mathf.Clamp(sourceHeight * 0.02f, 0f, Mathf.Max(0f, sourceHeight - cropHeight));
-            }
-            else if (sourceAspect > targetAspect)
-            {
-                // 源比目标还宽：水平居中裁。
+                // 源更宽：左右各裁一点。
                 cropHeight = sourceHeight;
                 cropWidth = sourceHeight * targetAspect;
                 cropX = (sourceWidth - cropWidth) * 0.5f;
                 cropY = 0f;
             }
-            else
+            else if (sourceAspect < targetAspect)
             {
-                // 宽条目标 + 方形/竖向源：取上三分之一处的横条（头像/胸像都在上半部）。
+                // 源更高：上下各裁一点。
                 cropWidth = sourceWidth;
                 cropHeight = sourceWidth / targetAspect;
                 cropX = 0f;
-                cropY = Mathf.Clamp(sourceHeight / 3f - cropHeight * 0.5f, 0f, Mathf.Max(0f, sourceHeight - cropHeight));
+                cropY = (sourceHeight - cropHeight) * 0.5f;
+            }
+            else
+            {
+                // 比例本来就一致：整张图缩放，不裁。
+                cropWidth = sourceWidth;
+                cropHeight = sourceHeight;
+                cropX = 0f;
+                cropY = 0f;
             }
 
             Vector2 scale = new Vector2(cropWidth / sourceWidth, cropHeight / sourceHeight);
