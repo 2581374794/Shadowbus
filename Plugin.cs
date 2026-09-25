@@ -406,6 +406,8 @@ public class Plugin : BaseUnityPlugin
             Harmony.CreateAndPatchAll(typeof(LeaderSkinAssetFallback));
             // 国服独占主战者移植：往角色表补行 + 补国服名字。
             Harmony.CreateAndPatchAll(typeof(ImportedLeaders));
+            // 表情/语音数据兜底：表里查不到不让它抛异常（抛在协程里会把对局卡死）。
+            Harmony.CreateAndPatchAll(typeof(EmotionDataGuard));
             Harmony.CreateAndPatchAll(typeof(ProfileOfflineData));
             Harmony.CreateAndPatchAll(typeof(ResourceRootPatches));
             Harmony.CreateAndPatchAll(typeof(DeckFormatUI));

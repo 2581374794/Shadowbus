@@ -68,6 +68,15 @@ namespace Shadowbus
                 }
                 else
                 {
+                    // FocusPauseGuard 现在会拦掉"失焦暂停"；拦掉了就别说"已暂停"。
+                    if (FocusPauseGuard.SkippedLastPause)
+                    {
+                        Plugin.Logger.LogInfo(
+                            "[Focus] 游戏窗口失去焦点：对局**未**暂停（FocusPauseGuard 已跳过），可以继续操作。" +
+                            (inBattle ? $"（phase={phase}）" : string.Empty));
+                        return;
+                    }
+
                     Plugin.Logger.LogWarning(
                         "[Focus] 游戏窗口失去焦点：对局已暂停，牌桌不再接受任何操作，" +
                         "但**回合计时器与网络连接仍在继续**（切出去就可能被判回合超时）。" +

@@ -254,6 +254,88 @@ namespace Shadowbus
             AccessTools.Field(typeof(Master), "EmoteWordDic");
 
         /// <summary>
+        /// 把国服的表情表补进 <c>_emotionDic</c>。
+        ///
+        /// 游戏建这张表的方式是：<c>遍历角色表 → CheckBeforeFileRequeset(清单里有才加载) →
+        /// 预加载 → StartLoadEmoteData</c>。我们塞进去的 <c>master_emote_chara_*.unity3d</c>
+        /// 不在清单里，会被跳过；表里没有这个皮肤号，开场语音就会 KeyNotFoundException、
+        /// 协程断掉、对局卡死。所以这里自己预加载这几个包，再用游戏自带的
+        /// <c>DynamicLoadEmoteData</c>（只追加、不清空）补进去。
+        /// </summary>
+        [HarmonyPatch(typeof(Master), nameof(Master.StartLoadEmoteData))]
+        [HarmonyPostfix]
+        private static void Master_StartLoadEmoteData_Postfix(Master __instance)
+        {
+            try
+            {
+                EnsureLoaded();
+                Dictionary<string, Dictionary<ClassCharaPrm.EmotionType, Emotion>> table = __instance?._emotionDic;
+                if (table == null || Pending.Count == 0)
+                {
+                    return;
+                }
+
+                var texts = new List<string>();
+                var keys = new List<string>();
+                var bundles = new List<string>();
+                foreach (string[] columns in Pending)
+                {
+                    int charaId = ParseInt(columns, 0, 0);
+                    int skinId = ParseInt(columns, 7, 0);
+                    if (charaId <= 0 || skinId <= 0)
+                    {
+                        continue;
+                    }
+
+                    string key = skinId.ToString(CultureInfo.InvariantCulture);
+                    if (table.ContainsKey(key))
+                    {
+                        continue;
+                    }
+
+                    string text = $"emote_chara_{charaId}";
+                    texts.Add(text);
+                    keys.Add(key);
+                    bundles.Add(Toolbox.ResourcesManager.GetAssetTypePath(
+                        text, ResourcesManager.AssetLoadPathType.CharaMaster, false));
+                }
+
+                if (texts.Count == 0)
+                {
+                    return;
+                }
+
+                // 先把包加载进来（LoadObject 只在已加载的包里找），再追加进字典。
+                Toolbox.ResourcesManager.StartCoroutine_LoadAssetGroupSync(bundles, delegate
+                {
+                    try
+                    {
+                        __instance.DynamicLoadEmoteData(texts, keys);
+                        int added = 0;
+                        foreach (string key in keys)
+                        {
+                            if (table.ContainsKey(key))
+                            {
+                                added++;
+                            }
+                        }
+
+                        Plugin.Logger.LogInfo(
+                            $"[Import] {added} imported leader emotion table(s) added (total {table.Count}).");
+                    }
+                    catch (Exception exception)
+                    {
+                        Plugin.Logger.LogWarning($"[Import] Could not add the emotion tables: {exception.Message}");
+                    }
+                });
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[Import] Could not load the imported emotion tables: {exception.Message}");
+            }
+        }
+
+        /// <summary>
         /// 表情台词表加载完之后，把国服那批台词（ET_..._&lt;角色号&gt;）补进去，
         /// 否则表情只有声音没有字。
         /// </summary>

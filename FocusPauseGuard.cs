@@ -17,8 +17,14 @@ namespace Shadowbus
     /// </summary>
     public static class FocusPauseGuard
     {
+        private static readonly System.Reflection.PropertyInfo HasFocusProperty =
+            AccessTools.Property(typeof(UnityEventAgent), "HasFocus");
+
         private static readonly System.Reflection.FieldInfo HasFocusField =
-            AccessTools.Field(typeof(UnityEventAgent), "HasFocus");
+            AccessTools.Field(typeof(UnityEventAgent), "<HasFocus>k__BackingField");
+
+        /// <summary>最近一次失焦有没有被我们跳过暂停（给诊断日志用）。</summary>
+        public static bool SkippedLastPause { get; private set; }
 
         private static int _logCount;
         private const int MaxLogs = 5;
@@ -35,12 +41,20 @@ namespace Shadowbus
 
             try
             {
-                // 标记还是要写：别的代码会读 HasFocus。
-                if (__instance != null && HasFocusField != null)
+                // 标记还是要写：别的代码会读 HasFocus（它是只读属性，只能反射 setter）。
+                if (__instance != null)
                 {
-                    HasFocusField.SetValue(__instance, false);
+                    if (HasFocusProperty?.GetSetMethod(true) != null)
+                    {
+                        HasFocusProperty.GetSetMethod(true).Invoke(__instance, new object[] { false });
+                    }
+                    else
+                    {
+                        HasFocusField?.SetValue(__instance, false);
+                    }
                 }
 
+                SkippedLastPause = true;
                 if (_logCount < MaxLogs)
                 {
                     _logCount++;
