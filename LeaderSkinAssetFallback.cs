@@ -35,13 +35,20 @@ namespace Shadowbus
         /// <summary>替换后生成的贴图最多留几份（超出就丢引用，交给 Resources.UnloadUnusedAssets 回收）。</summary>
         private const int MaxConvertedTextures = 64;
 
-        /// <summary>只有这几种"缺了就直接空一块"的类型才兜底；战斗立绘、模型等不动。</summary>
+        /// <summary>官方原图放这里：<c>Mods/LeaderSkins/</c>。</summary>
+        private const string OverrideDirectoryName = "LeaderSkins";
+
+        /// <summary>只有这几种"缺了就直接空一块"的类型才兜底；模型、特效等不动。</summary>
         private static readonly HashSet<ResourcesManager.AssetLoadPathType> Supported =
             new HashSet<ResourcesManager.AssetLoadPathType>
             {
                 ResourcesManager.AssetLoadPathType.ClassCharaSkinThumbnail,
                 ResourcesManager.AssetLoadPathType.ClassCharaButton,
                 ResourcesManager.AssetLoadPathType.DeckListTexture,
+                ResourcesManager.AssetLoadPathType.ClassCharaBase,
+                ResourcesManager.AssetLoadPathType.ClassCharaBaseWin,
+                ResourcesManager.AssetLoadPathType.ClassCharaBaseLose,
+                ResourcesManager.AssetLoadPathType.ClassCharaProfile,
             };
 
         /// <summary>同一皮肤内可换用的素材类型（不含请求的那一类本身），顺序即优先级。</summary>
@@ -72,10 +79,42 @@ namespace Shadowbus
                         ResourcesManager.AssetLoadPathType.ClassCharaBase,
                     }
                 },
+                {
+                    // 全身立绘/胜负立绘/资料图：缺了就用同一角色的普通立绘（比例一致）。
+                    ResourcesManager.AssetLoadPathType.ClassCharaBase, new[]
+                    {
+                        ResourcesManager.AssetLoadPathType.ClassCharaSkinThumbnail,
+                        ResourcesManager.AssetLoadPathType.ClassCharaButton,
+                    }
+                },
+                {
+                    ResourcesManager.AssetLoadPathType.ClassCharaBaseWin, new[]
+                    {
+                        ResourcesManager.AssetLoadPathType.ClassCharaBase,
+                        ResourcesManager.AssetLoadPathType.ClassCharaSkinThumbnail,
+                    }
+                },
+                {
+                    ResourcesManager.AssetLoadPathType.ClassCharaBaseLose, new[]
+                    {
+                        ResourcesManager.AssetLoadPathType.ClassCharaBase,
+                        ResourcesManager.AssetLoadPathType.ClassCharaSkinThumbnail,
+                    }
+                },
+                {
+                    ResourcesManager.AssetLoadPathType.ClassCharaProfile, new[]
+                    {
+                        ResourcesManager.AssetLoadPathType.ClassCharaBase,
+                        ResourcesManager.AssetLoadPathType.ClassCharaSkinThumbnail,
+                    }
+                },
             };
 
-        /// <summary>官方各类素材的像素尺寸（从本地官方素材量出来的，全部皮肤一致）。换素材时按这个尺寸裁切。</summary>
-        private static readonly Dictionary<ResourcesManager.AssetLoadPathType, Vector2Int> OfficialSize =
+        /// <summary>
+        /// 官方"小图标槽位"的像素尺寸（从本地官方素材量出来的，全部皮肤一致）。
+        /// 只有这些槽位才需要重排构图；立绘类槽位本身是整张插画，比例一致就原样用。
+        /// </summary>
+        private static readonly Dictionary<ResourcesManager.AssetLoadPathType, Vector2Int> TileSize =
             new Dictionary<ResourcesManager.AssetLoadPathType, Vector2Int>
             {
                 { ResourcesManager.AssetLoadPathType.ClassCharaSkinThumbnail, new Vector2Int(512, 512) },
@@ -83,11 +122,29 @@ namespace Shadowbus
                 { ResourcesManager.AssetLoadPathType.DeckListTexture, new Vector2Int(1024, 256) },
             };
 
+        /// <summary>
+        /// 各类素材的官方文件名（不含扩展名），用来找 <c>Mods/LeaderSkins/&lt;名字&gt;.png</c>：
+        /// 官方客户端没发、又从别的客户端（如国服手机版）拿到图时，直接放一张 PNG 就能生效——
+        /// 贴图与 Unity 版本无关，而别的版本的 bundle 在本地运行时是加载不了的。
+        /// </summary>
+        private static readonly Dictionary<ResourcesManager.AssetLoadPathType, string> AssetNameFormat =
+            new Dictionary<ResourcesManager.AssetLoadPathType, string>
+            {
+                { ResourcesManager.AssetLoadPathType.ClassCharaSkinThumbnail, "class_skin_{0:D2}" },
+                { ResourcesManager.AssetLoadPathType.ClassCharaButton, "class_select_thumbnail_{0:D2}" },
+                { ResourcesManager.AssetLoadPathType.DeckListTexture, "btn_deck_{0:D2}" },
+                { ResourcesManager.AssetLoadPathType.ClassCharaBase, "class_{0:D2}_base" },
+                { ResourcesManager.AssetLoadPathType.ClassCharaBaseWin, "class_{0:D2}_base_win" },
+                { ResourcesManager.AssetLoadPathType.ClassCharaBaseLose, "class_{0:D2}_base_lose" },
+                { ResourcesManager.AssetLoadPathType.ClassCharaProfile, "class_{0:D2}_profile" },
+            };
+
         private sealed class Substitution
         {
             public int SkinId;
             public ResourcesManager.AssetLoadPathType Requested;
             public ResourcesManager.AssetLoadPathType Used;
+            public int UsedSkinId;
         }
 
         private static readonly HashSet<string> ExistingBundles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -149,16 +206,14 @@ namespace Shadowbus
                     }
 
                     __result = isfetch ? objectPath : bundle;
-                    if (candidate.Value != type)
+                    // 记下这次替换：取到对象后可能还要"贴官方图"或"按官方尺寸重排构图"。
+                    Substitutions[objectPath] = new Substitution
                     {
-                        // 换了素材类型：取到后用官方尺寸等比例裁切，避免被界面拉变形。
-                        Substitutions[objectPath] = new Substitution
-                        {
-                            SkinId = skinId,
-                            Requested = type,
-                            Used = candidate.Value,
-                        };
-                    }
+                        SkinId = skinId,
+                        Requested = type,
+                        Used = candidate.Value,
+                        UsedSkinId = candidate.Key,
+                    };
 
                     _substitutionCount++;
                     LogOnce(skinId, type, candidate.Key, candidate.Value, isfetch);
@@ -264,18 +319,27 @@ namespace Shadowbus
         {
             try
             {
-                if (result == null || string.IsNullOrEmpty(objectName) ||
+                if (string.IsNullOrEmpty(objectName) ||
                     !Substitutions.TryGetValue(objectName, out Substitution substitution))
                 {
                     return result;
                 }
 
-                if (!(result is Texture source) || !OfficialSize.TryGetValue(substitution.Requested, out Vector2Int size))
+                string key = $"{substitution.SkinId}|{(int)substitution.Requested}";
+
+                // 1) Mods/LeaderSkins 里有官方原图（例如从国服客户端提取的）就直接用它，最准。
+                Texture official = LoadOverride(substitution.SkinId, substitution.Requested);
+                if (official != null)
+                {
+                    return official;
+                }
+
+                // 2) 立绘类槽位比例一致，原样用即可。
+                if (!(result is Texture source) || !TileSize.TryGetValue(substitution.Requested, out Vector2Int size))
                 {
                     return result;
                 }
 
-                string key = $"{substitution.SkinId}|{(int)substitution.Requested}";
                 if (ConvertedTextures.TryGetValue(key, out Texture cached) && cached != null)
                 {
                     return cached;
@@ -287,13 +351,68 @@ namespace Shadowbus
                     return result;
                 }
 
-                converted.name = $"{source.name}_fit{size.x}x{size.y}";                StoreConverted(key, converted);
+                converted.name = $"{source.name}_fit{size.x}x{size.y}";
+                StoreConverted(key, converted);
                 return converted;
             }
             catch (Exception exception)
             {
                 Plugin.Logger.LogDebug($"[SkinFallback] Could not fit the substituted texture: {exception.Message}");
                 return result;
+            }
+        }
+
+        /// <summary>
+        /// <c>Mods/LeaderSkins/&lt;官方素材名&gt;.png</c>：官方客户端没发这张图时，把别的客户端
+        /// （或自己做的）同尺寸 PNG 放进去即可生效。贴图与 Unity 版本无关，所以这条路比搬 bundle 靠谱。
+        /// </summary>
+        private static Texture LoadOverride(int skinId, ResourcesManager.AssetLoadPathType type)
+        {
+            if (!AssetNameFormat.TryGetValue(type, out string format))
+            {
+                return null;
+            }
+
+            string name = string.Format(format, skinId);
+            string key = "png:" + name;
+            if (ConvertedTextures.TryGetValue(key, out Texture cached))
+            {
+                return cached != null ? cached : null;
+            }
+
+            string path = Path.Combine(Path.Combine(PathHelper.ModPath, OverrideDirectoryName), name + ".png");
+            if (!File.Exists(path))
+            {
+                return null;
+            }
+
+            try
+            {
+                var texture = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                if (!ImageConversion.LoadImage(texture, File.ReadAllBytes(path), false))
+                {
+                    UnityEngine.Object.Destroy(texture);
+                    Plugin.Logger.LogWarning($"[SkinFallback] '{path}' is not a usable image; ignoring it.");
+                    return null;
+                }
+
+                texture.name = name;
+                StoreConverted(key, texture);
+                LogOverrideOnce(name);
+                return texture;
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[SkinFallback] Could not load '{path}': {exception.Message}");
+                return null;
+            }
+        }
+
+        private static void LogOverrideOnce(string name)
+        {
+            if (Logged.Add("png|" + name))
+            {
+                Plugin.Logger.LogInfo($"[SkinFallback] Using the official artwork from Mods/{OverrideDirectoryName}/{name}.png.");
             }
         }
 
