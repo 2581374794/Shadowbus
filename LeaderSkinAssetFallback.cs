@@ -49,6 +49,8 @@ namespace Shadowbus
                 ResourcesManager.AssetLoadPathType.ClassCharaBaseWin,
                 ResourcesManager.AssetLoadPathType.ClassCharaBaseLose,
                 ResourcesManager.AssetLoadPathType.ClassCharaProfile,
+                // 卡牌名底板（LoadClassHeaderTexture 走 ClassCharaHeader，路径是 log_class_<皮肤号>）
+                ResourcesManager.AssetLoadPathType.ClassCharaHeader,
             };
 
         /// <summary>同一皮肤内可换用的素材类型（不含请求的那一类本身），顺序即优先级。</summary>
@@ -108,6 +110,14 @@ namespace Shadowbus
                         ResourcesManager.AssetLoadPathType.ClassCharaSkinThumbnail,
                     }
                 },
+                {
+                    // 卡牌名底板是横条，缺了就用立绘裁一条出来。
+                    ResourcesManager.AssetLoadPathType.ClassCharaHeader, new[]
+                    {
+                        ResourcesManager.AssetLoadPathType.ClassCharaBase,
+                        ResourcesManager.AssetLoadPathType.ClassCharaSkinThumbnail,
+                    }
+                },
             };
 
         /// <summary>
@@ -137,6 +147,7 @@ namespace Shadowbus
                 { ResourcesManager.AssetLoadPathType.ClassCharaBaseWin, "class_{0:D2}_base_win" },
                 { ResourcesManager.AssetLoadPathType.ClassCharaBaseLose, "class_{0:D2}_base_lose" },
                 { ResourcesManager.AssetLoadPathType.ClassCharaProfile, "class_{0:D2}_profile" },
+                { ResourcesManager.AssetLoadPathType.ClassCharaHeader, "log_class_{0:D2}" },
             };
 
         private sealed class Substitution
@@ -176,13 +187,10 @@ namespace Shadowbus
                 return;
             }
 
-            if (!int.TryParse(path, out int requestedId) || requestedId <= 0)
+            if (!TryResolveSkinId(path, out int skinId))
             {
                 return;
             }
-
-            // 导入的主战者：界面有时按主战者号取图，素材是按皮肤号命名的。
-            int skinId = ImportedLeaders.ResolveSkinId(requestedId);
 
             string root = ResourceRootPatches.ResourceRoot;
             if (string.IsNullOrEmpty(root))
@@ -277,6 +285,38 @@ namespace Shadowbus
             {
                 _resolving = false;
             }
+        }
+
+        /// <summary>
+        /// 请求路径 → 皮肤号。一般是纯数字皮肤号；卡牌名底板是 <c>log_class_&lt;皮肤号&gt;</c>
+        /// （进化时还有 <c>_evolve</c> 后缀）；导入的主战者界面有时按主战者号取图，换成皮肤号。
+        /// </summary>
+        private static bool TryResolveSkinId(string path, out int skinId)
+        {
+            skinId = 0;
+            if (string.IsNullOrEmpty(path))
+            {
+                return false;
+            }
+
+            string text = path;
+            if (text.StartsWith("log_class_", StringComparison.OrdinalIgnoreCase))
+            {
+                text = text.Substring("log_class_".Length);
+                int suffix = text.IndexOf('_');
+                if (suffix >= 0)
+                {
+                    text = text.Substring(0, suffix);
+                }
+            }
+
+            if (!int.TryParse(text, out int requestedId) || requestedId <= 0)
+            {
+                return false;
+            }
+
+            skinId = ImportedLeaders.ResolveSkinId(requestedId);
+            return true;
         }
 
         /// <summary>

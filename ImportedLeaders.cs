@@ -31,6 +31,9 @@ namespace Shadowbus
         /// <summary>名字 key → { 简, 繁, 英 }。</summary>
         private static readonly Dictionary<string, string[]> Names = new Dictionary<string, string[]>(StringComparer.Ordinal);
 
+        /// <summary>台词 key（ET_...）→ { 简, 繁, 英, 日 }。</summary>
+        private static readonly Dictionary<string, string[]> EmoteLines = new Dictionary<string, string[]>(StringComparer.Ordinal);
+
         /// <summary>主战者号 → 皮肤号：素材按皮肤号命名，界面有时按主战者号取图。</summary>
         private static readonly Dictionary<int, int> CharaToSkin = new Dictionary<int, int>();
 
@@ -65,6 +68,20 @@ namespace Shadowbus
                 }
 
                 JObject root = JObject.Parse(File.ReadAllText(path));
+                if (root["emote_text"] is JObject emoteText)
+                {
+                    foreach (KeyValuePair<string, JToken> pair in emoteText)
+                    {
+                        EmoteLines[pair.Key] = new[]
+                        {
+                            (string)pair.Value["chs"] ?? string.Empty,
+                            (string)pair.Value["cht"] ?? string.Empty,
+                            (string)pair.Value["eng"] ?? string.Empty,
+                            (string)pair.Value["jpn"] ?? string.Empty,
+                        };
+                    }
+                }
+
                 JArray leaders = root["leaders"] as JArray;
                 if (leaders == null)
                 {
@@ -113,7 +130,6 @@ namespace Shadowbus
                 Plugin.Logger.LogInfo(
                     $"[Import] {leadersCount} imported leader(s) / {rowsCount} master row(s) prepared " +
                     $"from {path}.");
-
                 RegisterLocalHashes();
             }
             catch (Exception exception)
@@ -222,6 +238,9 @@ namespace Shadowbus
                 {
                     count += Register(manager, root, Path.Combine("v", Path.GetFileName(file)));
                 }
+
+                // 选择主战者时的语音（vo_char_select_<角色号>.acb）
+                count += Register(manager, root, Path.Combine("v", $"vo_char_select_{charaId}.acb"));
             }
             catch (Exception exception)
             {
@@ -229,6 +248,57 @@ namespace Shadowbus
             }
 
             return count;
+        }
+
+        private static readonly System.Reflection.FieldInfo EmoteWordDictionaryField =
+            AccessTools.Field(typeof(Master), "EmoteWordDic");
+
+        /// <summary>
+        /// 表情台词表加载完之后，把国服那批台词（ET_..._&lt;角色号&gt;）补进去，
+        /// 否则表情只有声音没有字。
+        /// </summary>
+        [HarmonyPatch(typeof(Master), nameof(Master.StartLoadEmoteMasterText))]
+        [HarmonyPostfix]
+        private static void Master_StartLoadEmoteMasterText_Postfix(Master __instance)
+        {
+            try
+            {
+                EnsureLoaded();
+                if (EmoteLines.Count == 0 || __instance == null)
+                {
+                    return;
+                }
+
+                if (!(EmoteWordDictionaryField?.GetValue(__instance) is Dictionary<string, string> words))
+                {
+                    return;
+                }
+
+                int added = 0;
+                foreach (KeyValuePair<string, string[]> pair in EmoteLines)
+                {
+                    string text = StoryTextLanguagePatches.ResolveUiText(pair.Value[0], pair.Value[1], pair.Value[2]);
+                    if (string.IsNullOrEmpty(text))
+                    {
+                        // 国服表的英文列是空的，英文界面就用日文原文兜。
+                        text = pair.Value[3];
+                    }
+
+                    if (string.IsNullOrEmpty(text))
+                    {
+                        continue;
+                    }
+
+                    words[pair.Key] = text;
+                    added++;
+                }
+
+                Plugin.Logger.LogInfo($"[Import] {added} emote line(s) added to the text table.");
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[Import] Could not add the emote lines: {exception.Message}");
+            }
         }
 
         /// <summary>
