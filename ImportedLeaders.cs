@@ -40,6 +40,7 @@ namespace Shadowbus
         private static bool _loaded;
         private static bool _warned;
         private static bool _hashesRegistered;
+        private static bool _assetsRegistered;
 
         /// <summary>主战者号换成皮肤号（不是我们导入的就原样返回）。</summary>
         internal static int ResolveSkinId(int id)
@@ -131,11 +132,127 @@ namespace Shadowbus
                     $"[Import] {leadersCount} imported leader(s) / {rowsCount} master row(s) prepared " +
                     $"from {path}.");
                 RegisterLocalHashes();
+                RegisterLocalAssets();
             }
             catch (Exception exception)
             {
                 Plugin.Logger.LogWarning($"[Import] Could not read '{ConfigurationPath}': {exception.Message}");
             }
+        }
+
+        /// <summary>
+        /// 把移植进来的文件注册成"游戏认得的资产"。
+        ///
+        /// 游戏判断一个资源能不能加载是 <c>AssetManager.IsEnableAssetName(name)</c> →
+        /// <c>handleDictionary.ContainsKey(name)</c>，而这张表是从素材清单建的；我们直接塞进
+        /// 资源目录的文件不在清单里，于是：**战斗 spine 包不加载（模型不显示）、表情表不加载
+        /// （没语音）、语音包不认**。剧情本地语音早就在用同一招（<c>RegistHandle</c> +
+        /// 本地 <c>AssetHandle</c>），这里照搬到主战者身上。
+        /// </summary>
+        private static void RegisterLocalAssets()
+        {
+            if (_assetsRegistered)
+            {
+                return;
+            }
+
+            try
+            {
+                Cute.AssetManager manager = Toolbox.AssetManager;
+                string root = ResourceRootPatches.ResourceRoot;
+                if (manager == null || string.IsNullOrEmpty(root) || Pending.Count == 0)
+                {
+                    return;
+                }
+
+                int registered = 0;
+                foreach (string[] columns in Pending)
+                {
+                    int charaId = ParseInt(columns, 0, 0);
+                    int skinId = ParseInt(columns, 7, 0);
+                    if (charaId <= 0 || skinId <= 0)
+                    {
+                        continue;
+                    }
+
+                    registered += RegisterLocalAsset(manager, root, Toolbox.ResourcesManager.GetAssetTypePath(
+                        skinId.ToString(CultureInfo.InvariantCulture),
+                        ResourcesManager.AssetLoadPathType.ClassCharaSpine, false));
+                    registered += RegisterLocalAsset(manager, root, Toolbox.ResourcesManager.GetAssetTypePath(
+                        $"emote_chara_{charaId}", ResourcesManager.AssetLoadPathType.CharaMaster, false));
+
+                    string voiceDirectory = Path.Combine(root, "v");
+                    if (Directory.Exists(voiceDirectory))
+                    {
+                        foreach (string file in Directory.GetFiles(voiceDirectory, $"vo_{charaId}_*.acb"))
+                        {
+                            registered += RegisterLocalAsset(manager, root, "v/" + Path.GetFileName(file));
+                        }
+                    }
+
+                    registered += RegisterLocalAsset(manager, root, $"v/vo_char_select_{charaId}.acb");
+                }
+
+                int handles = registered + RegisterOverrideHandles(manager, root);
+                _assetsRegistered = true;
+                if (handles > 0)
+                {
+                    Plugin.Logger.LogInfo($"[Import] Registered {handles} local asset(s) with the asset manager.");
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[Import] Could not register the local assets: {exception.Message}");
+            }
+        }
+
+        /// <summary>补图（PNG）不是素材包，走的是我们自己的贴图替换，这里不用注册；留个空实现方便扩展。</summary>
+        private static int RegisterOverrideHandles(Cute.AssetManager manager, string root)
+        {
+            return 0;
+        }
+
+        private static int RegisterLocalAsset(Cute.AssetManager manager, string root, string name)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(name))
+                {
+                    return 0;
+                }
+
+                string normalized = name.Replace('\\', '/');
+                if (manager.GetAssetHandle(normalized, false) != null)
+                {
+                    return 0;
+                }
+
+                if (!File.Exists(Path.Combine(root, normalized.Replace('/', Path.DirectorySeparatorChar))))
+                {
+                    return 0;
+                }
+
+                string hash = string.Empty;
+                try
+                {
+                    hash = manager.GetLocalDatahash(normalized) ?? string.Empty;
+                }
+                catch
+                {
+                }
+
+                var handle = new AssetHandle(normalized, hash, null, null, null, null, false, false);
+                if (manager.RegistHandle(normalized, handle))
+                {
+                    return 1;
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogDebug($"[Import] Could not register '{name}': {exception.Message}");
+            }
+
+            return 0;
         }
 
         private static int ParseInt(string[] columns, int index, int fallback)
@@ -434,8 +551,9 @@ namespace Shadowbus
             try
             {
                 EnsureLoaded();
-                // 角色表加载时资源管理器肯定起来了，哈希登记在这里再试一次（幂等）。
+                // 角色表加载时资源管理器肯定起来了，这两步在这里再试一次（幂等）。
                 RegisterLocalHashes();
+                RegisterLocalAssets();
                 if (Pending.Count == 0 || __instance?.ClassCharacterList == null)
                 {
                     return;
