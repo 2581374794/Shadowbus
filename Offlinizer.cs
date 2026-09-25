@@ -1,4 +1,4 @@
-﻿using Cute;
+using Cute;
 using HarmonyLib;
 using LitJson;
 using Newtonsoft.Json;
@@ -7,6 +7,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using UnityEngine;
 using Wizard;
@@ -145,6 +146,43 @@ namespace Shadowbus
         public static void ClassCharacterMasterData_Constructor_Postfix(ClassCharacterMasterData __instance)
         {
             __instance.IsAcquired = true;
+            HideNamePlaceholders(__instance);
+        }
+
+        private static PropertyInfo _isUsableProperty;
+
+        /// <summary>
+        /// 官方有一批"占位主战者"：名字文本就是 <c>？？？</c>（如 chara 510405，is_usable 却是 1，
+        /// 复用了月影的皮肤号 500405），在主战者列表里表现为"一个叫？？？的月影"。它不是能选的主战者，
+        /// 这里统一标成不可用，列表里就不会出现；官方以后补上真名时会自动恢复（判据是名字文本）。
+        /// </summary>
+        private static void HideNamePlaceholders(ClassCharacterMasterData instance)
+        {
+            try
+            {
+                string name = instance?.chara_name;
+                if (string.IsNullOrEmpty(name))
+                {
+                    return;
+                }
+
+                foreach (char character in name)
+                {
+                    if (character != '？' && character != '?')
+                    {
+                        return;
+                    }
+                }
+
+                _isUsableProperty ??= AccessTools.Property(typeof(ClassCharacterMasterData), "is_usable");
+                _isUsableProperty?.SetValue(instance, false, null);
+                Plugin.Logger.LogInfo(
+                    $"[Offlinizer] Placeholder leader {instance.chara_id} ('{name}') marked as not usable.");
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogDebug($"[Offlinizer] Could not hide a placeholder leader: {exception.Message}");
+            }
         }
         #endregion
 

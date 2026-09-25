@@ -287,8 +287,7 @@ namespace Shadowbus
                     return result;
                 }
 
-                converted.name = $"{source.name}_fit{size.x}x{size.y}";
-                StoreConverted(key, converted);
+                converted.name = $"{source.name}_fit{size.x}x{size.y}";                StoreConverted(key, converted);
                 return converted;
             }
             catch (Exception exception)
@@ -311,7 +310,13 @@ namespace Shadowbus
             ConvertedOrder.Add(key);
         }
 
-        /// <summary>把源贴图按等比例居中裁切后缩放到目标尺寸（只裁不拉伸，所以不会变形）。</summary>
+        /// <summary>
+        /// 把源贴图裁成目标尺寸（只裁不拉伸，所以不会变形）。裁法按素材类型定：
+        ///   方形槽位（皮肤缩略图 512²、选择按钮图 256²）：方形立绘取**上半部分居中**当半身像
+        ///     （官方缩略图就是胸像构图，全图缩进小方格里会变成一个小人）；
+        ///   宽条槽位（卡组立绘 1024×256）：取**上三分之一处的横条**，脸才在框里；
+        ///   源本来就比目标宽：水平居中裁。
+        /// </summary>
         private static Texture FitToSize(Texture source, int width, int height)
         {
             if (source.width <= 0 || source.height <= 0 || width <= 0 || height <= 0)
@@ -319,20 +324,46 @@ namespace Shadowbus
                 return null;
             }
 
-            float sourceAspect = (float)source.width / source.height;
+            float sourceWidth = source.width;
+            float sourceHeight = source.height;
             float targetAspect = (float)width / height;
-            Vector2 scale = Vector2.one;
-            Vector2 offset = Vector2.zero;
-            if (sourceAspect > targetAspect)
+            float sourceAspect = sourceWidth / sourceHeight;
+
+            // 裁切区域（像素，原点在左上角）。
+            float cropX;
+            float cropY;
+            float cropWidth;
+            float cropHeight;
+            if (targetAspect <= 1.05f)
             {
-                scale.x = targetAspect / sourceAspect;
-                offset.x = (1f - scale.x) * 0.5f;
+                // 方形目标：取上半部分当半身像；竖向太长的图按宽度取正方形。
+                cropWidth = Mathf.Min(sourceWidth, sourceHeight) * 0.5f;
+                cropHeight = Mathf.Min(sourceWidth, sourceHeight) * 0.5f;
+                cropWidth = Mathf.Min(cropWidth, sourceWidth);
+                cropHeight = Mathf.Min(cropHeight, sourceHeight);
+                cropX = (sourceWidth - cropWidth) * 0.5f;
+                cropY = Mathf.Clamp(sourceHeight * 0.02f, 0f, Mathf.Max(0f, sourceHeight - cropHeight));
             }
-            else if (sourceAspect < targetAspect)
+            else if (sourceAspect > targetAspect)
             {
-                scale.y = sourceAspect / targetAspect;
-                offset.y = (1f - scale.y) * 0.5f;
+                // 源比目标还宽：水平居中裁。
+                cropHeight = sourceHeight;
+                cropWidth = sourceHeight * targetAspect;
+                cropX = (sourceWidth - cropWidth) * 0.5f;
+                cropY = 0f;
             }
+            else
+            {
+                // 宽条目标 + 方形/竖向源：取上三分之一处的横条（头像/胸像都在上半部）。
+                cropWidth = sourceWidth;
+                cropHeight = sourceWidth / targetAspect;
+                cropX = 0f;
+                cropY = Mathf.Clamp(sourceHeight / 3f - cropHeight * 0.5f, 0f, Mathf.Max(0f, sourceHeight - cropHeight));
+            }
+
+            Vector2 scale = new Vector2(cropWidth / sourceWidth, cropHeight / sourceHeight);
+            // Graphics.Blit 的偏移是 UV（原点在左下），所以 y 要从上边换算过来。
+            Vector2 offset = new Vector2(cropX / sourceWidth, 1f - (cropY + cropHeight) / sourceHeight);
 
             RenderTexture renderTexture = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32);
             RenderTexture previous = RenderTexture.active;
