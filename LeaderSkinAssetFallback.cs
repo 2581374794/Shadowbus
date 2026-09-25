@@ -145,6 +145,8 @@ namespace Shadowbus
             public ResourcesManager.AssetLoadPathType Requested;
             public ResourcesManager.AssetLoadPathType Used;
             public int UsedSkinId;
+            /// <summary>替代素材的对象路径（从已加载的包里取它）。</summary>
+            public string AltObjectPath;
         }
 
         private static readonly HashSet<string> ExistingBundles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -205,15 +207,26 @@ namespace Shadowbus
                         continue;
                     }
 
-                    __result = isfetch ? objectPath : bundle;
-                    // 记下这次替换：取到对象后可能还要"贴官方图"或"按官方尺寸重排构图"。
-                    Substitutions[objectPath] = new Substitution
+                    if (isfetch)
                     {
-                        SkinId = skinId,
-                        Requested = type,
-                        Used = candidate.Value,
-                        UsedSkinId = candidate.Key,
-                    };
+                        // 对象路径**保持原样**（本地取不到的那个）：LoadObject 会返回 null，
+                        // 由后置处理换成替代素材。注意不能用替代素材自己的路径当键——那样游戏
+                        // 在别处正常加载同一张替代素材（例如战斗立绘 class_<id>_base）时也会被
+                        // 这张表劫持，出现"对战里显示卡组立绘"这种串图。
+                        Substitutions[__result] = new Substitution
+                        {
+                            SkinId = skinId,
+                            Requested = type,
+                            Used = candidate.Value,
+                            UsedSkinId = candidate.Key,
+                            AltObjectPath = objectPath,
+                        };
+                    }
+                    else
+                    {
+                        // 包名换成替代素材所在的包，调用方预加载的就是它，后面才取得到。
+                        __result = bundle;
+                    }
 
                     _substitutionCount++;
                     LogOnce(skinId, type, candidate.Key, candidate.Value, isfetch);
@@ -334,10 +347,26 @@ namespace Shadowbus
                     return official;
                 }
 
-                // 2) 立绘类槽位比例一致，原样用即可。
-                if (!(result is Texture source) || !TileSize.TryGetValue(substitution.Requested, out Vector2Int size))
+                // 2) 取替代素材：同类型（同角色的官方素材）比例天然正确，直接用；
+                //    换了类型才需要按官方尺寸等比例居中裁切。
+                Texture source = result as Texture;
+                if (source == null && !string.IsNullOrEmpty(substitution.AltObjectPath) &&
+                    Toolbox.AssetManager != null)
+                {
+                    // 替代素材来自另一个素材包，路径是我们的（原素材包本地不存在，取不到）。
+                    source = Toolbox.AssetManager.LoadObject(
+                        substitution.AltObjectPath, typeof(Texture), false) as Texture;
+                }
+
+                if (source == null)
                 {
                     return result;
+                }
+
+                if (substitution.Used == substitution.Requested ||
+                    !TileSize.TryGetValue(substitution.Requested, out Vector2Int size))
+                {
+                    return source;
                 }
 
                 if (ConvertedTextures.TryGetValue(key, out Texture cached) && cached != null)
@@ -348,7 +377,7 @@ namespace Shadowbus
                 Texture converted = FitToSize(source, size.x, size.y);
                 if (converted == null)
                 {
-                    return result;
+                    return source;
                 }
 
                 converted.name = $"{source.name}_fit{size.x}x{size.y}";
