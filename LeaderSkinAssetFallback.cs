@@ -380,10 +380,17 @@ namespace Shadowbus
                 return cached != null ? cached : null;
             }
 
-            string path = Path.Combine(Path.Combine(PathHelper.ModPath, OverrideDirectoryName), name + ".png");
+            string directory = Path.Combine(PathHelper.ModPath, OverrideDirectoryName);
+            // 先找按皮肤号分的子文件夹（Mods/LeaderSkins/4102/class_skin_4102.png），
+            // 再兼容直接平铺在 LeaderSkins 根下的旧放法。
+            string path = Path.Combine(Path.Combine(directory, skinId.ToString()), name + ".png");
             if (!File.Exists(path))
             {
-                return null;
+                path = Path.Combine(directory, name + ".png");
+                if (!File.Exists(path))
+                {
+                    return null;
+                }
             }
 
             try
@@ -398,7 +405,7 @@ namespace Shadowbus
 
                 texture.name = name;
                 StoreConverted(key, texture);
-                LogOverrideOnce(name);
+                LogOverrideOnce(path, name);
                 return texture;
             }
             catch (Exception exception)
@@ -408,11 +415,11 @@ namespace Shadowbus
             }
         }
 
-        private static void LogOverrideOnce(string name)
+        private static void LogOverrideOnce(string path, string name)
         {
             if (Logged.Add("png|" + name))
             {
-                Plugin.Logger.LogInfo($"[SkinFallback] Using the official artwork from Mods/{OverrideDirectoryName}/{name}.png.");
+                Plugin.Logger.LogInfo($"[SkinFallback] Using the official artwork from {path}.");
             }
         }
 

@@ -4,9 +4,25 @@
 （`LeaderSkinAssetFallback`）在本地找不到某个素材包时，会先看这个目录里有没有对应的 PNG：
 有就直接用它；没有才退回到"同一角色的其它皮肤 / 同一皮肤的另一类素材（按官方尺寸裁切）"。
 
-## 文件命名
+## 目录结构
 
-文件名 = **官方素材名**（不含扩展名）+ `.png`：
+按**皮肤号**建子文件夹，一个皮肤一个文件夹：
+
+```
+Mods/LeaderSkins/
+  4102/                         <- 皮肤号（韦斯）
+    class_skin_4102.png
+    class_select_thumbnail_4102.png
+    btn_deck_4102.png
+    class_4102_base_win.png
+    class_4102_base_lose.png
+    class_4102_profile.png
+```
+
+文件名 = **官方素材名**（不含扩展名）+ `.png`。插件两种放法都认：先找 `<皮肤号>/<素材名>.png`，
+找不到再看 `LeaderSkins/<素材名>.png`（兼容直接平铺的旧放法）。
+
+## 各文件名对应界面上的哪里
 
 | 文件名 | 用在界面上的位置 | 官方尺寸 |
 | --- | --- | --- |
@@ -17,15 +33,14 @@
 | `class_<皮肤号>_base_win.png` / `_base_lose.png` | 战斗胜利/失败立绘 | 2048×2048 |
 | `class_<皮肤号>_profile.png` | 资料页立绘 | 1024×1024 |
 
-皮肤号写最少两位（`4102`、`1003` 这样原样写）。
+皮肤号原样写（`4102`、`1003` 这样）。
 
 ## 现有什么
 
-- `class_skin_4102` / `class_select_thumbnail_4102` / `btn_deck_4102` /
-  `class_4102_base_win` / `class_4102_base_lose` / `class_4102_profile`
-  —— 韦斯（chara 4102，职业 2）。国际服清单 `Resources/manifest/ui_assetmanifest`
+- `4102/` —— 韦斯（chara 4102，职业 2）。国际服清单 `Resources/manifest/ui_assetmanifest`
   里只登记了 `ui_class_4102`（战斗 spine）和 `ui_class_4102_base`（立绘），缩略图/按钮图/
-  卡组立绘/资料图/胜负立绘全都没有；而同一批的 4101、4103、4104、4105、4107、4108 都有。
+  卡组立绘/资料图/胜负立绘全都没有；而同一批的 4101、4103、4104、4105、4107、4108 都有，
+  官方持久化目录 `AppData\LocalLow\Cygames\Shadowverse` 里也一样没有。
   这批图取自国服客户端（国服发过这些包），提取成 PNG 后按国际服原生尺寸放好。
   国服的 bundle 是 Unity 2022 构建的，本机运行时是 2020.3，bundle 不能直接用，**贴图可以**。
 
