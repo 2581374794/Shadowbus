@@ -280,9 +280,26 @@ namespace Shadowbus
                     {
                         try
                         {
+                            object bundleObject = manager.GetAssetBundleObject(probe);
+                            int objects = -1;
+                            try
+                            {
+                                if (bundleObject != null)
+                                {
+                                    objects = manager.GetAssetBundleObject(probe).objectArray.Count;
+                                }
+                            }
+                            catch
+                            {
+                            }
+
+                            string skin = probe.Replace("ui_class_", string.Empty).Replace(".unity3d", string.Empty);
+                            string prefabPath = Toolbox.ResourcesManager.GetAssetTypePath(
+                                skin, ResourcesManager.AssetLoadPathType.ClassCharaSpine, true);
+                            object prefab = manager.LoadObject(prefabPath, typeof(UnityEngine.GameObject), true);
                             Plugin.Logger.LogWarning(
-                                $"[ImportDiag] probe load '{probe}': loaded=" +
-                                $"{manager.GetAssetBundleObject(probe) != null}");
+                                $"[ImportDiag] probe load '{probe}': bundle={bundleObject != null} objects={objects} " +
+                                $"prefabPath='{prefabPath}' prefab={prefab != null}");
                         }
                         catch (Exception exception)
                         {
@@ -607,8 +624,11 @@ namespace Shadowbus
             return count;
         }
 
-        private static readonly System.Reflection.FieldInfo EmoteWordDictionaryField =
-            AccessTools.Field(typeof(Master), "EmoteWordDic");
+        // 注意：EmoteWordDic / _emotionDic 都是"自动属性"（字段名带 <...>k__BackingField），
+        // 用 AccessTools.Field 查不到 —— 之前那两行 Could not find field 就是这里来的。
+        private static readonly System.Reflection.PropertyInfo EmoteWordDictionaryProperty =
+            AccessTools.Property(typeof(Master), "EmoteWordDic")
+            ?? AccessTools.DeclaredProperty(typeof(Master), "EmoteWordDic");
 
         /// <summary>
         /// 把国服的表情表补进 <c>_emotionDic</c>。
@@ -718,8 +738,9 @@ namespace Shadowbus
                     return;
                 }
 
-                if (!(EmoteWordDictionaryField?.GetValue(__instance) is Dictionary<string, string> words))
+                if (!(EmoteWordDictionaryProperty?.GetValue(__instance, null) is IDictionary<string, string> words))
                 {
+                    Plugin.Logger.LogWarning("[Import] Could not reach the emote word table; the lines stay as ids.");
                     return;
                 }
 
@@ -785,14 +806,16 @@ namespace Shadowbus
             return false;
         }
 
-        private static readonly System.Reflection.FieldInfo EmotionDictionaryField =
-            AccessTools.Field(typeof(Master), "_emotionDic");
+        private static readonly System.Reflection.PropertyInfo EmotionDictionaryProperty =
+            AccessTools.Property(typeof(Master), "_emotionDic")
+            ?? AccessTools.DeclaredProperty(typeof(Master), "_emotionDic");
 
         private static bool HasEmotionData(int skinId)
         {
             try
             {
-                if (EmotionDictionaryField?.GetValue(Data.Master) is System.Collections.IDictionary dictionary)
+                object table = EmotionDictionaryProperty?.GetValue(Data.Master, null) ?? Data.Master?._emotionDic;
+                if (table is System.Collections.IDictionary dictionary)
                 {
                     return dictionary.Contains(skinId.ToString(CultureInfo.InvariantCulture));
                 }
