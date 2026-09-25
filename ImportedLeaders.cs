@@ -282,6 +282,8 @@ namespace Shadowbus
             try
             {
                 EnsureLoaded();
+                // 角色表加载时资源管理器肯定起来了，哈希登记在这里再试一次（幂等）。
+                RegisterLocalHashes();
                 if (Pending.Count == 0 || __instance?.ClassCharacterList == null)
                 {
                     return;
