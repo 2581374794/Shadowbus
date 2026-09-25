@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using Cute;
 using HarmonyLib;
 using Newtonsoft.Json.Linq;
 using Wizard;
@@ -35,6 +36,7 @@ namespace Shadowbus
 
         private static bool _loaded;
         private static bool _warned;
+        private static bool _hashesRegistered;
 
         /// <summary>主战者号换成皮肤号（不是我们导入的就原样返回）。</summary>
         internal static int ResolveSkinId(int id)
@@ -111,6 +113,8 @@ namespace Shadowbus
                 Plugin.Logger.LogInfo(
                     $"[Import] {leadersCount} imported leader(s) / {rowsCount} master row(s) prepared " +
                     $"from {path}.");
+
+                RegisterLocalHashes();
             }
             catch (Exception exception)
             {
@@ -121,6 +125,151 @@ namespace Shadowbus
         private static int ParseInt(string[] columns, int index, int fallback)
         {
             return index < columns.Length && int.TryParse(columns[index], out int value) ? value : fallback;
+        }
+
+        /// <summary>
+        /// 我们塞进资源目录的文件（战斗 spine、表情表、语音）游戏并不知道，
+        /// 用游戏自己的接口把本地哈希登记进去（<c>SaveLocalDatahash</c>），免得它当成"没下载"。
+        /// 资源管理器还没起来时先跳过，下次再试。
+        /// </summary>
+        private static void RegisterLocalHashes()
+        {
+            if (_hashesRegistered)
+            {
+                return;
+            }
+
+            try
+            {
+                Cute.AssetManager manager = Toolbox.AssetManager;
+                string root = ResourceRootPatches.ResourceRoot;
+                if (manager == null || string.IsNullOrEmpty(root))
+                {
+                    return;
+                }
+
+                int registered = 0;
+                foreach (string[] columns in Pending)
+                {
+                    int charaId = ParseInt(columns, 0, 0);
+                    int skinId = ParseInt(columns, 7, 0);
+                    if (charaId <= 0 || skinId <= 0)
+                    {
+                        continue;
+                    }
+
+                    registered += Register(manager, root, Path.Combine("a", $"ui_class_{skinId}.unity3d"));
+                    registered += Register(manager, root,
+                        Path.Combine("a", $"master_emote_chara_{charaId}.unity3d"));
+                    registered += RegisterVoiceFiles(manager, root, charaId);
+                }
+
+                _hashesRegistered = true;
+                if (registered > 0)
+                {
+                    Plugin.Logger.LogInfo($"[Import] Registered {registered} local asset hash(es).");
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogDebug($"[Import] Could not register local asset hashes: {exception.Message}");
+            }
+        }
+
+        private static int Register(Cute.AssetManager manager, string root, string relative)
+        {
+            try
+            {
+                string path = Path.Combine(root, relative);
+                if (!File.Exists(path))
+                {
+                    return 0;
+                }
+
+                string key = relative.Replace('\\', '/');
+                if (!string.IsNullOrEmpty(manager.GetLocalDatahash(key)))
+                {
+                    return 0;
+                }
+
+                using (var md5 = System.Security.Cryptography.MD5.Create())
+                using (FileStream stream = File.OpenRead(path))
+                {
+                    string hash = string.Concat(md5.ComputeHash(stream).Select(b => b.ToString("x2")));
+                    manager.SaveLocalDatahash(key, hash);
+                    return 1;
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogDebug($"[Import] Could not register '{relative}': {exception.Message}");
+                return 0;
+            }
+        }
+
+        private static int RegisterVoiceFiles(Cute.AssetManager manager, string root, int charaId)
+        {
+            int count = 0;
+            try
+            {
+                string directory = Path.Combine(root, "v");
+                if (!Directory.Exists(directory))
+                {
+                    return 0;
+                }
+
+                foreach (string file in Directory.GetFiles(directory, $"vo_{charaId}_*.acb"))
+                {
+                    count += Register(manager, root, Path.Combine("v", Path.GetFileName(file)));
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogDebug($"[Import] Could not register the voice files of {charaId}: {exception.Message}");
+            }
+
+            return count;
+        }
+
+        /// <summary>
+        /// 没有表情表的主战者（例如我们只搬了角色没搬语音的皮肤）播语音时，
+        /// <c>DataMgr.GetEmotionDataBySkinId</c> 会 KeyNotFoundException，而它是在
+        /// "换皮肤成功"的回调里调的 —— 一抛就把整个界面卡死。这里让语音直接跳过：
+        /// <c>Voice.Play</c> 拿到空 cue 名本来就会 return。
+        /// </summary>
+        [HarmonyPatch(typeof(Voice), nameof(Voice.GetEmotionCueName),
+            new[] { typeof(ClassCharaPrm.EmotionType), typeof(int), typeof(bool) })]
+        [HarmonyPrefix]
+        private static bool Voice_GetEmotionCueName_Prefix(int skinId, ref string __result)
+        {
+            if (HasEmotionData(skinId))
+            {
+                return true;
+            }
+
+            __result = string.Empty;
+            return false;
+        }
+
+        private static readonly System.Reflection.FieldInfo EmotionDictionaryField =
+            AccessTools.Field(typeof(Master), "_emotionDic");
+
+        private static bool HasEmotionData(int skinId)
+        {
+            try
+            {
+                if (EmotionDictionaryField?.GetValue(Data.Master) is System.Collections.IDictionary dictionary)
+                {
+                    return dictionary.Contains(skinId.ToString(CultureInfo.InvariantCulture));
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogDebug($"[Import] Could not inspect the emotion table: {exception.Message}");
+            }
+
+            // 查不到就当作"有数据"，不干扰正常流程。
+            return true;
         }
 
         private static readonly List<string[]> Pending = new List<string[]>();
