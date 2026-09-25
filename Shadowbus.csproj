@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <!-- 本机游戏目录：可选。不想设环境变量也不想改这个文件，就在同目录放一个
        Shadowverse.local.props（已 gitignore），内容是
@@ -69,6 +69,11 @@
     <!-- CRIWARE 运行时：ResourceRootPatches 用它把额外资源目录里的 ACB 注册进 Atom。 -->
     <Reference Include="CriMw.CriWare.Runtime">
       <HintPath>$(ShadowverseManagedDir)\CriMw.CriWare.Runtime.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <!-- Spine 运行时：SpineLoadDiagnostics 用它挂钩主战者模型的解析/渲染。 -->
+    <Reference Include="spine-unity">
+      <HintPath>$(ShadowverseManagedDir)\spine-unity.dll</HintPath>
       <Private>False</Private>
     </Reference>
   </ItemGroup>
