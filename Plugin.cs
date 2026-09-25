@@ -9,7 +9,7 @@ using UnityEngine;
 
 namespace Shadowbus;
 
-[BepInPlugin("08c8e386-a794-442f-a98c-aec65a183898", "GeorgesZebit.Shadowbus", "2.5.8")]
+[BepInPlugin("08c8e386-a794-442f-a98c-aec65a183898", "GeorgesZebit.Shadowbus", "2.5.9")]
 public class Plugin : BaseUnityPlugin
 {
     // 日志：包一层带锁的转发（见 LockedLogSource），避免多线程写日志时整行被插花。
@@ -399,6 +399,8 @@ public class Plugin : BaseUnityPlugin
             // 失焦诊断：窗口一失焦游戏就会暂停对局并屏蔽战斗输入（网络与回合计时器照跑），
             // 这条日志让玩家反馈的"联机卡死"一眼就能定性。
             Harmony.CreateAndPatchAll(typeof(FocusDiagnostics));
+            // 主战者头像诊断（临时）：把卡组头像的皮肤号 / 包名 / 文件是否存在 / 贴图是否取到写进日志。
+            Harmony.CreateAndPatchAll(typeof(LeaderPortraitDiagnostics));
             Harmony.CreateAndPatchAll(typeof(ProfileOfflineData));
             Harmony.CreateAndPatchAll(typeof(ResourceRootPatches));
             Harmony.CreateAndPatchAll(typeof(DeckFormatUI));

@@ -282,24 +282,30 @@ namespace Shadowbus
             {
                 ResourcesManager resourcesManager = Toolbox.ResourcesManager;
 
-                // 位置：法师（class 3）与龙族（class 4）两个职业按钮的中点，往上一个按钮高度。
-                // 「斗蛐蛐」在它右边一格。
+                // 位置：法师（class 3）与龙族（class 4）两个职业按钮的中点，往上一个按钮高度；
+                // 「自定义对手」的**左侧**再和法师（伊莎贝尔）按钮的左侧对齐。
+                // 「斗蛐蛐」排在它右边一格。
                 Vector3 customGridPosition = ResolveCustomPracticeGridPosition(__instance);
                 float cellWidth = __instance._classButtonGrid != null ? __instance._classButtonGrid.cellWidth : 105f;
-                Vector3 dualAiGridPosition = customGridPosition + new Vector3(cellWidth, 0f, 0f);
 
                 // 样式：用设置页那个蓝色按钮（OptionSettingPrefab.m_itemButton），
                 // 而不是原来克隆的职业选择方块。拿不到模板时退回旧的克隆方式。
-                if (TryCreateBlueCustomPracticeButton(
-                        __instance,
-                        customButtonParent,
-                        customGridPosition,
-                        CustomPracticeButtonName,
-                        CustomPracticeButtonLabelSimplified,
-                        CustomPracticeButtonLabelTraditional,
-                        CustomPracticeButtonLabelEnglish,
-                        dualAi: false))
+                GameObject customButtonObject = TryCreateBlueCustomPracticeButton(
+                    __instance,
+                    customButtonParent,
+                    customGridPosition,
+                    CustomPracticeButtonName,
+                    CustomPracticeButtonLabelSimplified,
+                    CustomPracticeButtonLabelTraditional,
+                    CustomPracticeButtonLabelEnglish,
+                    dualAi: false,
+                    alignLeftWithClassId: 3);
+                if (customButtonObject != null)
                 {
+                    // 「斗蛐蛐」的位置从**实际**落点算起：上面那个按钮的左侧被对齐过，
+                    // 从它的局部坐标加一格才不会和它重叠。
+                    Vector3 dualAiGridPosition = customButtonObject.transform.localPosition +
+                                                 new Vector3(cellWidth, 0f, 0f);
                     TryCreateBlueCustomPracticeButton(
                         __instance,
                         customButtonParent,
@@ -308,7 +314,8 @@ namespace Shadowbus
                         DualAiButtonLabelSimplified,
                         DualAiButtonLabelTraditional,
                         DualAiButtonLabelEnglish,
-                        dualAi: true);
+                        dualAi: true,
+                        alignLeftWithClassId: 0);
 
                     // 顺手把「官方练习 AI 牌组」的加载放到后台做掉：
                     // 以前是点按钮时才加载，第一次点必然卡一下（之后就快了）。
@@ -357,6 +364,9 @@ namespace Shadowbus
                     CustomPracticeButtonLabelSimplified,
                     CustomPracticeButtonLabelTraditional,
                     CustomPracticeButtonLabelEnglish);
+
+                // 旧样式也按同样的规则对齐左侧。
+                AlignLeftEdgeWithClassButton(__instance, buttonObject, button._texture, 3);
                 BeginPracticeWarmup(__instance);
 
                 Plugin.Logger.LogInfo(
@@ -366,6 +376,52 @@ namespace Shadowbus
             catch (Exception exception)
             {
                 Plugin.Logger.LogError($"[AIManager] Failed to add the custom practice button.\n{exception}");
+            }
+        }
+
+        /// <summary>
+        /// 把入口按钮的**左边界**对齐到某个职业按钮（默认是法师 / 伊莎贝尔，class 3）的左边界。
+        ///
+        /// 用 NGUI 的 <c>worldCorners[0]</c>（左下角）来对齐，而不是拿网格的 cellWidth 估：
+        /// 职业按钮的实际宽度由 prefab 决定，和网格格宽并不总是相等，估算会差几个像素。
+        /// </summary>
+        private static void AlignLeftEdgeWithClassButton(
+            ClassSelectionPage page,
+            GameObject buttonObject,
+            UIWidget buttonWidget,
+            int referenceClassId)
+        {
+            if (page == null || buttonObject == null || buttonWidget == null)
+            {
+                return;
+            }
+
+            try
+            {
+                List<ClassSelectionButton> buttons = page._classSelectionButtonList?
+                    .Where(classButton => classButton != null)
+                    .ToList() ?? new List<ClassSelectionButton>();
+                ClassSelectionButton reference = FindClassButton(buttons, referenceClassId);
+                UIWidget referenceWidget = GetClassButtonWidget(reference);
+                if (referenceWidget == null)
+                {
+                    return;
+                }
+
+                float deltaX = referenceWidget.worldCorners[0].x - buttonWidget.worldCorners[0].x;
+                if (Mathf.Abs(deltaX) < 0.01f)
+                {
+                    return;
+                }
+
+                buttonObject.transform.position += new Vector3(deltaX, 0f, 0f);
+                Plugin.Logger.LogInfo(
+                    $"[AIManager] Aligned the button left edge with the class {referenceClassId} button " +
+                    $"(shifted {deltaX:F1} px).");
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[AIManager] Could not align the button left edge: {exception.Message}");
             }
         }
 
@@ -405,10 +461,30 @@ namespace Shadowbus
                 : Vector3.zero;
         }
 
+        /// <summary>职业按钮用来显示头像的那个 <see cref="UITexture"/>（字段是私有的，反射拿）。</summary>
+        private static readonly System.Reflection.FieldInfo ClassSelectionButtonTextureField =
+            AccessTools.Field(typeof(ClassSelectionButton), "_texture");
+
+        private static UIWidget GetClassButtonWidget(ClassSelectionButton button)
+        {
+            if (button == null || ClassSelectionButtonTextureField == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                return ClassSelectionButtonTextureField.GetValue(button) as UIWidget;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
         private static ClassSelectionButton FindClassButton(
             List<ClassSelectionButton> buttons,
-            int classId)
-        {
+            int classId)        {
             return buttons.FirstOrDefault(classButton =>
                 classButton.ClassCharacterMasterData != null &&
                 classButton.ClassCharacterMasterData.class_id == classId);
@@ -419,7 +495,7 @@ namespace Shadowbus
         /// `CustomPracticeSetupWindow.CreateNativeButton` 完全一致（那套按钮的颜色是对的）。
         /// 模板拿不到时返回 false，由调用方走旧的克隆方式。
         /// </summary>
-        private static bool TryCreateBlueCustomPracticeButton(
+        private static GameObject TryCreateBlueCustomPracticeButton(
             ClassSelectionPage page,
             Transform parent,
             Vector3 gridPosition,
@@ -427,17 +503,18 @@ namespace Shadowbus
             string labelSimplified,
             string labelTraditional,
             string labelEnglish,
-            bool dualAi)
+            bool dualAi,
+            int alignLeftWithClassId)
         {
             SettingBase settingTemplate = UIManager.GetInstance()?.OptionSettingPrefab;
             if (settingTemplate == null || settingTemplate.m_itemButton == null)
             {
-                return false;
+                return null;
             }
 
             if (parent.Find(buttonName) != null)
             {
-                return true;
+                return parent.Find(buttonName).gameObject;
             }
 
             GameObject buttonObject = NGUITools.AddChild(parent.gameObject, settingTemplate.m_itemButton);
@@ -456,7 +533,7 @@ namespace Shadowbus
                     $"sprite={(item != null && item._sprite != null)}, label={(item != null && item._label != null)}); " +
                     "falling back to the plain cloned class button.");
                 UnityEngine.Object.Destroy(buttonObject);
-                return false;
+                return null;
             }
 
             item.SetActive_SeparatorLine(false);
@@ -526,11 +603,18 @@ namespace Shadowbus
                 labelTraditional,
                 labelEnglish);
 
+            // 左侧对齐（只对「自定义对手」用）：对完再算「斗蛐蛐」的位置。
+            if (alignLeftWithClassId > 0)
+            {
+                AlignLeftEdgeWithClassButton(page, buttonObject, item._sprite, alignLeftWithClassId);
+            }
+
             Plugin.Logger.LogInfo(
                 $"[AIManager] Added the practice button '{buttonName}' (label '{label}', aiVsAi={dualAi}) " +
                 $"at grid position {gridPosition} " +
-                $"(size {width}x{height}, font {fontSize}, sprite '{BlueButtonNormalSprite}').");
-            return true;
+                $"(size {width}x{height}, font {fontSize}, sprite '{BlueButtonNormalSprite}', " +
+                $"localPosition={buttonObject.transform.localPosition}).");
+            return buttonObject;
         }
 
         private static void ShowDeckSelection(ClassSelectionPage page, bool dualAi)
