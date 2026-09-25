@@ -399,6 +399,9 @@ public class Plugin : BaseUnityPlugin
             // 失焦诊断：窗口一失焦游戏就会暂停对局并屏蔽战斗输入（网络与回合计时器照跑），
             // 这条日志让玩家反馈的"联机卡死"一眼就能定性。
             Harmony.CreateAndPatchAll(typeof(FocusDiagnostics));
+            // 主战者皮肤素材兜底：本地资源库缺某个皮肤的 UI 素材包时，
+            // 用同一皮肤其它存在的素材顶替（皮肤缩略图/选择按钮图/卡组立绘三处常见缺口）。
+            Harmony.CreateAndPatchAll(typeof(LeaderSkinAssetFallback));
             Harmony.CreateAndPatchAll(typeof(ProfileOfflineData));
             Harmony.CreateAndPatchAll(typeof(ResourceRootPatches));
             Harmony.CreateAndPatchAll(typeof(DeckFormatUI));
