@@ -284,9 +284,10 @@ namespace Shadowbus
 
                 // 位置：法师（class 3）与龙族（class 4）两个职业按钮的中点，往上一个按钮高度；
                 // 「自定义对手」的**左侧**再和法师（伊莎贝尔）按钮的左侧对齐。
-                // 「斗蛐蛐」排在它右边一格。
+                // 「斗蛐蛐」**保持第一版的位置**：按未对齐前的坐标往右一格（不要再跟着动）。
                 Vector3 customGridPosition = ResolveCustomPracticeGridPosition(__instance);
                 float cellWidth = __instance._classButtonGrid != null ? __instance._classButtonGrid.cellWidth : 105f;
+                Vector3 dualAiGridPosition = customGridPosition + new Vector3(cellWidth, 0f, 0f);
 
                 // 样式：用设置页那个蓝色按钮（OptionSettingPrefab.m_itemButton），
                 // 而不是原来克隆的职业选择方块。拿不到模板时退回旧的克隆方式。
@@ -302,10 +303,6 @@ namespace Shadowbus
                     alignLeftWithClassId: 3);
                 if (customButtonObject != null)
                 {
-                    // 「斗蛐蛐」的位置从**实际**落点算起：上面那个按钮的左侧被对齐过，
-                    // 从它的局部坐标加一格才不会和它重叠。
-                    Vector3 dualAiGridPosition = customButtonObject.transform.localPosition +
-                                                 new Vector3(cellWidth, 0f, 0f);
                     TryCreateBlueCustomPracticeButton(
                         __instance,
                         customButtonParent,

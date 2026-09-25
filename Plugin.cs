@@ -9,7 +9,7 @@ using UnityEngine;
 
 namespace Shadowbus;
 
-[BepInPlugin("08c8e386-a794-442f-a98c-aec65a183898", "GeorgesZebit.Shadowbus", "2.5.9")]
+[BepInPlugin("08c8e386-a794-442f-a98c-aec65a183898", "GeorgesZebit.Shadowbus", "2.5.10")]
 public class Plugin : BaseUnityPlugin
 {
     // 日志：包一层带锁的转发（见 LockedLogSource），避免多线程写日志时整行被插花。
