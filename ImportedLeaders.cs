@@ -41,6 +41,7 @@ namespace Shadowbus
         private static bool _warned;
         private static bool _hashesRegistered;
         private static bool _assetsRegistered;
+        private static bool _diagnosed;
 
         /// <summary>主战者号换成皮肤号（不是我们导入的就原样返回）。</summary>
         internal static int ResolveSkinId(int id)
@@ -199,10 +200,76 @@ namespace Shadowbus
                 {
                     Plugin.Logger.LogInfo($"[Import] Registered {handles} local asset(s) with the asset manager.");
                 }
+
+                DiagnoseLocalAssets(manager);
             }
             catch (Exception exception)
             {
                 Plugin.Logger.LogWarning($"[Import] Could not register the local assets: {exception.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 诊断：把移植文件在游戏眼里的状态打出来 —— 认不认、期望的本地路径是哪、包有没有被加载、
+        /// 包里对象表有没有内容。用来区分"路径不对"和"包本身装不上"。
+        /// </summary>
+        private static void DiagnoseLocalAssets(Cute.AssetManager manager)
+        {
+            if (_diagnosed)
+            {
+                return;
+            }
+
+            try
+            {
+                var names = new List<string>();
+                foreach (string[] columns in Pending)
+                {
+                    int charaId = ParseInt(columns, 0, 0);
+                    int skinId = ParseInt(columns, 7, 0);
+                    if (charaId <= 0 || skinId <= 0)
+                    {
+                        continue;
+                    }
+
+                    names.Add(Toolbox.ResourcesManager.GetAssetTypePath(
+                        skinId.ToString(CultureInfo.InvariantCulture),
+                        ResourcesManager.AssetLoadPathType.ClassCharaSpine, false));
+                    names.Add(Toolbox.ResourcesManager.GetAssetTypePath(
+                        $"emote_chara_{charaId}", ResourcesManager.AssetLoadPathType.CharaMaster, false));
+                    names.Add($"v/vo_{charaId}_000_001.acb");
+                }
+
+                if (names.Count <= 9)
+                {
+                    foreach (string name in names)
+                    {
+                        AssetHandle handle = manager.GetAssetHandle(name, false);
+                        object bundle = manager.GetAssetBundleObject(name);
+                        string expected = null;
+                        try
+                        {
+                            expected = handle?.BuildLocalCachePath();
+                        }
+                        catch (Exception exception)
+                        {
+                            expected = "<" + exception.Message + ">";
+                        }
+
+                        Plugin.Logger.LogInfo(
+                            $"[ImportDiag] '{name}': handle={handle != null} enabled={manager.IsEnableAssetName(name)} " +
+                            $"loaded={bundle != null} expectedPath='{expected}'");
+                    }
+
+                    Plugin.Logger.LogInfo(
+                        $"[ImportDiag] isCryptAssetFileName={Cute.AssetManager.isCryptAssetFileName}, " +
+                        $"emotionKeys={Data.Master?._emotionDic?.Count ?? -1}");
+                    _diagnosed = true;
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogWarning($"[ImportDiag] failed: {exception.Message}");
             }
         }
 
