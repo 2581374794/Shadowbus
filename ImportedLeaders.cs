@@ -179,8 +179,10 @@ namespace Shadowbus
                     registered += RegisterLocalAsset(manager, root, Toolbox.ResourcesManager.GetAssetTypePath(
                         skinId.ToString(CultureInfo.InvariantCulture),
                         ResourcesManager.AssetLoadPathType.ClassCharaSpine, false));
-                    registered += RegisterLocalAsset(manager, root, Toolbox.ResourcesManager.GetAssetTypePath(
-                        $"emote_chara_{charaId}", ResourcesManager.AssetLoadPathType.CharaMaster, false));
+
+                    // 表情表故意**不**登记 master_emote_chara_*.unity3d：登记了游戏就会自己去加载
+                    // 这个包并把表建出来，于是 StartLoadEmoteData 的后缀里我们的 CSV 表就被
+                    // "已经有了"挡掉，语音反而没了。表一律由我们自己的 CSV 建，结果才是确定的。
 
                     string voiceDirectory = Path.Combine(root, "v");
                     if (Directory.Exists(voiceDirectory))
@@ -224,33 +226,20 @@ namespace Shadowbus
 
             try
             {
-                var names = new List<string>();
+                var seen = new List<int>();
                 foreach (string[] columns in Pending)
                 {
-                    int charaId = ParseInt(columns, 0, 0);
                     int skinId = ParseInt(columns, 7, 0);
-                    if (charaId <= 0 || skinId <= 0)
+                    if (skinId <= 0 || seen.Contains(skinId))
                     {
                         continue;
                     }
 
-                    names.Add(Toolbox.ResourcesManager.GetAssetTypePath(
+                    seen.Add(skinId);
+                    string spine = Toolbox.ResourcesManager.GetAssetTypePath(
                         skinId.ToString(CultureInfo.InvariantCulture),
-                        ResourcesManager.AssetLoadPathType.ClassCharaSpine, false));
-                    names.Add(Toolbox.ResourcesManager.GetAssetTypePath(
-                        $"emote_chara_{charaId}", ResourcesManager.AssetLoadPathType.CharaMaster, false));
-                    names.Add($"v/vo_{charaId}_000_001.acb");
-                }
-
-                if (names.Count <= 0)
-                {
-                    return;
-                }
-
-                foreach (string name in names)
-                {
-                    AssetHandle handle = manager.GetAssetHandle(name, false);
-                    object bundle = manager.GetAssetBundleObject(name);
+                        ResourcesManager.AssetLoadPathType.ClassCharaSpine, false);
+                    AssetHandle handle = manager.GetAssetHandle(spine, false);
                     string expected = null;
                     try
                     {
@@ -261,56 +250,59 @@ namespace Shadowbus
                         expected = "<" + exception.Message + ">";
                     }
 
+                    string cue = DescribeVoiceCue(skinId);
                     Plugin.Logger.LogInfo(
-                        $"[ImportDiag] '{name}': handle={handle != null} enabled={manager.IsEnableAssetName(name)} " +
-                        $"loaded={bundle != null} expectedPath='{expected}'");
+                        $"[ImportDiag] skin {skinId}: spineHandle={handle != null} " +
+                        $"enabled={manager.IsEnableAssetName(spine)} loaded={manager.GetAssetBundleObject(spine) != null} " +
+                        $"path='{expected}' {cue}");
                 }
 
-                Plugin.Logger.LogInfo(
-                    $"[ImportDiag] isCryptAssetFileName={Cute.AssetManager.isCryptAssetFileName}, " +
-                    $"emotionKeys={Data.Master?._emotionDic?.Count ?? -1}");
                 _diagnosed = true;
-
-                // 主动试加载第一个 spine 包：Unity 到底能不能读我们做出来的包。
-                string probe = names.Count > 0 ? names[0] : null;
-                if (!string.IsNullOrEmpty(probe))
-                {
-                    var list = new List<string> { probe };
-                    Toolbox.ResourcesManager.StartCoroutine_LoadAssetGroupAsync(list, delegate
-                    {
-                        try
-                        {
-                            object bundleObject = manager.GetAssetBundleObject(probe);
-                            int objects = -1;
-                            try
-                            {
-                                if (bundleObject != null)
-                                {
-                                    objects = manager.GetAssetBundleObject(probe).objectArray.Count;
-                                }
-                            }
-                            catch
-                            {
-                            }
-
-                            string skin = probe.Replace("ui_class_", string.Empty).Replace(".unity3d", string.Empty);
-                            string prefabPath = Toolbox.ResourcesManager.GetAssetTypePath(
-                                skin, ResourcesManager.AssetLoadPathType.ClassCharaSpine, true);
-                            object prefab = manager.LoadObject(prefabPath, typeof(UnityEngine.GameObject), true);
-                            Plugin.Logger.LogWarning(
-                                $"[ImportDiag] probe load '{probe}': bundle={bundleObject != null} objects={objects} " +
-                                $"prefabPath='{prefabPath}' prefab={prefab != null}");
-                        }
-                        catch (Exception exception)
-                        {
-                            Plugin.Logger.LogWarning($"[ImportDiag] probe load failed: {exception.Message}");
-                        }
-                    });
-                }
             }
             catch (Exception exception)
             {
                 Plugin.Logger.LogWarning($"[ImportDiag] failed: {exception.Message}");
+            }
+        }
+
+        /// <summary>把某个皮肤的表情表 + 语音 cue 的真实状态打出来，区分"表没有"和"cue 表没登记"。</summary>
+        private static string DescribeVoiceCue(int skinId)
+        {
+            try
+            {
+                Dictionary<string, Dictionary<ClassCharaPrm.EmotionType, Emotion>> table = Data.Master?._emotionDic;
+                if (table == null)
+                {
+                    return "emotionTable=null";
+                }
+
+                if (!table.TryGetValue(skinId.ToString(CultureInfo.InvariantCulture), out var emotions) || emotions == null)
+                {
+                    return $"emotionTable=missing (total {table.Count})";
+                }
+
+                string cueName = "?";
+                string cueSheet = "?";
+                bool available = false;
+                if (emotions.TryGetValue(ClassCharaPrm.EmotionType.WIN, out Emotion win) && win != null)
+                {
+                    cueName = "vo_" + win.GetVoiceId(false);
+                    cueSheet = "v/" + cueName + ".acb";
+                    try
+                    {
+                        available = Toolbox.AudioManager.IsAvailableCueSheet(cueSheet);
+                    }
+                    catch (Exception exception)
+                    {
+                        cueSheet += " <" + exception.Message + ">";
+                    }
+                }
+
+                return $"emotionTable={emotions.Count} sample='{cueName}' sheet='{cueSheet}' available={available}";
+            }
+            catch (Exception exception)
+            {
+                return "emotionDiag failed: " + exception.Message;
             }
         }
 
@@ -685,11 +677,6 @@ namespace Shadowbus
                     }
 
                     string key = skinId.ToString(CultureInfo.InvariantCulture);
-                    if (table.ContainsKey(key))
-                    {
-                        continue;
-                    }
-
                     string text = $"emote_chara_{charaId}";
                     texts.Add(text);
                     keys.Add(key);
@@ -702,8 +689,9 @@ namespace Shadowbus
                     return;
                 }
 
-                // 首选：直接用我们带过来的 CSV 建表（不依赖素材包能不能被游戏加载）。
-                int built = InjectEmotionTables(table);
+                // 表一律用我们带过来的 CSV 重建（不依赖素材包能不能被游戏加载，也不看游戏有没有
+                // 自己建过）：CSV 才是我们验过的那份，谁先建谁赢会导致语音时有时无。
+                int built = InjectEmotionTables(table, true);
                 if (built > 0)
                 {
                     Plugin.Logger.LogInfo(
