@@ -130,6 +130,8 @@ def build(skin):
             d.save()
         elif obj.type.name == 'AssetBundle':
             d.m_Name = 'ui_class_%s.unity3d' % skin
+            # 引擎认包看的是 m_AssetBundleName；不改的话 7 个包都自称是那个壳包。
+            d.m_AssetBundleName = 'ui_class_%s.unity3d' % skin
             cont = d.m_Container or []
             if isinstance(cont, dict):
                 d.m_Container = {p.replace('class_101', 'class_%s' % skin): i for p, i in cont.items()}

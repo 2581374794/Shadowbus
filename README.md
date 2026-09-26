@@ -250,13 +250,13 @@ python collect_story_text_bundles.py --lang chs --source deployed --move-source 
 <资源根>/text/cht/<同名表>.json          ← 国际服原有繁体（49 张表 51205 条，从游戏本体导出）
 ```
 
-目录名就是语言区段名小写（`Chs` → `chs`、`Cht` → `cht`），游戏从哪一套读由设置里的**文本语言**决定：
+目录名就是语言目录小写（`Chs` → `chs`、`Cht` → `cht`），**只有玩家在设置里选了简体中文时才会覆盖**：
 
-- 文本语言 = 简体中文 → 用 `text/chs/`；
-- 文本语言 = 繁体中文 → 用 `text/cht/`；
-- 其它语言（Jpn / Eng / …）没有目录 → 完全不覆盖，用游戏自己的文本。
+- **文本语言 = 简体中文** → 用 `text/chs/`（国服译文）；
+- **文本语言 = 繁体中文或其它** → 一个字都不覆盖，游戏显示自己的原文（繁体保持原版单机繁体）；
+- 判断依据是存档里的 `LANG_SETTING`（语言切换时写进去的那一项）。**不能**用游戏正在解析的语言区段来判断：这个客户端切到繁体之后，文本表仍在解析 `Chs` 区段，照区段判断就会把繁体界面里的文本换成国服译文（「先谋」变成「激奏」就是这么来的）。
 
-改哪套就只动哪个目录，互不影响；想让某张表回到游戏原样，删掉那个 json 即可（目录里没有的表也会保持原样）。数据用 `_tools/build_text_data.py` 生成：
+`text/cht/` 那份原版繁体照样留着、可以单独改（`_tools/build_text_data.py --lang cht --region Cht --source pc` 重新导出），只是默认不参与覆盖。改哪套就只动哪个目录；想让某张表回到游戏原样，删掉那个 json 即可。数据生成：
 
 ```text
 python build_text_data.py --lang chs --region Chs --source cn   # 简体 ← 国服客户端
@@ -267,7 +267,7 @@ python build_text_data.py --lang cht --region Cht --source pc   # 繁体 ← 游
 
 > 两套文本表都只在装了资源文件夹时生效；`text/` 下没有对应语言目录时插件什么都不做。
 
-表情表包 `a/master_emote_chara_*.unity3d`（每个角色一张：情绪 → 脸/动作/语音/台词 id，875 个）是**结构性**数据，不带正文——台词正文在 `emotetext` 表里按语言取，所以它只需要一份，仍然放在 `a/`。国服客户端那 875 张的结构与本地同源（文本 id 有 96% 在本体表里存在），因此这份包直接用国服的 CSV 重建（`_tools/rebuild_emote_bundles.py`），语音 id 与 `text/chs/emotetext.json` 对得上。
+表情表包 `a/master_emote_chara_*.unity3d`（每个角色一张：情绪 → 脸/动作/语音/台词 id，875 个）是**结构性**数据，不带正文——台词正文在 `emotetext` 表里按语言取，所以它只需要一份，仍然放在 `a/`。国服客户端那 875 张的结构与本地同源（文本 id 有 96% 在本体表里存在），因此这份包直接用国服的 CSV 重建（`_tools/rebuild_emote_bundles.py`），语音 id 与 `text/chs/emotetext.json` 对得上。重建时要改三样东西：TextAsset 的名字与内容、`m_Container` 路径、以及 `m_Name` **和** `m_AssetBundleName`——引擎认包看的是后者，只改前者的话 875 个包全都自称是那个壳包，日志会刷满 `AssetBundle '壳包名' was already unloaded.`（主战者 spine 那 7 个包同理）。
 
 ### 解谜（`basic_puzzle/*`）
 

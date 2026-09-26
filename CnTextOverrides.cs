@@ -58,13 +58,14 @@ namespace Shadowbus
                     return;
                 }
 
-                // 只覆盖"当前文本语言"和"游戏正在解析的语言区段"**一致**的那一套：
-                //   简体语言 + Chs 区段 → 用 text/chs（国服）
-                //   繁体语言 + Cht 区段 → 用 text/cht（本来就是这份内容，等于不动）
-                //   两者不一致（切了语言但游戏还在解析另一个区段）→ 一个字都不碰，
-                //   保持切换前的样子。繁体必须原样。
+                // 只覆盖"玩家真正选的语言"那一套：
+                //   选了简体 → 用 text/chs（国服译文）
+                //   选了繁体 → 一个字都不动，保持游戏原本的繁体
+                // 注意不能用游戏正在解析的语言区段来判断：这个客户端切到繁体之后，
+                // 文本表仍在解析 Chs 区段，照区段覆盖就会把繁体界面里的文本换成国服译文。
+                string chosen = ChosenLanguageFolder();
                 string folder = LanguageFolder(region);
-                if (folder == null || folder != CurrentLanguageFolder())
+                if (chosen == null || folder == null || folder != chosen)
                 {
                     return;
                 }
@@ -104,11 +105,29 @@ namespace Shadowbus
         }
 
         /// <summary>
-        /// 当前文本语言对应的目录名（<c>Cht</c> → <c>cht</c>、<c>Chs</c> → <c>chs</c>；
-        /// 读不出来或不是语言码时返回 null，那就一律不覆盖）。
+        /// 玩家选的文本语言对应的目录名。来源是存档里的 <c>LANG_SETTING</c>——
+        /// 语言切换时写进去的那一项，也是"设置里到底选了哪个"的唯一可靠来源
+        /// （<c>CustomPreference.GetTextLanguage()</c> / <c>Data.SystemText.RegionCode</c>
+        /// 在这个客户端上会停在旧值，不能用来判断）。读不出来就退回它。
         /// </summary>
-        private static string CurrentLanguageFolder()
+        private static string ChosenLanguageFolder()
         {
+            try
+            {
+                string saved = Toolbox.SavedataManager == null
+                    ? null
+                    : Toolbox.SavedataManager.GetString("LANG_SETTING");
+                string folder = LanguageFolder(saved);
+                if (folder != null)
+                {
+                    return folder;
+                }
+            }
+            catch (Exception exception)
+            {
+                WarnOnce($"[TextOverride] Could not read LANG_SETTING: {exception.Message}");
+            }
+
             try
             {
                 return LanguageFolder(CustomPreference.GetTextLanguage());

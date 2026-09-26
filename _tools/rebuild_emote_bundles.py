@@ -62,6 +62,10 @@ def build(name):
             d.save()
         elif obj.type.name == 'AssetBundle':
             d.m_Name = name
+            # Unity 认包用的是 m_AssetBundleName（AssetBundle.name），不是 m_Name：
+            # 不一起改掉的话 875 个包全都自称是那一个壳包，引擎会报一堆
+            # "AssetBundle '壳包名' was already unloaded."，而且互相顶掉。
+            d.m_AssetBundleName = name
             path = CONTAINER % chara
             cont = d.m_Container or []
             if isinstance(cont, dict):
