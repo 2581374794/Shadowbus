@@ -35,9 +35,6 @@ namespace Shadowbus
         /// <summary>替换后生成的贴图最多留几份（超出就丢引用，交给 Resources.UnloadUnusedAssets 回收）。</summary>
         private const int MaxConvertedTextures = 64;
 
-        /// <summary>官方原图放这里：<c>Mods/LeaderSkins/</c>。</summary>
-        private const string OverrideDirectoryName = "LeaderSkins";
-
         /// <summary>只有这几种"缺了就直接空一块"的类型才兜底；模型、特效等不动。</summary>
         private static readonly HashSet<ResourcesManager.AssetLoadPathType> Supported =
             new HashSet<ResourcesManager.AssetLoadPathType>
@@ -133,7 +130,7 @@ namespace Shadowbus
             };
 
         /// <summary>
-        /// 各类素材的官方文件名（不含扩展名），用来找 <c>Mods/LeaderSkins/&lt;名字&gt;.png</c>：
+        /// 各类素材的官方文件名（不含扩展名），用来找 <c>&lt;资源根&gt;/LeaderSkins/&lt;名字&gt;.png</c>：
         /// 官方客户端没发、又从别的客户端（如国服手机版）拿到图时，直接放一张 PNG 就能生效——
         /// 贴图与 Unity 版本无关，而别的版本的 bundle 在本地运行时是加载不了的。
         /// </summary>
@@ -247,7 +244,7 @@ namespace Shadowbus
                     return;
                 }
 
-                // 一个可用的替代素材包都没有，但有 Mods/LeaderSkins 补图（移植过来的皮肤）：
+                // 一个可用的替代素材包都没有，但有 LeaderSkins 补图（移植过来的皮肤）：
                 // 预加载先指向确实存在的包（用它自己的 spine 包），对象取不到就换补图。
                 if (OverrideExists(skinId, type))
                 {
@@ -445,7 +442,7 @@ namespace Shadowbus
 
                 string key = $"{substitution.SkinId}|{(int)substitution.Requested}";
 
-                // 1) Mods/LeaderSkins 里有官方原图（例如从国服客户端提取的）就直接用它，最准。
+                // 1) LeaderSkins 里有官方原图（例如从国服客户端提取的）就直接用它，最准。
                 Texture official = LoadOverride(substitution.SkinId, substitution.Requested);
                 if (official != null)
                 {
@@ -505,7 +502,7 @@ namespace Shadowbus
             }
 
             string name = string.Format(format, skinId);
-            string directory = Path.Combine(PathHelper.ModPath, OverrideDirectoryName);
+            string directory = PathHelper.LeaderSkinsPath;
             string path = Path.Combine(Path.Combine(directory, skinId.ToString()), name + ".png");
             if (File.Exists(path))
             {
@@ -523,7 +520,7 @@ namespace Shadowbus
         }
 
         /// <summary>
-        /// <c>Mods/LeaderSkins/&lt;官方素材名&gt;.png</c>：官方客户端没发这张图时，把别的客户端
+        /// <c>&lt;资源根&gt;/LeaderSkins/&lt;官方素材名&gt;.png</c>：官方客户端没发这张图时，把别的客户端
         /// （或自己做的）同尺寸 PNG 放进去即可生效。贴图与 Unity 版本无关，所以这条路比搬 bundle 靠谱。
         /// </summary>
         private static Texture LoadOverride(int skinId, ResourcesManager.AssetLoadPathType type)
@@ -691,7 +688,7 @@ namespace Shadowbus
 
             Plugin.Logger.LogInfo(
                 $"[SkinFallback] Skin {skinId} '{type}': no local bundle, using the ported artwork " +
-                $"from Mods/{OverrideDirectoryName}/{skinId}/{(AssetNameFormat.TryGetValue(type, out string format) ? string.Format(format, skinId) : "?")}.png.");
+                $"from LeaderSkins/{skinId}/{(AssetNameFormat.TryGetValue(type, out string format) ? string.Format(format, skinId) : "?")}.png.");
         }
 
         private static void LogOnce(

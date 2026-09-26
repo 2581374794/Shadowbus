@@ -24,6 +24,26 @@ namespace Shadowbus
         public static readonly string AIEmotePath = Path.Combine(AIDataPath, "emote");
 
         /// <summary>
+        /// 移植进来的官方素材（主战者皮肤补图、各语言文本表）所在的位置：**资源目录**下，
+        /// 不在 `Mods` 里 —— `Mods` 只放玩家自制内容，官方素材跟 `story_ai/` 一样归资源目录。
+        /// 资源根还没解析出来时（或玩家没放资源文件夹）退回 `<游戏>/Mods`，老布局照样能用。
+        /// </summary>
+        public static string OfficialDataRoot
+        {
+            get
+            {
+                string root = ResourceRootPatches.ResourceRoot;
+                return string.IsNullOrEmpty(root) ? ModPath : root;
+            }
+        }
+
+        /// <summary>`&lt;资源根&gt;/LeaderSkins/&lt;皮肤号&gt;/`：主战者补图与表情 CSV。</summary>
+        public static string LeaderSkinsPath => Path.Combine(OfficialDataRoot, "LeaderSkins");
+
+        /// <summary>`&lt;资源根&gt;/text/&lt;语言码小写&gt;/&lt;表名&gt;.json`：国服 / 国际服两套文本表。</summary>
+        public static string LanguageTextPath => Path.Combine(OfficialDataRoot, "text");
+
+        /// <summary>
         /// 官方 AI 数据（从游戏本体资源包导出成 CSV 的那一份）所在的本地目录。
         ///
         /// 位置在**资源目录**里（`&lt;资源根&gt;/story_ai/{deck,style,emote}`），不在 Mods 下：

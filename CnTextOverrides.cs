@@ -8,32 +8,33 @@ using Wizard;
 namespace Shadowbus
 {
     /// <summary>
-    /// 国服（网易）简体中文文本覆盖。
+    /// 简体 / 繁体两套文本表，各自独立存放、按当前文本语言取用。
     ///
-    /// 游戏里所有文本表（卡名 / 卡牌说明 / 卡面记述 / 能力关键词 / 系统 UI …，一共 50 张）
-    /// 都走同一个入口：<c>Master.LoadLocalizeJsonAndParseWithRegion(dic, region, fileName, isTrimKey)</c>
+    /// 游戏里所有文本表（卡名 / 卡牌说明 / 卡面记述 / 能力关键词 / 表情台词 / 系统 UI …，
+    /// 一共 50 张）都走同一个入口：
+    /// <c>Master.LoadLocalizeJsonAndParseWithRegion(dic, region, fileName, isTrimKey)</c>
     /// —— 把某个语言区段的 JSON 灌进一张字典。区段名就是当前文本语言
     /// （<c>Data.SystemText.RegionCode = CustomPreference.GetTextLanguage()</c>）。
     ///
-    /// 所以这里不碰任何素材包，只在解析完之后把国服那一份**盖上去**：
-    /// <c>&lt;Mods&gt;/Text/&lt;语言码小写&gt;/&lt;表名&gt;.json</c>，表名取自
-    /// <c>fileName</c> 的最后一段（<c>Master/text/cardnametext</c> → <c>cardnametext</c>）。
+    /// 所以这里不碰任何素材包，只在解析完之后把对应语言的那一份**盖上去**：
+    ///
+    /// <code>
+    /// &lt;资源根&gt;\text\chs\cardnametext.json      ← 国服（网易）译文
+    /// &lt;资源根&gt;\text\cht\cardnametext.json      ← 国际服原有繁体
+    /// </code>
+    ///
+    /// 表名取自 <c>fileName</c> 的最后一段（<c>Master/text/cardnametext</c> → <c>cardnametext</c>），
+    /// 目录名是语言区段名小写。没有对应目录的语言（Jpn / Eng / …）完全不覆盖。
     /// 键按游戏自己的规则 <c>Trim</c>（<c>isTrimKey</c> 为真时），否则查不到。
     ///
-    /// 数据由 <c>_tools/build_text_data.py</c> 从国服客户端导出；想让某个表回到原样，
-    /// 删掉对应的 json 即可。
+    /// 数据由 <c>_tools/build_text_data.py</c> 生成（简体取自国服客户端，繁体取自游戏本体）；
+    /// 想让某张表回到原样，删掉对应的 json 即可。
     /// </summary>
     internal static class CnTextOverrides
     {
-        /// <summary>文本数据目录名（<c>&lt;Mods&gt;/Text</c>）。</summary>
-        private const string TextFolder = "Text";
-
-        /// <summary>简体中文的语言码（也是 <c>RegionCode</c> 的取值）。</summary>
-        private const string SimplifiedRegion = "Chs";
-
         private static readonly object CacheLock = new object();
 
-        /// <summary>表名 → 国服数据；缺失的表缓存成 null，免得每次加载都去碰磁盘。</summary>
+        /// <summary>"语言目录/表名" → 数据；查不到的缓存成 null，免得每次加载都去碰磁盘。</summary>
         private static readonly Dictionary<string, Dictionary<string, string>> Cache =
             new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
 
@@ -54,8 +55,8 @@ namespace Shadowbus
                     return;
                 }
 
-                // 只在简体中文区段上盖国服的译文；别的语言保持游戏原样。
-                if (!string.Equals(region, SimplifiedRegion, StringComparison.OrdinalIgnoreCase))
+                string folder = LanguageFolder(region);
+                if (folder == null)
                 {
                     return;
                 }
@@ -66,7 +67,7 @@ namespace Shadowbus
                     return;
                 }
 
-                Dictionary<string, string> lines = LoadTable(table);
+                Dictionary<string, string> lines = LoadTable(folder, table);
                 if (lines == null || lines.Count == 0)
                 {
                     return;
@@ -86,12 +87,35 @@ namespace Shadowbus
                     applied++;
                 }
 
-                ReportApplied(table, applied);
+                ReportApplied(folder, table, applied);
             }
             catch (Exception exception)
             {
                 Plugin.Logger.LogWarning($"[TextOverride] Could not apply '{fileName}': {exception.Message}");
             }
+        }
+
+        /// <summary>
+        /// 语言区段名 → 目录名。只认纯小写字母的区段（<c>Chs</c> → <c>chs</c>），
+        /// 别的（<c>Jpn</c> / <c>Eng</c> / <c>Kor</c> …）也能对上目录，只是我们没放那份数据。
+        /// </summary>
+        private static string LanguageFolder(string region)
+        {
+            string code = (region ?? string.Empty).Trim().ToLowerInvariant();
+            if (code.Length == 0 || code.Length > 4)
+            {
+                return null;
+            }
+
+            foreach (char c in code)
+            {
+                if (c < 'a' || c > 'z')
+                {
+                    return null;
+                }
+            }
+
+            return code;
         }
 
         /// <summary><c>Master/text/cardnametext</c> → <c>cardnametext</c>。</summary>
@@ -102,34 +126,37 @@ namespace Shadowbus
             return slash >= 0 ? normalized.Substring(slash + 1) : normalized;
         }
 
-        private static Dictionary<string, string> LoadTable(string table)
+        private static Dictionary<string, string> LoadTable(string folder, string table)
         {
+            string key = folder + "/" + table;
             lock (CacheLock)
             {
-                if (Cache.TryGetValue(table, out Dictionary<string, string> cached))
+                if (Cache.TryGetValue(key, out Dictionary<string, string> cached))
                 {
                     return cached;
                 }
 
-                Dictionary<string, string> loaded = ReadTable(table);
-                Cache[table] = loaded;
+                Dictionary<string, string> loaded = ReadTable(folder, table);
+                // 资源根还没解析出来时路径是错的，别把"没有"记死，等它接上再读一次。
+                if (loaded != null || !string.IsNullOrEmpty(ResourceRootPatches.ResourceRoot))
+                {
+                    Cache[key] = loaded;
+                }
+
                 return loaded;
             }
         }
 
-        private static Dictionary<string, string> ReadTable(string table)
+        private static Dictionary<string, string> ReadTable(string folder, string table)
         {
-            string path = Path.Combine(
-                Path.Combine(PathHelper.ModPath, TextFolder),
-                SimplifiedRegion.ToLowerInvariant(),
-                table + ".json");
+            string path = Path.Combine(Path.Combine(PathHelper.LanguageTextPath, folder), table + ".json");
             if (!File.Exists(path))
             {
-                if (!_warnedAboutFolder && !Directory.Exists(Path.GetDirectoryName(path)))
+                if (!_warnedAboutFolder && !Directory.Exists(PathHelper.LanguageTextPath))
                 {
                     _warnedAboutFolder = true;
                     Plugin.Logger.LogInfo(
-                        $"[TextOverride] No CN text data at '{Path.GetDirectoryName(path)}'; " +
+                        $"[TextOverride] No ported text at '{PathHelper.LanguageTextPath}'; " +
                         "the game's own text is used as-is.");
                 }
 
@@ -147,17 +174,18 @@ namespace Shadowbus
             }
         }
 
-        private static void ReportApplied(string table, int applied)
+        private static void ReportApplied(string folder, string table, int applied)
         {
+            string key = folder + "/" + table;
             lock (CacheLock)
             {
-                if (!Reported.Add(table))
+                if (!Reported.Add(key))
                 {
                     return;
                 }
             }
 
-            Plugin.Logger.LogInfo($"[TextOverride] Replaced {applied} CN line(s) in '{table}'.");
+            Plugin.Logger.LogInfo($"[TextOverride] Replaced {applied} line(s) in '{folder}/{table}'.");
         }
     }
 }

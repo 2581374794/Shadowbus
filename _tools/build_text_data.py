@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Build the shipped CN text override data.
+"""Build the shipped per-language text override data.
 
-For every text table the game loads, take the `Chs` section of the CN (NetEase) client
-bundle and write it to Mods/Text/chs/<table>.json. The plugin overlays this on top of the
-table the game just parsed, so the port needs no bundle surgery and stays reversible.
+Two independent sets live side by side under the resource root, mirroring `story_text`:
 
-`--lang chs` writes the Simplified Chinese set; the same script can build other languages
-straight from the same CN bundles if a language table is ever wanted.
+    <资源根>/text/chs/<table>.json   <- the CN (NetEase) client's Chs section
+    <资源根>/text/cht/<table>.json   <- the PC client's own Cht section
+
+The plugin picks the folder that matches the current text language, so neither set touches
+the other. `_tools/list_cn_text_assets.py` produces the CN pull list.
 """
 import argparse
 import json
@@ -15,8 +16,9 @@ import UnityPy
 
 UnityPy.config.FALLBACK_UNITY_VERSION = '2020.3.18f1'
 CN_T = r'D:\Games\Shadowbus-dev\artifacts\cn_text'
-GAME_MODS = r'D:\Games\Shadowbus\Shadowverse\Mods\Text'
-REPO_MODS = r'D:\Github\Shadowbus\Mods\Text'
+PC_A = r'D:\Games\Shadowbus\Resources\a'
+RES_ROOT = r'D:\Games\Shadowbus\Resources'
+REPO_ROOT = r'D:\Github\Shadowbus\Resources'
 
 
 def load_table(path):
@@ -41,26 +43,25 @@ def load_table(path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--lang', default='chs')
-    parser.add_argument('--region', default='Chs')
+    parser.add_argument('--lang', required=True, choices=['chs', 'cht'])
+    parser.add_argument('--region', required=True, choices=['Chs', 'Cht'])
+    parser.add_argument('--source', required=True, choices=['cn', 'pc'])
     args = parser.parse_args()
 
-    out_dirs = [os.path.join(GAME_MODS, args.lang), os.path.join(REPO_MODS, args.lang)]
+    source = CN_T if args.source == 'cn' else PC_A
+    out_dirs = [os.path.join(RES_ROOT, 'text', args.lang), os.path.join(REPO_ROOT, 'text', args.lang)]
     for d in out_dirs:
         os.makedirs(d, exist_ok=True)
 
-    names = sorted(f for f in os.listdir(CN_T)
+    names = sorted(f for f in os.listdir(source)
                    if f.startswith('master_') and f.endswith('.unity3d'))
-    total = 0
-    written = 0
+    written = total = 0
     for name in names:
-        table, regions = load_table(os.path.join(CN_T, name))
+        table, regions = load_table(os.path.join(source, name))
         if not table or not isinstance(regions, dict):
-            print('%-48s skipped (no regions)' % name)
             continue
         region = regions.get(args.region)
         if not isinstance(region, dict) or not region:
-            print('%-48s skipped (no %s section)' % (name, args.region))
             continue
         payload = json.dumps(region, ensure_ascii=False, separators=(',', ':'))
         for d in out_dirs:
@@ -68,10 +69,9 @@ def main():
                 fh.write(payload)
         written += 1
         total += len(region)
-        print('%-48s %6d entries  %7d B' % (table, len(region), len(payload.encode('utf-8'))))
 
-    print()
-    print('%d table(s), %d entry(ies) total' % (written, total))
+    print('%s (%s section of the %s client): %d table(s), %d entry(ies)'
+          % (args.lang, args.region, args.source, written, total))
     for d in out_dirs:
         size = sum(os.path.getsize(os.path.join(d, f)) for f in os.listdir(d))
         print('  %s : %d file(s), %.2f MB' % (d, len(os.listdir(d)), size / 1048576.0))

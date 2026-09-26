@@ -82,7 +82,16 @@ Shadowbus/
 
 玩家只要把别人的资源文件夹整个复制过来放在游戏目录旁边，**不需要原版资源目录、也不需要做任何目录联接**，直接就能玩；游戏启动之后才把资源文件夹放进来也能认（插件会在下一帧补上重定向）。一个都没找到时，插件完全不动游戏行为。
 
-资源目录里由游戏决定的子目录是 `a/`（资源包）、`b/`（BGM）、`s/`（音效）、`v/`（语音，`v/t` 是剧情临时语音）、`m/`（影片）、`f/`（字体）、`manifest/`（各资源清单）、`cardmaster/`、`recovery/`。**从本体导出成纯本地文件的官方 AI 数据统一放在 `<资源根>/story_ai/{deck,style,emote}`**（见下面「剧情特殊战斗」）—— 官方数据进这里，`Mods` 只放玩家自制的模组内容。
+资源目录里由游戏决定的子目录是 `a/`（资源包）、`b/`（BGM）、`s/`（音效）、`v/`（语音，`v/t` 是剧情临时语音）、`m/`（影片）、`f/`（字体）、`manifest/`（各资源清单）、`cardmaster/`、`recovery/`。**移植进来的官方素材也统一放在资源目录里**，按语言分开、各自独立：
+
+| 目录 | 内容 |
+| --- | --- |
+| `<资源根>/story_text/{chs,cht}/` | 剧情正文 / 人名 / 章节概要 / 影片字幕包（各 1317 个） |
+| `<资源根>/text/{chs,cht}/` | 卡名 / 卡牌说明 / 卡面记述 / 卡牌效果 / 关键词 / 表情台词等 50 张文本表 |
+| `<资源根>/LeaderSkins/<皮肤号>/` | 国服独占主战者的补图（PNG）与表情 CSV、`imported_leaders.json` |
+| `<资源根>/story_ai/{deck,style,emote}/` | 从本体导出成纯本地文件的官方 AI 数据（见下面「剧情特殊战斗」） |
+
+游戏自己按当前**文本语言**从对应的语言目录取，两套互不影响；`Mods` 只放玩家自制的模组内容（官方数据不进 `Mods`）。
 
 被接管的不只是资源本身：游戏里所有 `Application.persistentDataPath` 的取值（一共 18 处调用）以及启动最早期就已经存进静态字段的路径，一律指向这个资源目录，包括卡图/语音/影片/manifest、回放目录 `NewReplay` 与 Record、HTTP 下载缓存、统计日志 `accumulate_log` 等、`NGUITools` 存档、游戏自带的 CardMaster 导出目录、首页特殊称号的 BGM 检查。Unity 原生写的 `Player.log` / `Player-prev.log` 走引擎的 C++ 层，托管代码改不了它的路径，所以另外两条路都通到资源目录：
 >
@@ -225,23 +234,40 @@ python collect_story_text_bundles.py --lang chs --source deployed --move-source 
 
 想退回「剧情文本也放 `a/`」的老样子：把 `story_text/chs/` 里的包复制回 `<资源根>/a/` 即可（`cht` 留着也不影响，插件只是优先用语言目录）。`_tools/verify_resources.py` 已经认识这个新位置，所以搬走之后它照样报 `storylang_assetmanifest missing=0`。
 
-### 国服简体中文文本（`<Mods>/Text/chs/`）
+### 文本表：简体 / 繁体两套独立存放（`<资源根>/text/`）
 
 剧情以外的所有文本表都走同一条入口：`Master.LoadLocalizeJsonAndParseWithRegion(dic, region, fileName, isTrimKey)` —— 把某个语言区段的 JSON 灌进一张字典，区段名就是当前文本语言（`Data.SystemText.RegionCode = CustomPreference.GetTextLanguage()`，见 `Master.StartLoadCardNameText` 等 50 处调用）。
 
-插件的 `CnTextOverrides` 就挂在这条路上：解析完之后把国服那一份**盖上去**，所以不碰任何素材包、随时可逆（删掉对应的 json 就回到游戏原样）：
+插件的 `CnTextOverrides` 就挂在这条路上：解析完之后把**当前语言那一份**盖上去。两套数据在资源目录里并列存放、各自独立，和 `story_text/` 一个路子：
 
 ```text
-<Mods>/Text/chs/cardnametext.json      ← 卡牌名称（5356 条）
-<Mods>/Text/chs/skilldesctext.json     ← 卡牌说明 / 效果（9442 条）
-<Mods>/Text/chs/flavourtext.json       ← 卡面记述（8927 条）
-<Mods>/Text/chs/battlekeyword.json     ← 能力关键词（6290 条，必杀→毁灭、复仇→反击 …）
-… 一共 50 张表、51802 条
+<资源根>/text/chs/cardnametext.json     ← 国服（网易）译文，来自国服客户端
+<资源根>/text/chs/skilldesctext.json    ← 卡牌说明 / 效果（9442 条）
+<资源根>/text/chs/flavourtext.json      ← 卡面记述（8927 条）
+<资源根>/text/chs/emotetext.json        ← 表情台词（5288 条）
+<资源根>/text/chs/battlekeyword.json    ← 能力关键词（6290 条）
+… 共 50 张表 51802 条
+<资源根>/text/cht/<同名表>.json          ← 国际服原有繁体（49 张表 51205 条，从游戏本体导出）
 ```
 
-数据用 `_tools/build_text_data.py` 从国服客户端导出（拉取清单见 `_tools/list_cn_text_assets.py`），只在**简体中文**区段生效；切到别的文本语言时不覆盖。逐表差异：卡名 3936/5356、说明 8107/9442、记述 8246/8927、关键词 2356/6290 与国服不同，少数国服没有的条目（国际服独占内容）保留游戏原文。
+目录名就是语言区段名小写（`Chs` → `chs`、`Cht` → `cht`），游戏从哪一套读由设置里的**文本语言**决定：
 
-顺带一句：`a/master_emote_chara_*.unity3d`（每个角色的表情表，875 个）也是用国服同名的 CSV 重建的 2020 包（`_tools/rebuild_emote_bundles.py`），这样语音 id 和国服台词表 `emotetext` 对得上。
+- 文本语言 = 简体中文 → 用 `text/chs/`；
+- 文本语言 = 繁体中文 → 用 `text/cht/`；
+- 其它语言（Jpn / Eng / …）没有目录 → 完全不覆盖，用游戏自己的文本。
+
+改哪套就只动哪个目录，互不影响；想让某张表回到游戏原样，删掉那个 json 即可（目录里没有的表也会保持原样）。数据用 `_tools/build_text_data.py` 生成：
+
+```text
+python build_text_data.py --lang chs --region Chs --source cn   # 简体 ← 国服客户端
+python build_text_data.py --lang cht --region Cht --source pc   # 繁体 ← 游戏本体 a/
+```
+
+两套的差别很大：卡名 3936/5356、说明 8107/9442、记述 8246/8927、表情台词 3323、关键词 2356/6290 与国服不同。**繁体的那套就是游戏原本的繁体**，一个字节都没改（例如关键词 `Battle_keyword_Title_0527`：国服简体与繁体都是「激奏」，而国际服简体原作是「先谋」—— 所以简体换成国服译法后，这个键和繁体看着一样是正常的，不是繁体被改了）。
+
+> 两套文本表都只在装了资源文件夹时生效；`text/` 下没有对应语言目录时插件什么都不做。
+
+表情表包 `a/master_emote_chara_*.unity3d`（每个角色一张：情绪 → 脸/动作/语音/台词 id，875 个）是**结构性**数据，不带正文——台词正文在 `emotetext` 表里按语言取，所以它只需要一份，仍然放在 `a/`。国服客户端那 875 张的结构与本地同源（文本 id 有 96% 在本体表里存在），因此这份包直接用国服的 CSV 重建（`_tools/rebuild_emote_bundles.py`），语音 id 与 `text/chs/emotetext.json` 对得上。
 
 ### 解谜（`basic_puzzle/*`）
 

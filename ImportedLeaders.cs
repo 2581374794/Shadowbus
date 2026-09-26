@@ -13,19 +13,18 @@ namespace Shadowbus
     /// <summary>
     /// 把国服独占的主战者（地区独占联动皮肤）补进国际服的角色表。
     ///
-    /// 数据在 <c>Mods/LeaderSkins/imported_leaders.json</c>：每个角色带国服
+    /// 数据在 <c>&lt;资源根&gt;/LeaderSkins/imported_leaders.json</c>：每个角色带国服
     /// <c>class_chara_master</c> 的原始 20 列 + 名字（简/繁/英）+ 可用职业列表。
     /// 国服里职业是 99（<c>ClanType.SHADOW</c>，国际服枚举里本来就有）的那几个是"中立"，
     /// 国际服的主战者列表是按 <c>class_id</c> 过滤的，所以中立皮肤按 1~8 各注入一行
     /// （skin_id 相同、class_id 不同，游戏里没有"主战者职业必须等于卡组职业"的校验）。
     ///
     /// 素材：缩略图/按钮图/卡组立绘/立绘/胜负/资料图走 <see cref="LeaderSkinAssetFallback"/>
-    /// 的补图机制（<c>Mods/LeaderSkins/&lt;皮肤号&gt;</c>）；战斗 spine 是另外做好的
+    /// 的补图机制（<c>&lt;资源根&gt;/LeaderSkins/&lt;皮肤号&gt;</c>）；战斗 spine 是另外做好的
     /// 2020 版包（壳 = 国际服 skeleton 包，内容换成国服骨骼/图集/贴图）。
     /// </summary>
     internal static class ImportedLeaders
     {
-        private const string SubDirectory = "LeaderSkins";
         private const string ResourceName = "imported_leaders.json";
 
         /// <summary>名字 key → { 简, 繁, 英 }。</summary>
@@ -41,6 +40,8 @@ namespace Shadowbus
         private static bool _warned;
         private static bool _hashesRegistered;
         private static bool _assetsRegistered;
+        private static bool _missingReported;
+        private static int _missingCheckTick;
 
         /// <summary>主战者号换成皮肤号（不是我们导入的就原样返回）。</summary>
         internal static int ResolveSkinId(int id)
@@ -50,7 +51,7 @@ namespace Shadowbus
         }
 
         private static string ConfigurationPath =>
-            Path.Combine(Path.Combine(PathHelper.ModPath, SubDirectory), ResourceName);
+            Path.Combine(PathHelper.LeaderSkinsPath, ResourceName);
 
         private static void EnsureLoaded()
         {
@@ -59,15 +60,33 @@ namespace Shadowbus
                 return;
             }
 
-            _loaded = true;
-            try
+            string path = ConfigurationPath;
+            if (!File.Exists(path))
             {
-                string path = ConfigurationPath;
-                if (!File.Exists(path))
+                // 资源根还没解析出来时 LeaderSkins 会退回 <游戏>/Mods，所以找不到不能就此
+                // 认定"没有这份数据"——只按秒节流重试，等资源目录接上了再读。
+                if (string.IsNullOrEmpty(ResourceRootPatches.ResourceRoot))
                 {
                     return;
                 }
 
+                int now = Environment.TickCount;
+                if (!_missingReported || unchecked(now - _missingCheckTick) > 2000)
+                {
+                    _missingCheckTick = now;
+                    if (!_missingReported)
+                    {
+                        _missingReported = true;
+                        Plugin.Logger.LogWarning($"[Import] '{path}' not found; the imported leaders are off.");
+                    }
+                }
+
+                return;
+            }
+
+            _loaded = true;
+            try
+            {
                 JObject root = JObject.Parse(File.ReadAllText(path));
                 if (root["emote_text"] is JObject emoteText)
                 {
@@ -210,7 +229,7 @@ namespace Shadowbus
         }
 
         /// <summary>
-        /// 直接用 <c>Mods/LeaderSkins/&lt;皮肤号&gt;/emote_chara_&lt;角色号&gt;.csv</c> 建表情表。
+        /// 直接用 <c>&lt;资源根&gt;/LeaderSkins/&lt;皮肤号&gt;/emote_chara_&lt;角色号&gt;.csv</c> 建表情表。
         /// 这样不用管素材包能不能被游戏加载（那条路要进清单，很容易又踩坑），
         /// 表里有了皮肤号，开场/胜负/表情的语音就不会再抛异常，也会真的去播。
         /// </summary>
@@ -237,7 +256,7 @@ namespace Shadowbus
                     }
 
                     string path = Path.Combine(
-                        Path.Combine(PathHelper.ModPath, SubDirectory),
+                        PathHelper.LeaderSkinsPath,
                         skinId.ToString(CultureInfo.InvariantCulture),
                         $"emote_chara_{charaId}.csv");
                     if (!File.Exists(path))
@@ -557,7 +576,7 @@ namespace Shadowbus
         /// 游戏建这张表的方式是：<c>遍历角色表 → CheckBeforeFileRequeset(清单里有才加载) →
         /// 预加载 → StartLoadEmoteData</c>。我们塞进去的主战者不在清单里，游戏会跳过它们；
         /// 表里没有这个皮肤号，开场语音就会 <c>KeyNotFoundException</c>、协程断掉、对局卡死。
-        /// 所以这里直接用我们带过来的 CSV 自己建表（<c>Mods/LeaderSkins/&lt;皮肤号&gt;/emote_chara_*.csv</c>），
+        /// 所以这里直接用我们带过来的 CSV 自己建表（<c>&lt;资源根&gt;/LeaderSkins/&lt;皮肤号&gt;/emote_chara_*.csv</c>），
         /// 与素材包能不能被游戏加载完全无关。
         /// </summary>
         [HarmonyPatch(typeof(Master), nameof(Master.StartLoadEmoteData))]
