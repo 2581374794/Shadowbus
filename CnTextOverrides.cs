@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using Cute;
 using HarmonyLib;
 using Newtonsoft.Json;
 using Wizard;
@@ -43,6 +44,8 @@ namespace Shadowbus
 
         private static bool _warnedAboutFolder;
 
+        private static bool _warned;
+
         [HarmonyPatch(typeof(Master), nameof(Master.LoadLocalizeJsonAndParseWithRegion))]
         [HarmonyPostfix]
         private static void Master_LoadLocalizeJsonAndParseWithRegion_Postfix(
@@ -55,8 +58,13 @@ namespace Shadowbus
                     return;
                 }
 
+                // 只覆盖"当前文本语言"和"游戏正在解析的语言区段"**一致**的那一套：
+                //   简体语言 + Chs 区段 → 用 text/chs（国服）
+                //   繁体语言 + Cht 区段 → 用 text/cht（本来就是这份内容，等于不动）
+                //   两者不一致（切了语言但游戏还在解析另一个区段）→ 一个字都不碰，
+                //   保持切换前的样子。繁体必须原样。
                 string folder = LanguageFolder(region);
-                if (folder == null)
+                if (folder == null || folder != CurrentLanguageFolder())
                 {
                     return;
                 }
@@ -92,6 +100,23 @@ namespace Shadowbus
             catch (Exception exception)
             {
                 Plugin.Logger.LogWarning($"[TextOverride] Could not apply '{fileName}': {exception.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 当前文本语言对应的目录名（<c>Cht</c> → <c>cht</c>、<c>Chs</c> → <c>chs</c>；
+        /// 读不出来或不是语言码时返回 null，那就一律不覆盖）。
+        /// </summary>
+        private static string CurrentLanguageFolder()
+        {
+            try
+            {
+                return LanguageFolder(CustomPreference.GetTextLanguage());
+            }
+            catch (Exception exception)
+            {
+                WarnOnce($"[TextOverride] Could not read the text language: {exception.Message}");
+                return null;
             }
         }
 
@@ -186,6 +211,23 @@ namespace Shadowbus
             }
 
             Plugin.Logger.LogInfo($"[TextOverride] Replaced {applied} line(s) in '{folder}/{table}'.");
+        }
+
+        private static void WarnOnce(string message)
+        {
+            lock (CacheLock)
+            {
+                if (!_warned)
+                {
+                    _warned = true;
+                }
+                else
+                {
+                    return;
+                }
+            }
+
+            Plugin.Logger.LogWarning(message);
         }
     }
 }
