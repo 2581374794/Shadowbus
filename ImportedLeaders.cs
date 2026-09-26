@@ -484,6 +484,7 @@ namespace Shadowbus
                 }
 
                 _hashesRegistered = true;
+                registered += RefreshEmoteBundleHashes(manager, root);
                 if (registered > 0)
                 {
                     Plugin.Logger.LogInfo($"[Import] Registered {registered} local asset hash(es).");
@@ -493,6 +494,39 @@ namespace Shadowbus
             {
                 Plugin.Logger.LogDebug($"[Import] Could not register local asset hashes: {exception.Message}");
             }
+        }
+
+        /// <summary>
+        /// 刷新每个角色那张表情表包（<c>a/master_emote_chara_*.unity3d</c>）的本地哈希。
+        ///
+        /// 这 875 个包是我们用国服 CSV 重新打包的（<c>_tools/rebuild_emote_bundles.py</c>），
+        /// 文件一变，<c>manifest.db</c> 里的旧哈希就对不上了，游戏会以为它们没下载好。
+        /// 包是官方名字、我们没登记过句柄，所以只能在这里按磁盘上的真实 MD5 对齐；
+        /// 819 个小包的 MD5 只在第一次启动时做一遍，之后哈希一致就跳过。
+        /// </summary>
+        private static int RefreshEmoteBundleHashes(Cute.AssetManager manager, string root)
+        {
+            int refreshed = 0;
+            try
+            {
+                string directory = Path.Combine(root, "a");
+                if (!Directory.Exists(directory))
+                {
+                    return 0;
+                }
+
+                foreach (string file in Directory.GetFiles(directory, "master_emote_chara_*.unity3d"))
+                {
+                    string name = Path.GetFileName(file);
+                    refreshed += Register(manager, root, "a/" + name, name);
+                }
+            }
+            catch (Exception exception)
+            {
+                Plugin.Logger.LogDebug($"[Import] Could not refresh the emote bundle hashes: {exception.Message}");
+            }
+
+            return refreshed;
         }
 
         /// <summary>
