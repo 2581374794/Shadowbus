@@ -41,7 +41,6 @@ namespace Shadowbus
         private static bool _warned;
         private static bool _hashesRegistered;
         private static bool _assetsRegistered;
-        private static bool _diagnosed;
 
         /// <summary>主战者号换成皮肤号（不是我们导入的就原样返回）。</summary>
         internal static int ResolveSkinId(int id)
@@ -176,7 +175,7 @@ namespace Shadowbus
                         continue;
                     }
 
-                    registered += RegisterLocalAsset(manager, root, Toolbox.ResourcesManager.GetAssetTypePath(
+                    registered += RegisterLocalAsset(manager, Toolbox.ResourcesManager.GetAssetTypePath(
                         skinId.ToString(CultureInfo.InvariantCulture),
                         ResourcesManager.AssetLoadPathType.ClassCharaSpine, false));
 
@@ -189,120 +188,24 @@ namespace Shadowbus
                     {
                         foreach (string file in Directory.GetFiles(voiceDirectory, $"vo_{charaId}_*.acb"))
                         {
-                            registered += RegisterLocalAsset(manager, root, "v/" + Path.GetFileName(file));
+                            registered += RegisterLocalAsset(manager, "v/" + Path.GetFileName(file));
                         }
                     }
 
-                    registered += RegisterLocalAsset(manager, root, $"v/vo_char_select_{charaId}.acb");
+                    registered += RegisterLocalAsset(manager, $"v/vo_char_select_{charaId}.acb");
                 }
 
-                int handles = registered + RegisterOverrideHandles(manager, root);
                 int cues = RegisterVoiceCueSheets(manager, root);
                 _assetsRegistered = true;
-                if (handles > 0 || cues > 0)
+                if (registered > 0 || cues > 0)
                 {
                     Plugin.Logger.LogInfo(
-                        $"[Import] Registered {handles} local asset(s) and {cues} voice cue sheet(s).");
+                        $"[Import] Registered {registered} local asset(s) and {cues} voice cue sheet(s).");
                 }
-
-                DiagnoseLocalAssets(manager);
             }
             catch (Exception exception)
             {
                 Plugin.Logger.LogWarning($"[Import] Could not register the local assets: {exception.Message}");
-            }
-        }
-
-        /// <summary>
-        /// 诊断：把移植文件在游戏眼里的状态打出来 —— 认不认、期望的本地路径是哪、包有没有被加载、
-        /// 包里对象表有没有内容。用来区分"路径不对"和"包本身装不上"。
-        /// </summary>
-        private static void DiagnoseLocalAssets(Cute.AssetManager manager)
-        {
-            if (_diagnosed)
-            {
-                return;
-            }
-
-            try
-            {
-                var seen = new List<int>();
-                foreach (string[] columns in Pending)
-                {
-                    int skinId = ParseInt(columns, 7, 0);
-                    if (skinId <= 0 || seen.Contains(skinId))
-                    {
-                        continue;
-                    }
-
-                    seen.Add(skinId);
-                    string spine = Toolbox.ResourcesManager.GetAssetTypePath(
-                        skinId.ToString(CultureInfo.InvariantCulture),
-                        ResourcesManager.AssetLoadPathType.ClassCharaSpine, false);
-                    AssetHandle handle = manager.GetAssetHandle(spine, false);
-                    string expected = null;
-                    try
-                    {
-                        expected = handle?.BuildLocalCachePath();
-                    }
-                    catch (Exception exception)
-                    {
-                        expected = "<" + exception.Message + ">";
-                    }
-
-                    string cue = DescribeVoiceCue(skinId);
-                    Plugin.Logger.LogInfo(
-                        $"[ImportDiag] skin {skinId}: spineHandle={handle != null} " +
-                        $"enabled={manager.IsEnableAssetName(spine)} loaded={manager.GetAssetBundleObject(spine) != null} " +
-                        $"path='{expected}' {cue}");
-                }
-
-                _diagnosed = true;
-            }
-            catch (Exception exception)
-            {
-                Plugin.Logger.LogWarning($"[ImportDiag] failed: {exception.Message}");
-            }
-        }
-
-        /// <summary>把某个皮肤的表情表 + 语音 cue 的真实状态打出来，区分"表没有"和"cue 表没登记"。</summary>
-        private static string DescribeVoiceCue(int skinId)
-        {
-            try
-            {
-                Dictionary<string, Dictionary<ClassCharaPrm.EmotionType, Emotion>> table = Data.Master?._emotionDic;
-                if (table == null)
-                {
-                    return "emotionTable=null";
-                }
-
-                if (!table.TryGetValue(skinId.ToString(CultureInfo.InvariantCulture), out var emotions) || emotions == null)
-                {
-                    return $"emotionTable=missing (total {table.Count})";
-                }
-
-                string cueName = "?";
-                string cueSheet = "?";
-                bool available = false;
-                if (emotions.TryGetValue(ClassCharaPrm.EmotionType.WIN, out Emotion win) && win != null)
-                {
-                    cueName = "vo_" + win.GetVoiceId(false);
-                    cueSheet = "v/" + cueName + ".acb";
-                    try
-                    {
-                        available = Toolbox.AudioManager.IsAvailableCueSheet(cueSheet);
-                    }
-                    catch (Exception exception)
-                    {
-                        cueSheet += " <" + exception.Message + ">";
-                    }
-                }
-
-                return $"emotionTable={emotions.Count} sample='{cueName}' sheet='{cueSheet}' available={available}";
-            }
-            catch (Exception exception)
-            {
-                return "emotionDiag failed: " + exception.Message;
             }
         }
 
@@ -455,12 +358,6 @@ namespace Shadowbus
             return names;
         }
 
-        /// <summary>补图（PNG）不是素材包，走的是我们自己的贴图替换，这里不用注册；留个空实现方便扩展。</summary>
-        private static int RegisterOverrideHandles(Cute.AssetManager manager, string root)
-        {
-            return 0;
-        }
-
         /// <summary>
         /// 把一份本地文件登记进 <c>handleDictionary</c>，否则 <c>AssetManager.CacheAsset</c>
         /// 里 <c>handleDictionary.TryGetValue</c> 查不到就直接跳过，包永远加载不了
@@ -469,7 +366,7 @@ namespace Shadowbus
         /// 拼到 <c>&lt;root&gt;/a/</c> 下，语音 <c>v/xxx.acb</c> 拼到 <c>&lt;root&gt;/v/</c> 下。
         /// 所以存在性检查必须用 <c>BuildLocalCachePath()</c> 的结果，不能直接拼 root。
         /// </summary>
-        private static int RegisterLocalAsset(Cute.AssetManager manager, string root, string name)
+        private static int RegisterLocalAsset(Cute.AssetManager manager, string name)
         {
             try
             {
@@ -560,11 +457,10 @@ namespace Shadowbus
                         continue;
                     }
 
+                    // 表情表不走素材包（见 Master_StartLoadEmoteData_Postfix），所以只登记
+                    // 战斗 spine 包和语音；素材名是裸包名，键必须和 AssetHandle 查的一致。
                     registered += Register(manager, root, $"a/ui_class_{skinId}.unity3d",
                         $"ui_class_{skinId}.unity3d");
-                    registered += Register(manager, root,
-                        $"a/master_emote_chara_{charaId}.unity3d",
-                        $"master_emote_chara_{charaId}.unity3d");
                     registered += RegisterVoiceFiles(manager, root, charaId);
                 }
 
@@ -659,10 +555,10 @@ namespace Shadowbus
         /// 把国服的表情表补进 <c>_emotionDic</c>。
         ///
         /// 游戏建这张表的方式是：<c>遍历角色表 → CheckBeforeFileRequeset(清单里有才加载) →
-        /// 预加载 → StartLoadEmoteData</c>。我们塞进去的 <c>master_emote_chara_*.unity3d</c>
-        /// 不在清单里，会被跳过；表里没有这个皮肤号，开场语音就会 KeyNotFoundException、
-        /// 协程断掉、对局卡死。所以这里自己预加载这几个包，再用游戏自带的
-        /// <c>DynamicLoadEmoteData</c>（只追加、不清空）补进去。
+        /// 预加载 → StartLoadEmoteData</c>。我们塞进去的主战者不在清单里，游戏会跳过它们；
+        /// 表里没有这个皮肤号，开场语音就会 <c>KeyNotFoundException</c>、协程断掉、对局卡死。
+        /// 所以这里直接用我们带过来的 CSV 自己建表（<c>Mods/LeaderSkins/&lt;皮肤号&gt;/emote_chara_*.csv</c>），
+        /// 与素材包能不能被游戏加载完全无关。
         /// </summary>
         [HarmonyPatch(typeof(Master), nameof(Master.StartLoadEmoteData))]
         [HarmonyPostfix]
@@ -677,65 +573,14 @@ namespace Shadowbus
                     return;
                 }
 
-                var texts = new List<string>();
-                var keys = new List<string>();
-                var bundles = new List<string>();
-                foreach (string[] columns in Pending)
-                {
-                    int charaId = ParseInt(columns, 0, 0);
-                    int skinId = ParseInt(columns, 7, 0);
-                    if (charaId <= 0 || skinId <= 0)
-                    {
-                        continue;
-                    }
-
-                    string key = skinId.ToString(CultureInfo.InvariantCulture);
-                    string text = $"emote_chara_{charaId}";
-                    texts.Add(text);
-                    keys.Add(key);
-                    bundles.Add(Toolbox.ResourcesManager.GetAssetTypePath(
-                        text, ResourcesManager.AssetLoadPathType.CharaMaster, false));
-                }
-
-                if (texts.Count == 0)
-                {
-                    return;
-                }
-
-                // 表一律用我们带过来的 CSV 重建（不依赖素材包能不能被游戏加载，也不看游戏有没有
-                // 自己建过）：CSV 才是我们验过的那份，谁先建谁赢会导致语音时有时无。
+                // 一律重建（force）：CSV 才是我们验过的那份，谁先建谁赢会让语音时有时无。
                 int built = InjectEmotionTables(table, true);
                 if (built > 0)
                 {
                     Plugin.Logger.LogInfo(
                         $"[Import] {built} imported leader emotion table(s) built from the bundled CSV " +
                         $"(total {table.Count}).");
-                    return;
                 }
-
-                // 兜底：让游戏自己加载补进去的那些表情包。
-                Toolbox.ResourcesManager.StartCoroutine_LoadAssetGroupSync(bundles, delegate
-                {
-                    try
-                    {
-                        __instance.DynamicLoadEmoteData(texts, keys);
-                        int added = 0;
-                        foreach (string key in keys)
-                        {
-                            if (table.ContainsKey(key))
-                            {
-                                added++;
-                            }
-                        }
-
-                        Plugin.Logger.LogInfo(
-                            $"[Import] {added} imported leader emotion table(s) added (total {table.Count}).");
-                    }
-                    catch (Exception exception)
-                    {
-                        Plugin.Logger.LogWarning($"[Import] Could not add the emotion tables: {exception.Message}");
-                    }
-                });
             }
             catch (Exception exception)
             {

@@ -195,7 +195,9 @@ AllowTemporaryVoiceDownload = true
 ...
 ```
 
-两个文件夹各 1317 个包 / 4.67 MB，`a/` 下**不再保留副本**（`a/` 里只剩 `storylang_scenario_param_diff_*` 参数表和 `storylang_tutorial_*`、`storylang_stt_*` 这两组图）。
+两个文件夹各 1317 个包 / 4.65 MB，`a/` 下**不再保留副本**（`a/` 里只剩 `storylang_scenario_param_diff_*` 参数表和 `storylang_tutorial_*`、`storylang_stt_*` 这两组图）。
+
+**`chs/` 里装的是国服（网易）的简体译文**：原来的简体是国际服自己那套翻译（还混着繁体字形），和国服差别很大——逐包比对 1317 个包里有 **1160 个**内容不同（例如 `亞里莎`→`亚里莎`、`此處為次元的夾縫之間`→`此处乃是次元的狭缝`）。现在 `chs/` 的 1160 个包已经用国服客户端的文本重建（`_tools/build_story_text_bundles.py`），`cht/` 保持原来的繁体那套不动。国服客户端本身就是 2022 格式、引擎读不了，所以做法是把国服文本**灌回**原来那个 2020 包壳里（跟主战者 spine 一样的一次性手术），每个包仍然带自己独立的内部 archive 名。
 
 游戏算剧情包路径只有一条路（`Cute.AssetHandle.BuildLocalCachePath()`，`AssetHandle/<_Load>` 用它 `AssetBundle.LoadFromFile`、`AssetManager.LoadObject` 用它 `File.Exists`），插件就在这条路的出口按**当前文本语言**（`Cute.CustomPreference.GetTextLanguage()`，也就是设置里切的那一项）改路径，查找顺序是：
 
@@ -222,6 +224,24 @@ python collect_story_text_bundles.py --lang chs --source deployed --move-source 
 **不收** `storylang_tutorial_how_to_class_*`、`storylang_stt_loop_sneak_*`——它们里面装的是图（Texture2D），两套逐字节一致；也不收 `storylang_scenario_param_diff_*`（参数表，不是文本）。国服客户端有一部分章节（第 1～6 篇为主）的原文包本来就是日文开发占位（正文以 `dummy` 开头的空壳），这些包各语言下一样、实际也不显示，脚本照原样收集，不影响。
 
 想退回「剧情文本也放 `a/`」的老样子：把 `story_text/chs/` 里的包复制回 `<资源根>/a/` 即可（`cht` 留着也不影响，插件只是优先用语言目录）。`_tools/verify_resources.py` 已经认识这个新位置，所以搬走之后它照样报 `storylang_assetmanifest missing=0`。
+
+### 国服简体中文文本（`<Mods>/Text/chs/`）
+
+剧情以外的所有文本表都走同一条入口：`Master.LoadLocalizeJsonAndParseWithRegion(dic, region, fileName, isTrimKey)` —— 把某个语言区段的 JSON 灌进一张字典，区段名就是当前文本语言（`Data.SystemText.RegionCode = CustomPreference.GetTextLanguage()`，见 `Master.StartLoadCardNameText` 等 50 处调用）。
+
+插件的 `CnTextOverrides` 就挂在这条路上：解析完之后把国服那一份**盖上去**，所以不碰任何素材包、随时可逆（删掉对应的 json 就回到游戏原样）：
+
+```text
+<Mods>/Text/chs/cardnametext.json      ← 卡牌名称（5356 条）
+<Mods>/Text/chs/skilldesctext.json     ← 卡牌说明 / 效果（9442 条）
+<Mods>/Text/chs/flavourtext.json       ← 卡面记述（8927 条）
+<Mods>/Text/chs/battlekeyword.json     ← 能力关键词（6290 条，必杀→毁灭、复仇→反击 …）
+… 一共 50 张表、51802 条
+```
+
+数据用 `_tools/build_text_data.py` 从国服客户端导出（拉取清单见 `_tools/list_cn_text_assets.py`），只在**简体中文**区段生效；切到别的文本语言时不覆盖。逐表差异：卡名 3936/5356、说明 8107/9442、记述 8246/8927、关键词 2356/6290 与国服不同，少数国服没有的条目（国际服独占内容）保留游戏原文。
+
+顺带一句：`a/master_emote_chara_*.unity3d`（每个角色的表情表，875 个）也是用国服同名的 CSV 重建的 2020 包（`_tools/rebuild_emote_bundles.py`），这样语音 id 和国服台词表 `emotetext` 对得上。
 
 ### 解谜（`basic_puzzle/*`）
 

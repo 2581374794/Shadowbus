@@ -408,8 +408,8 @@ public class Plugin : BaseUnityPlugin
             Harmony.CreateAndPatchAll(typeof(ImportedLeaders));
             // 表情/语音数据兜底：表里查不到不让它抛异常（抛在协程里会把对局卡死）。
             Harmony.CreateAndPatchAll(typeof(EmotionDataGuard));
-            // 主战者模型（spine）一次性诊断：解析/渲染卡在哪一步。
-            Harmony.CreateAndPatchAll(typeof(SpineLoadDiagnostics));
+            // 国服简体中文文本覆盖：卡名 / 卡牌说明 / 卡面记述 / 关键词 / 系统文本。
+            Harmony.CreateAndPatchAll(typeof(CnTextOverrides));
             Harmony.CreateAndPatchAll(typeof(ProfileOfflineData));
             Harmony.CreateAndPatchAll(typeof(ResourceRootPatches));
             Harmony.CreateAndPatchAll(typeof(DeckFormatUI));

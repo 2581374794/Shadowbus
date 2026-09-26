@@ -71,11 +71,6 @@
       <HintPath>$(ShadowverseManagedDir)\CriMw.CriWare.Runtime.dll</HintPath>
       <Private>False</Private>
     </Reference>
-    <!-- Spine 运行时：SpineLoadDiagnostics 用它挂钩主战者模型的解析/渲染。 -->
-    <Reference Include="spine-unity">
-      <HintPath>$(ShadowverseManagedDir)\spine-unity.dll</HintPath>
-      <Private>False</Private>
-    </Reference>
   </ItemGroup>
 
   <ItemGroup>
